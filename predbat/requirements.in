@@ -1,0 +1,15 @@
+# Top-level runtime dependencies (same set as upstream predbat_addon 587e1a7a), pinned.
+# requirements.txt is generated from this file, see the header there.
+pytz==2026.5
+requests==2.34.2
+pyyaml==6.0.3
+aiofiles==25.1.0
+aiohttp==3.14.5
+aiomqtt==2.5.1
+Jinja2==3.1.6
+ruamel.yaml==0.18.17
+pyjwt==2.15.1
+numpy==2.3.5
+prometheus-client==0.26.0
+protobuf==7.36.2
+pvlib==0.16.1
