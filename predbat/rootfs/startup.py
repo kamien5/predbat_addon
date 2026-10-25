@@ -4,6 +4,14 @@ import sys
 import urllib.request
 import shutil
 import time
+
+supervisor_token = os.environ.get("SUPERVISOR_TOKEN")
+if os.path.exists("/config"):
+    if not supervisor_token:
+        print("Error: SUPERVISOR_TOKEN not set in environment")
+        sys.exit(1)
+    print("SUPERVISOR_TOKEN present (value not logged)")
+
 print("Bootstrap Predbat")
 
 root = "/config"
