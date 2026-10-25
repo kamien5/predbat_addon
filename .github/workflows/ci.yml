@@ -14,6 +14,12 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Explicit bash runs steps as `bash --noprofile --norc -eo pipefail {0}`,
+# so a failing command in a pipeline (e.g. `| tee`) fails the step.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   unittest:
     name: Unit tests
@@ -44,7 +50,9 @@ jobs:
       - name: Run tests
         env:
           PYTHONDONTWRITEBYTECODE: "1"
+        shell: bash
         run: |
+          set -o pipefail
           .venv/bin/python -m unittest discover -s tests -v 2>&1 | tee unittest.log
           if grep -Eq '(^| )skipped' unittest.log; then
             echo "::error::tests were skipped; all tests must run in CI"
