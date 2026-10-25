@@ -23,4 +23,4 @@ schema:
   log_level: list(trace|debug|info|notice|warning|error|fatal)?
   dummy:
     - str
-  notify_device: str?
+  notify_device: "match(^[a-z0-9_]*$)?"

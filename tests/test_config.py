@@ -65,8 +65,20 @@ class ConfigYamlTestCase(unittest.TestCase):
         )
         self.assertRegex(
             self.config_text,
-            r"(?m)^schema:\n(?:.*\n)*?[ \t]+notify_device:\s*str\?\s*$",
+            r"(?m)^schema:\n(?:.*\n)*?[ \t]+notify_device:\s*\"match\(\^\[a-z0-9_\]\*\$\)\?\"\s*$",
         )
+
+    def test_notify_device_schema_regex_matches_startup_validation(self) -> None:
+        match = re.search(
+            r"(?m)^[ \t]+notify_device:\s*\"match\((.+)\)\?\"\s*$",
+            self.config_text,
+        )
+        self.assertIsNotNone(match)
+        pattern = re.compile(match.group(1))
+        for ok in ("", "mobile_app_x", "abc_123"):
+            self.assertIsNotNone(pattern.fullmatch(ok), msg=ok)
+        for bad in ("Mobile", "a-b", "a b", "a]\nb: c", "x,y", "a.b", "[x]"):
+            self.assertIsNone(pattern.fullmatch(bad), msg=bad)
 
     def test_build_from_pinned_sha256(self) -> None:
         entries = re.findall(
