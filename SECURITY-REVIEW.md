@@ -39,7 +39,18 @@ Serwer WWW Predbata (port 5052) nie ma własnego uwierzytelniania. Fork dodaje w
 - `latitude`/`longitude` dopisane do nazw traktowanych przez Predbata jak poświadczenia (maskowanie
   w UI, eksporcie diagnostycznym i redakcji logów);
 - dostęp do UI tylko z proxy ingress Supervisora (172.30.32.2) i loopback, inne adresy dostają 403;
-- wyłączone surowe edytory/eksport apps.yaml (apps.yaml i tak jest generowany od nowa przy każdym starcie).
+- wyłączone surowe edytory/eksport apps.yaml (apps.yaml i tak jest generowany od nowa przy każdym starcie);
+- wyłączone endpointy administracyjne dla wszystkich adresów, także z ingress i loopback: zapis
+  konfiguracji i restart komponentów, zapis apps.yaml z UI, przeglądanie i pobieranie plików,
+  widoki diagnostyczne, czat (cała gałąź ścieżek) oraz zapis klucza API taryfy; konfiguracją zarządza
+  add-on, nie UI. Ścieżki są porównywane także z końcowym ukośnikiem, a test sprawdza, że każda
+  zablokowana ścieżka nadal istnieje w trasach `vendor/web.py` (wykrywa zmianę nazw po aktualizacji
+  Predbata);
+- ta sama polityka dostępu dla każdego dodatkowego listenera aiohttp w kodzie zwendorowanym; brak
+  takiego modułu jest logowany;
+- start kończy się kodem 1, gdy apps.yaml włącza opcję nieobsługiwaną w forku. apps.yaml jest
+  czytany tak jak przez Predbata (`yaml.safe_load` z `!secret`, sekcja `pred_bat`), plus skan linii
+  na zduplikowane klucze; nieczytelny plik też kończy start kodem 1.
 
 Testy: `tests/test_web_hardening.py`.
 
