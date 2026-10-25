@@ -151,6 +151,8 @@ class StartupTestCase(unittest.TestCase):
         self._ha_api_url = "http://127.0.0.1:{}".format(port)
         thread = threading.Thread(target=self._ha_server.serve_forever, daemon=True)
         thread.start()
+        # Cleanups run in reverse order: shutdown() first, then server_close().
+        self.addCleanup(self._ha_server.server_close)
         self.addCleanup(self._ha_server.shutdown)
 
         self._options_json = os.path.join(self._tmpdir, "options.json")
@@ -238,12 +240,25 @@ class StartupTestCase(unittest.TestCase):
         return mod
 
     def _expected_apps_yaml(self, notify_device: str = "") -> str:
-        startup = self._load_startup_module("predbat_startup_expected")
+        """Expected apps.yaml built independently of startup.render_apps_yaml."""
+        self.assertEqual(str(HA_TEST_LAT), "0.123456")
+        self.assertEqual(str(HA_TEST_LON), "0.654321")
         with open(APPS_YAML_SRC, "r", encoding="utf-8") as handle:
             text = handle.read()
-        return startup.render_apps_yaml(
-            text, HA_TEST_LAT, HA_TEST_LON, notify_device
+        self.assertEqual(text.count("__HA_LATITUDE__"), 2)
+        self.assertEqual(text.count("__HA_LONGITUDE__"), 2)
+        self.assertEqual(text.count("[__HA_NOTIFY_DEVICE__]"), 1)
+        devices = "[{}]".format(notify_device) if notify_device else "[]"
+        expected = (
+            text.replace("__HA_LATITUDE__", "0.123456")
+            .replace("__HA_LONGITUDE__", "0.654321")
+            .replace("[__HA_NOTIFY_DEVICE__]", devices)
         )
+        self.assertNotIn("__HA_", expected)
+        self.assertEqual(expected.count("latitude: 0.123456"), 2)
+        self.assertEqual(expected.count("longitude: 0.654321"), 2)
+        self.assertIn("notify_devices: " + devices, expected)
+        return expected
 
     def test_a_clean_start_installs_all_pinned_files(self) -> None:
         image_dir = self._make_image_dir()
