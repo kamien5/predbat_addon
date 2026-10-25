@@ -6,13 +6,21 @@ Runs from the image (/opt/predbat/launch.py). Working directory and sys.path
 use CONFIG_DIR so hass.py and the freshly installed download.py are used.
 block_self_update() must run before predbat is imported so that
 `from download import predbat_update_download, ...` binds the stubs.
+
+Defensive hardening: mask secret-like and location fields in web UI/API
+responses, restrict UI to ingress, disable raw apps.yaml editor/export
+endpoints (apps.yaml is regenerated on every start). Patches run before
+importing web/predbat/components via hass.py.
 """
 
 from __future__ import annotations
 
+import functools
+import json
 import os
 import runpy
 import sys
+import types
 
 CONFIG_DIR = os.environ.get("PREDBAT_CONFIG_DIR", "/config")
 
@@ -20,6 +28,25 @@ DISABLED_MESSAGE = (
     "Predbat self-update is disabled in the kamien5 fork "
     "(pinned v9.5.0); ignoring request"
 )
+
+# HA ingress proxy (Supervisor) plus local loopback for health checks.
+ALLOWED_REMOTES = {"172.30.32.2", "127.0.0.1", "::1"}
+
+# Paths disabled for all remotes (apps.yaml is regenerated on every start).
+BLOCKED_PATHS = {
+    "/apps_editor",
+    "/apps_editor_checksum",
+    "/debug_apps",
+    "/debug_apps_live",
+    "/apps_value",
+}
+
+SECRET_MASK = "***configured***"
+
+_SECRET_SUBSTRINGS = ("_key", "token", "password", "secret", "latitude", "longitude")
+
+# Location key names treated like credentials by Predbat's own masking/redaction.
+LOCATION_KEYS = ("latitude", "longitude", "temperature_latitude", "temperature_longitude")
 
 
 def block_self_update() -> None:
@@ -51,6 +78,142 @@ def block_self_update() -> None:
     download.get_github_directory_listing = get_github_directory_listing
 
 
+def extend_secret_names() -> None:
+    """
+    Extend utils.SECRET_KEY_EXTRA_NAMES with location field names.
+
+    Consulted by utils.is_secret_key() at call time. Fail closed if the
+    attribute is missing.
+    """
+    # Late import: CONFIG_DIR must already be on sys.path (see main()).
+    import utils
+
+    if not hasattr(utils, "SECRET_KEY_EXTRA_NAMES"):
+        print("Error: utils.SECRET_KEY_EXTRA_NAMES is missing")
+        sys.exit(1)
+    old = utils.SECRET_KEY_EXTRA_NAMES
+    utils.SECRET_KEY_EXTRA_NAMES = tuple(old) + LOCATION_KEYS
+
+
+def _should_mask_config_key(config_key, secret_keys, utils_mod) -> bool:
+    if config_key in secret_keys:
+        return True
+    try:
+        if utils_mod.is_secret_key(config_key):
+            return True
+    except Exception:
+        return True
+    if config_key in ("latitude", "longitude"):
+        return True
+    key_lower = str(config_key).lower()
+    if key_lower == "api_key":
+        return True
+    for needle in _SECRET_SUBSTRINGS:
+        if needle in key_lower:
+            return True
+    return False
+
+
+def mask_sensitive_response_fields() -> None:
+    """
+    Defensive hardening: mask secret-like and location fields in web UI/API
+    responses.
+
+    Wraps the component-config handler so non-empty default/current_value
+    fields that look secret or location-related are replaced with
+    ***configured***. Fail closed on parse/mask errors.
+    """
+    # Late import: CONFIG_DIR must already be on sys.path (see main()).
+    import components
+    import utils
+    import web
+
+    secret_keys = set()
+    for component_info in components.COMPONENT_LIST.values():
+        args = component_info.get("args", {})
+        if not isinstance(args, dict):
+            continue
+        for arg_info in args.values():
+            if isinstance(arg_info, dict) and arg_info.get("secret"):
+                config = arg_info.get("config")
+                if config:
+                    secret_keys.add(config)
+
+    original = web.WebInterface.html_component_config
+
+    @functools.wraps(original)
+    async def html_component_config(self, request):
+        resp = await original(self, request)
+        try:
+            if getattr(resp, "content_type", None) != "application/json":
+                return resp
+            body = resp.body
+            if isinstance(body, bytes):
+                data = json.loads(body.decode("utf-8"))
+            else:
+                data = json.loads(body)
+            for entry in data.get("args", []):
+                config_key = entry.get("config_key")
+                if not _should_mask_config_key(config_key, secret_keys, utils):
+                    continue
+                for field in ("default", "current_value"):
+                    value = entry.get(field)
+                    if value is not None and value != "":
+                        entry[field] = SECRET_MASK
+            return web.web.json_response(data, status=resp.status)
+        except Exception:
+            return web.web.json_response(
+                {"success": False, "message": "masked"}, status=500
+            )
+
+    web.WebInterface.html_component_config = html_component_config
+
+
+def restrict_web_to_ingress() -> None:
+    """
+    Defensive hardening: restrict UI to ingress, disable raw apps.yaml
+    editor/export endpoints (apps.yaml is regenerated on every start).
+
+    Replace web.web (aiohttp.web) with a ModuleType shim whose Application
+    factory prepends middleware without editing vendor code.
+    """
+    import aiohttp.web as aiohttp_web
+    import web
+
+    allowed = set(ALLOWED_REMOTES)
+    extra = os.environ.get("PREDBAT_WEB_ALLOWED_REMOTES", "")
+    for part in extra.split(","):
+        remote = part.strip()
+        if remote:
+            allowed.add(remote)
+
+    @aiohttp_web.middleware
+    async def ingress_only(request, handler):
+        if request.path in BLOCKED_PATHS:
+            return aiohttp_web.Response(
+                text="Disabled in kamien5 fork", status=403
+            )
+        if request.remote not in allowed:
+            return aiohttp_web.Response(text="Forbidden", status=403)
+        return await handler(request)
+
+    shim = types.ModuleType("aiohttp.web")
+    shim.__dict__.update(aiohttp_web.__dict__)
+    real_application = aiohttp_web.Application
+
+    def Application(*args, **kwargs):
+        middlewares = list(kwargs.get("middlewares") or ())
+        middlewares.insert(0, ingress_only)
+        kwargs["middlewares"] = middlewares
+        return real_application(*args, **kwargs)
+
+    shim.Application = Application
+    web.web = shim
+    print(
+        "Predbat web UI restricted to ingress (172.30.32.2) in kamien5 fork"
+    )
+
+
 def main() -> None:
     if not os.path.isdir(CONFIG_DIR):
         print("Error: CONFIG_DIR does not exist: {}".format(CONFIG_DIR))
@@ -61,6 +224,9 @@ def main() -> None:
     sys.path.insert(0, CONFIG_DIR)
 
     block_self_update()
+    extend_secret_names()
+    mask_sensitive_response_fields()
+    restrict_web_to_ingress()
 
     hass_path = os.path.join(CONFIG_DIR, "hass.py")
     if not os.path.isfile(hass_path):
