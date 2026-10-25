@@ -343,7 +343,13 @@ class WebHardeningTestCase(unittest.TestCase):
             ("GET", "/api/internals"),
             ("GET", "/api/internals/download"),
         ]
-        allowed = [("GET", "/apps"), ("GET", "/"), ("GET", "/component_config")]
+        blocked += [
+            ("GET", "/chat"),
+            ("POST", "/chat/send"),
+            ("GET", "/chat/stream"),
+            ("POST", "/api/kraken_key"),
+        ]
+        allowed = [("GET", "/apps"), ("GET", "/"), ("GET", "/component_config"), ("GET", "/charts")]
 
         async def _check():
             res = {}
@@ -358,6 +364,22 @@ class WebHardeningTestCase(unittest.TestCase):
             self.assertEqual(res[("loopback", method, path)], 403, msg=(method, path))
         for method, path in allowed:
             self.assertEqual(res[(method, path)], 200, msg=(method, path))
+
+    def test_prefix_and_extra_paths_blocked_for_all_methods(self) -> None:
+        launch_mod = self._load_launch("predbat_launch_prefix")
+        for method in ("GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"):
+            for path in (
+                "/chat",
+                "/chat/",
+                "/chat/send",
+                "/chat/providers/models",
+                "/chat/anything/new",
+                "/api/kraken_key",
+                "/api/kraken_key/",
+            ):
+                self.assertTrue(launch_mod.is_blocked_request(method, path), msg=(method, path))
+        for path in ("/chatter", "/charts", "/", "/plan"):
+            self.assertFalse(launch_mod.is_blocked_request("GET", path), msg=path)
 
     def test_blocked_request_helper(self) -> None:
         launch_mod = self._load_launch("predbat_launch_helper")
@@ -513,6 +535,11 @@ class WebHardeningTestCase(unittest.TestCase):
         self.assertIn("/", paths)
         for path in sorted(launch_mod.BLOCKED_PATHS):
             self.assertIn(path, paths, msg="restricted path is not a vendor route: " + path)
+        for prefix in launch_mod.BLOCKED_PREFIXES:
+            self.assertTrue(
+                any(p == prefix or p.startswith(prefix + "/") for p in paths),
+                msg="restricted prefix matches no vendor route: " + prefix,
+            )
         for method, path in sorted(launch_mod.BLOCKED_METHOD_PATHS):
             self.assertIn((method, path), routes, msg="restricted route missing: {} {}".format(method, path))
 

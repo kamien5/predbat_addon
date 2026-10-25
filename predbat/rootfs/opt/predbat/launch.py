@@ -49,7 +49,12 @@ BLOCKED_PATHS = {
     "/internals",
     "/api/internals",
     "/api/internals/download",
+    "/api/kraken_key",
 }
+
+# Path prefixes disabled for all remotes and methods: the prefix itself and
+# everything below it ("/chat" and "/chat/...", but not "/chatter").
+BLOCKED_PREFIXES = ("/chat",)
 
 # (method, path) pairs disabled for all remotes; other methods stay available.
 BLOCKED_METHOD_PATHS = {
@@ -68,6 +73,9 @@ def is_blocked_request(method: str, path: str) -> bool:
     norm = _normalize_path(path)
     if norm in BLOCKED_PATHS:
         return True
+    for prefix in BLOCKED_PREFIXES:
+        if norm == prefix or norm.startswith(prefix + "/"):
+            return True
     return ((method or "GET").upper(), norm) in BLOCKED_METHOD_PATHS
 
 # Vendor modules that open an additional aiohttp listener.
