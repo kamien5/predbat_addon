@@ -41,8 +41,8 @@ EXPECTED_FILE_COUNT = 114
 APPS_YAML_SHA256 = (
     "bc4b790e3a8f63230f6ce3e4b680a9cab51d4f6212cc6072dae3f2862da3f1ee"
 )
-HA_TEST_LAT = 50.1234
-HA_TEST_LON = 19.5678
+HA_TEST_LAT = 0.123456
+HA_TEST_LON = 0.654321
 DEFAULT_TEST_TOKEN = "test-token"
 
 
@@ -535,7 +535,7 @@ class StartupTestCase(unittest.TestCase):
                 combined,
             )
             self.assertNotIn(secret, combined)
-            self.assertNotIn("50.1234", combined)
+            self.assertNotIn(str(HA_TEST_LAT), combined)
 
         self._ha_server.force_status = None
 
@@ -551,8 +551,8 @@ class StartupTestCase(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
         combined = result.stdout + result.stderr
         self.assertNotIn(secret, combined)
-        self.assertNotIn("50.1234", combined)
-        self.assertNotIn("19.5678", combined)
+        self.assertNotIn(str(HA_TEST_LAT), combined)
+        self.assertNotIn(str(HA_TEST_LON), combined)
         self.assertIn("Installed apps.yaml", combined)
         self.assertIn("coordinates from Home Assistant config", combined)
         self.assertIn("notify device not set", combined)

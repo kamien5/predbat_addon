@@ -123,11 +123,11 @@ class WebHardeningTestCase(unittest.TestCase):
                 "            },\n"
                 "            'latitude': {\n"
                 "                'config': 'latitude',\n"
-                "                'default': 50.5,\n"
+                "                'default': 0.111111,\n"
                 "            },\n"
                 "            'longitude': {\n"
                 "                'config': 'longitude',\n"
-                "                'default': 19.5,\n"
+                "                'default': 0.222222,\n"
                 "            },\n"
                 "            'ha_url': {\n"
                 "                'config': 'ha_url',\n"
@@ -169,12 +169,12 @@ class WebHardeningTestCase(unittest.TestCase):
                 " 'current_value': 'tok-DDD'},\n"
                 "                {'config_key': 'api_key', 'default': 'tok-EEE',"
                 " 'current_value': 'tok-EEE'},\n"
-                "                {'config_key': 'latitude', 'default': 50.5,"
-                " 'current_value': 50.5},\n"
-                "                {'config_key': 'longitude', 'default': 19.5,"
-                " 'current_value': 19.5},\n"
-                "                {'config_key': 'temperature_latitude', 'default': 49.25,"
-                " 'current_value': 49.25},\n"
+                "                {'config_key': 'latitude', 'default': 0.111111,"
+                " 'current_value': 0.111111},\n"
+                "                {'config_key': 'longitude', 'default': 0.222222,"
+                " 'current_value': 0.222222},\n"
+                "                {'config_key': 'temperature_latitude', 'default': 0.333333,"
+                " 'current_value': 0.333333},\n"
                 "                {'config_key': 'ha_url',"
                 " 'default': 'http://supervisor/core', 'current_value': None},\n"
                 "            ],\n"
@@ -211,14 +211,14 @@ class WebHardeningTestCase(unittest.TestCase):
         resp = asyncio.run(_call())
         body = resp.body.decode("utf-8") if isinstance(resp.body, bytes) else resp.body
         for needle in (
-            "49.25",
+            "0.333333",
             "tok-AAA",
             "tok-BBB",
             "tok-CCC",
             "tok-DDD",
             "tok-EEE",
-            "50.5",
-            "19.5",
+            "0.111111",
+            "0.222222",
         ):
             self.assertNotIn(needle, body)
         self.assertIn("***configured***", body)
