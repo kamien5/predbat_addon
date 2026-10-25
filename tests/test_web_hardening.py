@@ -365,6 +365,69 @@ class WebHardeningTestCase(unittest.TestCase):
         self.assertTrue(launch_mod.is_blocked_request("GET", "/api/internals/download/"))
         self.assertFalse(launch_mod.is_blocked_request("GET", "/"))
 
+    def _write_apps_yaml(self, body: str) -> str:
+        path = os.path.join(self._tmpdir, "apps.yaml")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("pred_bat:\n  module: predbat\n" + body)
+        return path
+
+    def test_unsupported_option_enabled_exits(self) -> None:
+        launch_mod = self._load_launch("predbat_launch_options")
+        for value in ("true", "True", "yes", "on", "1", "'true'", "\"yes\"", "maybe"):
+            path = self._write_apps_yaml("  mcp_enable: {}  # c\n".format(value))
+            with redirect_stdout(io.StringIO()) as buf:
+                with self.assertRaises(SystemExit) as ctx:
+                    launch_mod.refuse_unsupported_options(path)
+            self.assertEqual(ctx.exception.code, 1, msg=value)
+            self.assertIn("not supported", buf.getvalue())
+
+    def test_unsupported_option_absent_or_false_passes(self) -> None:
+        launch_mod = self._load_launch("predbat_launch_options_ok")
+        bodies = ["", "  mcp_enable: false\n", "  mcp_enable: False # off\n",
+                  "  mcp_enable: no\n", "  # mcp_enable: true\n"]
+        for body in bodies:
+            path = self._write_apps_yaml(body)
+            launch_mod.refuse_unsupported_options(path)
+        launch_mod.refuse_unsupported_options(os.path.join(self._tmpdir, "missing.yaml"))
+
+    def test_shipped_apps_yaml_passes_option_check(self) -> None:
+        launch_mod = self._load_launch("predbat_launch_options_shipped")
+        launch_mod.refuse_unsupported_options(
+            os.path.join(REPO_ROOT, "predbat", "rootfs", "apps.yaml")
+        )
+
+    @unittest.skipUnless(_AIOHTTP_AVAILABLE, "aiohttp not installed")
+    def test_extra_listener_modules_get_access_policy(self) -> None:
+        import aiohttp.web as aiohttp_web
+
+        launch_mod = self._load_launch("predbat_launch_listeners")
+        fake_web = types.ModuleType("web")
+        fake_web.web = aiohttp_web
+        sys.modules["web"] = fake_web
+        extra = types.ModuleType("web_mcp")
+        extra.web = aiohttp_web
+        sys.modules["web_mcp"] = extra
+        self.addCleanup(lambda: sys.modules.pop("web_mcp", None))
+
+        with redirect_stdout(io.StringIO()):
+            launch_mod.restrict_web_to_ingress()
+        self.assertIs(extra.web, fake_web.web)
+        middleware = extra.web.Application().middlewares[0]
+
+        async def ok_handler(_request):
+            return aiohttp_web.Response(text="ok")
+
+        async def _check():
+            outside = await middleware(
+                types.SimpleNamespace(remote="10.0.0.5", path="/", method="GET"), ok_handler
+            )
+            ingress = await middleware(
+                types.SimpleNamespace(remote="172.30.32.2", path="/", method="GET"), ok_handler
+            )
+            return outside.status, ingress.status
+
+        self.assertEqual(asyncio.run(_check()), (403, 200))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,8 +16,10 @@ importing web/predbat/components via hass.py.
 from __future__ import annotations
 
 import functools
+import importlib
 import json
 import os
+import re
 import runpy
 import sys
 import types
@@ -67,6 +69,14 @@ def is_blocked_request(method: str, path: str) -> bool:
     if norm in BLOCKED_PATHS:
         return True
     return ((method or "GET").upper(), norm) in BLOCKED_METHOD_PATHS
+
+# Vendor modules that open an additional aiohttp listener.
+EXTRA_LISTENER_MODULES = ("web_mcp",)
+
+# apps.yaml options that must stay off in this fork (each opens an extra listener).
+FORBIDDEN_ENABLED_OPTIONS = ("mcp_enable",)
+
+_FALSE_VALUES = {"", "false", "no", "off", "0", "null", "~"}
 
 SECRET_MASK = "***configured***"
 
@@ -236,9 +246,45 @@ def restrict_web_to_ingress() -> None:
 
     shim.Application = Application
     web.web = shim
+    # Every module that starts its own aiohttp listener gets the same policy.
+    for name in EXTRA_LISTENER_MODULES:
+        try:
+            mod = importlib.import_module(name)
+        except ImportError:
+            continue
+        if hasattr(mod, "web"):
+            mod.web = shim
     print(
         "Predbat web UI restricted to ingress (172.30.32.2) in kamien5 fork"
     )
+
+
+def refuse_unsupported_options(apps_yaml_path: str) -> None:
+    """
+    Exit 1 if apps.yaml enables an option this fork does not support.
+
+    Line-based check (stdlib only); any value other than an explicit false
+    is treated as enabled, so unknown spellings fail closed.
+    """
+    try:
+        with open(apps_yaml_path, "r", encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except FileNotFoundError:
+        return
+    for option in FORBIDDEN_ENABLED_OPTIONS:
+        pattern = re.compile(r"^\s*['\"]?" + re.escape(option) + r"['\"]?\s*:(.*)$")
+        for line in lines:
+            match = pattern.match(line)
+            if not match:
+                continue
+            value = match.group(1).split("#", 1)[0].strip().strip("'\"").lower()
+            if value not in _FALSE_VALUES:
+                print(
+                    "Error: apps.yaml option {} is not supported in the kamien5 fork".format(
+                        option
+                    )
+                )
+                sys.exit(1)
 
 
 def main() -> None:
@@ -250,6 +296,7 @@ def main() -> None:
     # Prefer CONFIG_DIR modules over anything else on the path.
     sys.path.insert(0, CONFIG_DIR)
 
+    refuse_unsupported_options(os.path.join(CONFIG_DIR, "apps.yaml"))
     block_self_update()
     extend_secret_names()
     mask_sensitive_response_fields()
