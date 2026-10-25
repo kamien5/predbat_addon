@@ -600,6 +600,21 @@ class WebHardeningTestCase(unittest.TestCase):
             ],
         )
 
+    @unittest.skipUnless(_AIOHTTP_AVAILABLE, "aiohttp not installed")
+    def test_missing_optional_listener_module_is_logged(self) -> None:
+        import aiohttp.web as aiohttp_web
+
+        launch_mod = self._load_launch("predbat_launch_listener_missing")
+        launch_mod.EXTRA_LISTENER_MODULES = ("predbat_no_such_module_for_test",)
+        fake_web = types.ModuleType("web")
+        fake_web.web = aiohttp_web
+        sys.modules["web"] = fake_web
+        with redirect_stdout(io.StringIO()) as buf:
+            launch_mod.restrict_web_to_ingress()
+        out = buf.getvalue()
+        self.assertIn("optional module predbat_no_such_module_for_test could not be imported", out)
+        self.assertIn("ModuleNotFoundError", out)
+
     def test_restricted_paths_exist_in_vendor_routes(self) -> None:
         launch_mod = self._load_launch("predbat_launch_routes")
         with open(os.path.join(REPO_ROOT, "predbat", "vendor", "web.py"), "r", encoding="utf-8") as handle:

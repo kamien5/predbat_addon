@@ -258,7 +258,11 @@ def restrict_web_to_ingress() -> None:
     for name in EXTRA_LISTENER_MODULES:
         try:
             mod = importlib.import_module(name)
-        except ImportError:
+        except ImportError as exc:
+            print(
+                "Note: optional module {} could not be imported ({}); "
+                "it will not start".format(name, type(exc).__name__)
+            )
             continue
         if hasattr(mod, "web"):
             mod.web = shim
