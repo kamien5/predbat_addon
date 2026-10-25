@@ -6,15 +6,19 @@ Every start:
   1. Verify the image-pinned vendor tree against MANIFEST.sha256.
   2. Strip dangerous/stale code from CONFIG_DIR (plugins, package shadows, staged updates).
   3. Reinstall every pinned file into CONFIG_DIR (overwrite local edits).
-  4. Write a local manifest.yaml so Predbat check_install never contacts GitHub.
-  5. Launch Predbat via the image launch.py (self-update stubs).
+  4. Install apps.yaml from the image (sha256-pinned; HA lat/lon and notify device substituted).
+  5. Write a local manifest.yaml so Predbat check_install never contacts GitHub.
+  6. Launch Predbat via the image launch.py (self-update stubs).
 
-Stdlib only. No network. SUPERVISOR_TOKEN is read from the environment only and never printed.
+Stdlib only. Network is used only to read Home Assistant /config for coordinates.
+SUPERVISOR_TOKEN is read from the environment only and never printed.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import os
 import re
 import shutil
@@ -23,15 +27,26 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 
 # Paths are overridable for tests; production uses /config and /opt/predbat.
 CONFIG_DIR = os.environ.get("PREDBAT_CONFIG_DIR", "/config")
 IMAGE_DIR = os.environ.get("PREDBAT_IMAGE_DIR", "/opt/predbat")
+APPS_YAML_SRC = os.environ.get("PREDBAT_APPS_YAML_SRC", "/apps.yaml")
+APPS_YAML_SHA256 = (
+    "a484c349b22a91479180d44507ac2dbd3f7ef8fafbc8bbc4af448dc4b0abc625"
+)
+HA_API_URL = os.environ.get("PREDBAT_HA_API_URL", "http://supervisor/core/api")
+OPTIONS_JSON = os.environ.get("PREDBAT_OPTIONS_JSON", "/data/options.json")
 
 # sha256sum --strict style: "<64 hex>  <safe filename>" (exactly two spaces).
 MANIFEST_LINE_RE = re.compile(
     r"^([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)$"
 )
+NOTIFY_DEVICE_RE = re.compile(r"^[a-z0-9_]+$")
+PLACEHOLDER_RE = re.compile(r"__HA_[A-Z0-9_]*__")
+NOTIFY_DEVICE_TOKEN = "[__HA_NOTIFY_DEVICE__]"
 
 # Staged self-update leftovers such as predbat.py.v9.6.0 or foo.so.tag
 STAGED_SUFFIX_RE = re.compile(r"\.(py|so)\.[^/]+$")
@@ -196,8 +211,8 @@ def clean_config_dir(manifest: dict) -> None:
     """
     Remove code that could shadow or extend the pinned install.
 
-    Never touches user data such as apps.yaml, secrets.yaml, predbat.log,
-    predbat_save/, or other non-code YAML settings.
+    Never deletes apps.yaml (install_apps_yaml overwrites it), secrets.yaml,
+    predbat.log, predbat_save/, or other non-code YAML settings.
     """
     manifest_names = set(manifest)
     py_stems = {name[:-3] for name in manifest_names if name.endswith(".py")}
@@ -339,6 +354,206 @@ def _yaml_quote(value: str) -> str:
     return '"{}"'.format(escaped)
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects, so the Bearer token cannot be forwarded elsewhere."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# No proxies from the environment and no redirects for the HA API call.
+_HA_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+
+def fetch_ha_location() -> tuple:
+    """
+    GET Home Assistant /config for latitude and longitude.
+
+    Uses SUPERVISOR_TOKEN as Bearer auth. Token is never logged.
+    Retries up to 5 times; sleep between attempts is 10s (PREDBAT_RETRY_SLEEP).
+    """
+    token = os.environ.get("SUPERVISOR_TOKEN")
+    if not token:
+        print("Error: SUPERVISOR_TOKEN not set in environment")
+        sys.exit(1)
+
+    try:
+        retry_sleep = float(os.environ.get("PREDBAT_RETRY_SLEEP", "10"))
+    except ValueError:
+        retry_sleep = 10.0
+
+    url = HA_API_URL + "/config"
+    last_detail = None
+
+    for attempt in range(5):
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={"Authorization": "Bearer " + token},
+                method="GET",
+            )
+            with _HA_OPENER.open(request, timeout=10) as response:
+                body = response.read()
+            data = json.loads(body.decode("utf-8"))
+            lat = float(data["latitude"])
+            lon = float(data["longitude"])
+            if not math.isfinite(lat) or not math.isfinite(lon):
+                raise ValueError("non-finite coordinates")
+            if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
+                raise ValueError("coordinates out of range")
+            if lat == 0.0 and lon == 0.0:
+                raise ValueError("coordinates both zero")
+            return lat, lon
+        except urllib.error.HTTPError as exc:
+            last_detail = "HTTP {}".format(exc.code)
+        except Exception as exc:
+            last_detail = type(exc).__name__
+        if attempt < 4:
+            time.sleep(retry_sleep)
+
+    print("Error: unable to read latitude/longitude from Home Assistant config")
+    if last_detail:
+        print(last_detail)
+    sys.exit(1)
+
+
+def read_notify_device() -> str:
+    """
+    Read add-on option notify_device from OPTIONS_JSON.
+
+    Missing file yields "". Non-empty values must match ^[a-z0-9_]+$;
+    the option value is never printed.
+    """
+    if not os.path.isfile(OPTIONS_JSON):
+        return ""
+    try:
+        with open(OPTIONS_JSON, "r", encoding="utf-8") as handle:
+            options = json.load(handle)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        print(
+            "Error: add-on option notify_device is invalid (allowed: a-z, 0-9, _)"
+        )
+        sys.exit(1)
+
+    if not isinstance(options, dict):
+        print(
+            "Error: add-on option notify_device is invalid (allowed: a-z, 0-9, _)"
+        )
+        sys.exit(1)
+
+    raw = options.get("notify_device")
+    if raw is None:
+        value = ""
+    elif not isinstance(raw, str):
+        print(
+            "Error: add-on option notify_device is invalid (allowed: a-z, 0-9, _)"
+        )
+        sys.exit(1)
+    else:
+        value = raw.strip()
+    if value and not NOTIFY_DEVICE_RE.fullmatch(value):
+        print(
+            "Error: add-on option notify_device is invalid (allowed: a-z, 0-9, _)"
+        )
+        sys.exit(1)
+    return value
+
+
+def render_apps_yaml(text, latitude, longitude, notify_device) -> str:
+    """
+    Substitute apps.yaml placeholders for coordinates and notify device.
+
+    Latitude/longitude are written with str(float(...)) when provided.
+    The notify-device list token becomes [name] or [] when empty.
+    """
+    result = text
+    if latitude is not None:
+        result = result.replace("__HA_LATITUDE__", str(float(latitude)))
+    if longitude is not None:
+        result = result.replace("__HA_LONGITUDE__", str(float(longitude)))
+    if notify_device:
+        result = result.replace(NOTIFY_DEVICE_TOKEN, "[" + notify_device + "]")
+    else:
+        result = result.replace(NOTIFY_DEVICE_TOKEN, "[]")
+    return result
+
+
+def check_no_placeholders(text) -> None:
+    """Exit 1 if any unsubstituted __HA_...__ placeholder remains."""
+    if PLACEHOLDER_RE.search(text):
+        print("Error: apps.yaml still contains unsubstituted placeholders")
+        sys.exit(1)
+
+
+def install_apps_yaml() -> None:
+    """
+    Verify image apps.yaml, substitute placeholders, write CONFIG_DIR/apps.yaml.
+
+    Always overwrites local edits. Coordinates, notify device, and
+    SUPERVISOR_TOKEN are never logged.
+    """
+    try:
+        actual_hash = _sha256_file(APPS_YAML_SRC)
+    except OSError:
+        print("Error: apps.yaml in image failed verification")
+        sys.exit(1)
+
+    if actual_hash != APPS_YAML_SHA256:
+        print("Error: apps.yaml in image failed verification")
+        sys.exit(1)
+
+    try:
+        with open(APPS_YAML_SRC, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError as exc:
+        _error("failed to read apps.yaml source: {}".format(exc))
+
+    notify_device = read_notify_device()
+    latitude = None
+    longitude = None
+    if "__HA_LATITUDE__" in text or "__HA_LONGITUDE__" in text:
+        latitude, longitude = fetch_ha_location()
+
+    text = render_apps_yaml(text, latitude, longitude, notify_device)
+    check_no_placeholders(text)
+
+    dest = os.path.join(CONFIG_DIR, "apps.yaml")
+    fd = None
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(prefix=".apps.yaml.tmp.", dir=CONFIG_DIR)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
+            handle.write(text)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, dest)
+        tmp_path = None
+    except OSError as exc:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        _error("failed to install apps.yaml: {}".format(exc))
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    notify_status = "set" if notify_device else "not set"
+    print(
+        "Installed apps.yaml (pinned sha256 {}, coordinates from Home Assistant "
+        "config, notify device {})".format(APPS_YAML_SHA256, notify_status)
+    )
+
+
 def write_predbat_manifest(manifest: dict) -> None:
     """
     Write CONFIG_DIR/manifest.yaml in the shape check_install expects.
@@ -437,6 +652,7 @@ def main() -> None:
     manifest = verify_vendor()
     clean_config_dir(manifest)
     install_code(manifest)
+    install_apps_yaml()
     write_predbat_manifest(manifest)
     launch()
 

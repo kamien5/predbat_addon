@@ -18,7 +18,9 @@ map:
   - addon_config:rw
 options:
   dummy: []
+  notify_device: ""
 schema:
   log_level: list(trace|debug|info|notice|warning|error|fatal)?
   dummy:
     - str
+  notify_device: str?

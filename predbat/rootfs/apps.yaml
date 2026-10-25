@@ -1,0 +1,102 @@
+# apps.yaml dla Predbat v9.5.0 (tag commit 0cfceaaa719b9ce3de1d10185578feffb008908b), na bazie templates/fox.yaml.
+# Instalacja docelowa: falownik FoxESS H3 przez foxess_modbus 1.15.0 (RS485), encje BEZ prefiksu "foxess_".
+# Zmiany względem szablonu oznaczone [ZMIANA]. Eksport z baterii zablokowany (usługi -> Self Use).
+pred_bat:
+  module: predbat
+  class: PredBat
+  prefix: predbat
+  timezone: Europe/Warsaw                       # [ZMIANA]
+  currency_symbols: ['zł', 'gr']                # [ZMIANA] stawki w raw_* w PLN/kWh, Predbat liczy w gr (x100)
+  threads: auto
+  plan_interval_minutes: 30
+  load_filter_threshold: 30
+
+  load_today: [sensor.load_energy_today]                       # [ZMIANA] nazwy encji
+  import_today: [sensor.grid_consumption_energy_today]
+  export_today: [sensor.feed_in_energy_today]
+  pv_today: [sensor.solar_energy_today]
+
+  num_inverters: 1
+  inverter_type: FoxESS
+
+  # [ZMIANA] Force Charge przez skrypt strażnika: przy PV > 0,5 kW i koszcie >= 0 skrypt wybiera Self Use
+  charge_start_service:
+    service: script.turn_on
+    entity_id: script.bateria_force_charge
+  charge_freeze_service:
+    service: select.select_option
+    entity_id: select.work_mode
+    option: "Back-up"
+  charge_stop_service:
+    service: select.select_option
+    entity_id: select.work_mode
+    option: "Self Use"
+  # [ZMIANA] wymuszony eksport zablokowany: wszystkie usługi eksportu = Self Use
+  discharge_start_service:
+    service: select.select_option
+    entity_id: select.work_mode
+    option: "Self Use"
+  discharge_stop_service:
+    service: select.select_option
+    entity_id: select.work_mode
+    option: "Self Use"
+  discharge_freeze_service:
+    service: select.select_option
+    entity_id: select.work_mode
+    option: "Self Use"
+
+  # [ZMIANA] Predbat pisze do PROXY; strażnik HA przepisuje min(żądanie, limit przyłącza/fazy/sprzętu)
+  charge_rate: [input_number.predbat_charge_rate_request]
+  discharge_rate: [input_number.predbat_discharge_rate_request]
+  battery_power: [sensor.invbatpower]          # dodatni = rozładowanie (odczyt 25.10: invbatpower 0.16 = battery_discharge 0.16)
+  pv_power: [sensor.foxess_modbus_pv_power]
+  load_power: [sensor.dom_moc_obciazenia]      # [ZMIANA] template (load_power_r/s/t = 0 w tej instalacji)
+  grid_power: [sensor.siec_moc_netto]          # [ZMIANA] suma grid_ct_* (dodatni = eksport) -> bez invert
+  grid_power_invert: [False]
+  soc_percent: [sensor.battery_soc]
+  soc_max: [input_number.bateria_pojemnosc_kwh] # [ZMIANA] 8,7 kWh (Mira-HV25 9,83 kWh x SoH 89%); bms_kwh_remaining nie jest pojemnością
+  reserve: [number.min_soc_on_grid]
+  battery_min_soc: [input_number.battery_min_soc]
+  battery_temperature: [sensor.battery_temp]
+
+  inverter_limit: [10000]                      # [ZMIANA] moc falownika 10 kW
+  battery_rate_max: [5500]                     # [ZMIANA] 26 A x ~213 V
+  inverter_limit_charge: [10000]
+  inverter_limit_discharge: [10000]
+  inverter_clock_skew_start: 0
+  inverter_clock_skew_end: 0
+  inverter_clock_skew_discharge_start: 0
+  inverter_clock_skew_discharge_end: 0
+  clock_skew: 0
+
+  # [ZMIANA] PV: Forecast.Solar bezpośrednio z Predbata, konwencja 0 = południe (azimuth_zero_south)
+  forecast_solar:
+    - latitude: __HA_LATITUDE__        # wstawiane przy instalacji z get_config, nie trzymane w repo
+      longitude: __HA_LONGITUDE__
+      azimuth: -90                     # wschód, string PV1 (patrz PAKIET: przypisanie stringów [NZ])
+      declination: 30                  # [NZ] przyjęto 30 st.
+      kwp: 6.7                        # [NZ] FoxESS Cloud 9,9 kWp; podział 2/3 wg liczników pv1/pv2
+      efficiency: 0.95
+      azimuth_zero_south: true
+    - latitude: __HA_LATITUDE__
+      longitude: __HA_LONGITUDE__
+      azimuth: 90                      # zachód, string PV2
+      declination: 30
+      kwp: 3.2                        # [NZ]
+      efficiency: 0.95
+      azimuth_zero_south: true
+  forecast_solar_max_age: 4
+
+  # [ZMIANA] taryfa: pełny koszt importu (Pstryk price_gross + zmienne G13 Tauron) i cena eksportu Pstryk
+  metric_octopus_import: sensor.koszt_importu_pln_kwh
+  metric_octopus_export: sensor.cena_eksportu_pln_kwh
+  metric_standing_charge: 0
+
+  days_previous: [7]
+  forecast_hours: 48
+  notify_devices: [__HA_NOTIFY_DEVICE__]   # wstawiane przy instalacji, nie trzymane w repo
+  battery_scaling: [1.0]
+  import_export_scaling: 1.0
+
+  num_cars: 0                                          # grudzień: 1 + encje go-e (osobny diff)
+  car_charging_hold: True
