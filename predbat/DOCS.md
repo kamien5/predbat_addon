@@ -28,7 +28,29 @@ If you want to buy me a beer then please use Paypal - [tdlj@tdlj.net](mailto:tdl
   and writes `apps.yaml` from the image, filling in the Home Assistant location and the `notify_device` option
 * `apps.yaml` in `/addon_configs/fc83ef65_predbat` is regenerated on every start, so manual edits there are
   overwritten; configuration changes go through this repository
+* The `fc83ef65` prefix is not fixed: Home Assistant derives it from the repository URL as the first
+  8 characters of the sha1 of the lowercased URL. For `https://github.com/kamien5/predbat_addon`:
+
+  ```bash
+  printf '%s' 'https://github.com/kamien5/predbat_addon' | tr 'A-Z' 'a-z' | sha1sum | cut -c1-8
+  ```
+
+  A fork published under another URL gets a different directory name.
 * Click restart on the app if need be
+
+### EV charging energy (`car_charging_energy`)
+
+The shipped `apps.yaml` keeps `num_cars: 0` (Predbat does not plan car charging) but sets
+`car_charging_energy`, so energy used by the car can be removed from the house load history
+(`car_charging_hold`). For this to work:
+
+* `car_charging_energy` must point to an energy sensor in kWh with `state_class: total_increasing`
+  (a cumulative counter, not power), and the recorder must store its history (not excluded in
+  `recorder:`); Predbat reads it from history
+* `switch.predbat_car_energy_reported_load` must be on (default on). When it is off, Predbat treats car
+  energy as not part of the measured load and disables `car_charging_hold`, so nothing is subtracted
+* if the sensor has no history, Predbat logs a warning and falls back to the `car_charging_threshold`
+  heuristic
 
 Please note the predbat.log will be in this addon_configs directory also.
 
