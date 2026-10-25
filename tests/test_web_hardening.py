@@ -17,6 +17,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -427,6 +428,93 @@ class WebHardeningTestCase(unittest.TestCase):
             return outside.status, ingress.status
 
         self.assertEqual(asyncio.run(_check()), (403, 200))
+
+    def _run_main_with_apps_yaml(self, body: str, module_name: str):
+        """Run launch.main() against a temp CONFIG_DIR with stubbed patch steps."""
+        config_dir = os.path.join(self._tmpdir, "config_" + module_name)
+        os.makedirs(config_dir)
+        with open(os.path.join(config_dir, "apps.yaml"), "w", encoding="utf-8") as handle:
+            handle.write("pred_bat:\n  module: predbat\n" + body)
+        marker = os.path.join(config_dir, "hass_started")
+        with open(os.path.join(config_dir, "hass.py"), "w", encoding="utf-8") as handle:
+            handle.write("open({!r}, 'w').close()\n".format(marker))
+
+        launch_mod = self._load_launch(module_name)
+        launch_mod.CONFIG_DIR = config_dir
+        calls = []
+        real_refuse = launch_mod.refuse_unsupported_options
+
+        def recording_refuse(path):
+            calls.append(("refuse", path))
+            return real_refuse(path)
+
+        launch_mod.refuse_unsupported_options = recording_refuse
+        for name in (
+            "block_self_update",
+            "extend_secret_names",
+            "mask_sensitive_response_fields",
+            "restrict_web_to_ingress",
+        ):
+            setattr(launch_mod, name, (lambda n: lambda: calls.append((n, None)))(name))
+
+        old_cwd, old_path, old_argv = os.getcwd(), list(sys.path), list(sys.argv)
+
+        def restore():
+            os.chdir(old_cwd)
+            sys.path[:] = old_path
+            sys.argv[:] = old_argv
+
+        self.addCleanup(restore)
+        exit_code = None
+        with redirect_stdout(io.StringIO()) as buf:
+            try:
+                launch_mod.main()
+            except SystemExit as exc:
+                exit_code = exc.code
+        restore()
+        return exit_code, calls, os.path.exists(marker), buf.getvalue(), config_dir
+
+    def test_main_refuses_unsupported_option_before_start(self) -> None:
+        code, calls, started, out, config_dir = self._run_main_with_apps_yaml(
+            "  mcp_enable: true\n", "predbat_launch_main_refuse"
+        )
+        self.assertEqual(code, 1)
+        self.assertFalse(started)
+        self.assertIn("not supported", out)
+        self.assertEqual(calls, [("refuse", os.path.join(config_dir, "apps.yaml"))])
+
+    def test_main_checks_options_first_then_starts(self) -> None:
+        code, calls, started, _out, config_dir = self._run_main_with_apps_yaml(
+            "  mcp_enable: false\n", "predbat_launch_main_ok"
+        )
+        self.assertIsNone(code)
+        self.assertTrue(started)
+        self.assertEqual(calls[0], ("refuse", os.path.join(config_dir, "apps.yaml")))
+        self.assertEqual(
+            [name for name, _ in calls[1:]],
+            [
+                "block_self_update",
+                "extend_secret_names",
+                "mask_sensitive_response_fields",
+                "restrict_web_to_ingress",
+            ],
+        )
+
+    def test_restricted_paths_exist_in_vendor_routes(self) -> None:
+        launch_mod = self._load_launch("predbat_launch_routes")
+        with open(os.path.join(REPO_ROOT, "predbat", "vendor", "web.py"), "r", encoding="utf-8") as handle:
+            source = handle.read()
+        routes = set()
+        for method, path in re.findall(
+            r"router\.add_(get|post|put|delete|patch|route)\(\s*[\"']([^\"']+)[\"']", source
+        ):
+            routes.add((method.upper(), path))
+        paths = {path for _method, path in routes}
+        self.assertIn("/", paths)
+        for path in sorted(launch_mod.BLOCKED_PATHS):
+            self.assertIn(path, paths, msg="restricted path is not a vendor route: " + path)
+        for method, path in sorted(launch_mod.BLOCKED_METHOD_PATHS):
+            self.assertIn((method, path), routes, msg="restricted route missing: {} {}".format(method, path))
 
 
 if __name__ == "__main__":
