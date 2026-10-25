@@ -307,6 +307,64 @@ class WebHardeningTestCase(unittest.TestCase):
             self.assertEqual(status, 403, msg=path)
             self.assertIn("Disabled in kamien5 fork", body)
 
+    @unittest.skipUnless(_AIOHTTP_AVAILABLE, "aiohttp not installed")
+    def test_admin_endpoints_forbidden(self) -> None:
+        import aiohttp.web as aiohttp_web
+
+        launch_mod = self._load_launch("predbat_launch_admin")
+        fake_web = types.ModuleType("web")
+        fake_web.web = aiohttp_web
+        sys.modules["web"] = fake_web
+        with redirect_stdout(io.StringIO()):
+            launch_mod.restrict_web_to_ingress()
+        middleware = fake_web.web.Application().middlewares[0]
+
+        async def ok_handler(_request):
+            return aiohttp_web.Response(text="ok")
+
+        async def status(method, path, remote="172.30.32.2"):
+            resp = await middleware(
+                types.SimpleNamespace(remote=remote, path=path, method=method),
+                ok_handler,
+            )
+            return resp.status
+
+        blocked = [
+            ("POST", "/component_config_save"),
+            ("POST", "/component_restart"),
+            ("POST", "/apps"),
+            ("POST", "/apps/"),
+            ("GET", "/download"),
+            ("GET", "/download/"),
+            ("HEAD", "/download"),
+            ("GET", "/browse"),
+            ("GET", "/internals"),
+            ("GET", "/api/internals"),
+            ("GET", "/api/internals/download"),
+        ]
+        allowed = [("GET", "/apps"), ("GET", "/"), ("GET", "/component_config")]
+
+        async def _check():
+            res = {}
+            for method, path in blocked + allowed:
+                res[(method, path)] = await status(method, path)
+                res[("loopback", method, path)] = await status(method, path, "127.0.0.1")
+            return res
+
+        res = asyncio.run(_check())
+        for method, path in blocked:
+            self.assertEqual(res[(method, path)], 403, msg=(method, path))
+            self.assertEqual(res[("loopback", method, path)], 403, msg=(method, path))
+        for method, path in allowed:
+            self.assertEqual(res[(method, path)], 200, msg=(method, path))
+
+    def test_blocked_request_helper(self) -> None:
+        launch_mod = self._load_launch("predbat_launch_helper")
+        self.assertTrue(launch_mod.is_blocked_request("post", "/apps"))
+        self.assertFalse(launch_mod.is_blocked_request("GET", "/apps"))
+        self.assertTrue(launch_mod.is_blocked_request("GET", "/api/internals/download/"))
+        self.assertFalse(launch_mod.is_blocked_request("GET", "/"))
+
 
 if __name__ == "__main__":
     unittest.main()

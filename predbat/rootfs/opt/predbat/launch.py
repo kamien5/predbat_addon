@@ -39,7 +39,34 @@ BLOCKED_PATHS = {
     "/debug_apps",
     "/debug_apps_live",
     "/apps_value",
+    # Admin endpoints: configuration is owned by the add-on, not the UI.
+    "/component_config_save",
+    "/component_restart",
+    "/download",
+    "/browse",
+    "/internals",
+    "/api/internals",
+    "/api/internals/download",
 }
+
+# (method, path) pairs disabled for all remotes; other methods stay available.
+BLOCKED_METHOD_PATHS = {
+    ("POST", "/apps"),
+}
+
+
+def _normalize_path(path: str) -> str:
+    path = path or "/"
+    if len(path) > 1:
+        path = path.rstrip("/") or "/"
+    return path
+
+
+def is_blocked_request(method: str, path: str) -> bool:
+    norm = _normalize_path(path)
+    if norm in BLOCKED_PATHS:
+        return True
+    return ((method or "GET").upper(), norm) in BLOCKED_METHOD_PATHS
 
 SECRET_MASK = "***configured***"
 
@@ -189,7 +216,7 @@ def restrict_web_to_ingress() -> None:
 
     @aiohttp_web.middleware
     async def ingress_only(request, handler):
-        if request.path in BLOCKED_PATHS:
+        if is_blocked_request(getattr(request, "method", "GET"), request.path):
             return aiohttp_web.Response(
                 text="Disabled in kamien5 fork", status=403
             )
