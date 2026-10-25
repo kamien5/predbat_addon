@@ -78,7 +78,7 @@ apps.yaml `prediction_kernel_enable`.
 
 ## 5. apps.yaml i dane w repo
 
-`predbat/rootfs/apps.yaml` = pakiet v5 (sha256 `a484c349b22a91479180d44507ac2dbd3f7ef8fafbc8bbc4af448dc4b0abc625`):
+`predbat/rootfs/apps.yaml` = pakiet v5 + prio2 (sha256 `bc4b790e3a8f63230f6ce3e4b680a9cab51d4f6212cc6072dae3f2862da3f1ee`; jedyna zmiana względem v5: `car_charging_energy` + komentarz):
 tylko nazwy encji i parametry; placeholdery `__HA_LATITUDE__`, `__HA_LONGITUDE__`, `__HA_NOTIFY_DEVICE__`.
 Przy każdym starcie `startup.py`: weryfikuje sha256, pobiera współrzędne z HA `GET /api/config`
 (token z env, bez proxy i przekierowań), bierze `notify_device` z opcji add-onu (`^[a-z0-9_]+$`,

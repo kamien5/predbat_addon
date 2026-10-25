@@ -98,5 +98,10 @@ pred_bat:
   battery_scaling: [1.0]
   import_export_scaling: 1.0
 
-  num_cars: 0                                          # grudzień: 1 + encje go-e (osobny diff)
+  # [ZMIANA -prio2] Plan magazynu ma pierwszeństwo, EV dostaje resztę (od 1.11). Predbat NIE planuje auta i NIE trzyma
+  # magazynu dla auta: num_cars 0 (brak slotów, brak car_charging_now, brak "hold for car"). Jedyna rola EV w Predbacie:
+  # car_charging_hold + car_charging_energy wycinają energię EV z historii zużycia domu (fetch.py ok. 418, 4484 - działa przy
+  # num_cars 0), żeby prognoza domu i plan magazynu nie liczyły auta. Energia: sensor szablonowy HA (bez numeru seryjnego w repo).
+  num_cars: 0
+  car_charging_energy: sensor.ev_energia_calkowita     # kWh, total_increasing
   car_charging_hold: True
