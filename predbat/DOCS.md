@@ -36,6 +36,9 @@ If you want to buy me a beer then please use Paypal - [tdlj@tdlj.net](mailto:tdl
   ```
 
   A fork published under another URL gets a different directory name.
+* The hash is computed from the repository URL exactly as it is entered in Home Assistant (only
+  lowercased). A trailing `.git` or `/`, or a `#branch` suffix, gives a different directory, so add
+  the repository exactly as `https://github.com/kamien5/predbat_addon`
 * Click restart on the app if need be
 
 ### EV charging energy (`car_charging_energy`)
