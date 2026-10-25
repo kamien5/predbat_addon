@@ -267,32 +267,82 @@ def restrict_web_to_ingress() -> None:
     )
 
 
+def _option_is_off(value) -> bool:
+    """True only for an explicit false/absent value; everything else counts as enabled."""
+    if value is None or value is False:
+        return True
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value == 0
+    if isinstance(value, str):
+        return value.strip().lower() in _FALSE_VALUES
+    return False
+
+
+def _refuse(option: str, reason: str = "is not supported") -> None:
+    print("Error: apps.yaml option {} {} in the kamien5 fork".format(option, reason))
+    sys.exit(1)
+
+
 def refuse_unsupported_options(apps_yaml_path: str) -> None:
     """
-    Exit 1 if apps.yaml enables an option this fork does not support.
+    Exit 1 unless every option in FORBIDDEN_ENABLED_OPTIONS is off in apps.yaml.
 
-    Line-based check (stdlib only); any value other than an explicit false
-    is treated as enabled, so unknown spellings fail closed.
+    1. The file is parsed the way Predbat reads it (utils.load_apps_yaml:
+       yaml.safe_load with a !secret constructor, then the pred_bat section),
+       so flow style, merge keys (<<), escaped or complex (?) keys and values
+       on the next line resolve exactly as Predbat would see them. An option
+       counts as off only if it is absent or an explicit false value (false,
+       no, off, 0, null, ~ or an empty string); a !secret reference, true, any
+       other string or a non-scalar counts as enabled.
+    2. Additionally, any line that sets the option directly to a value other
+       than an explicit false fails, which also catches duplicate keys where
+       the parser keeps only the last value.
+
+    A missing or unreadable file, a YAML error, a missing pred_bat section or
+    a missing yaml module also exit 1: Predbat could not start in those cases
+    either, and the check must not be skipped silently.
     """
     try:
         with open(apps_yaml_path, "r", encoding="utf-8") as handle:
-            lines = handle.read().splitlines()
-    except FileNotFoundError:
-        return
+            text = handle.read()
+    except OSError:
+        print("Error: apps.yaml could not be read for the option check")
+        sys.exit(1)
+
+    try:
+        import yaml
+    except ImportError:
+        print("Error: yaml module missing, cannot check apps.yaml options")
+        sys.exit(1)
+
+    class _CheckLoader(yaml.SafeLoader):
+        pass
+
+    secret_ref = object()
+    _CheckLoader.add_constructor("!secret", lambda _loader, _node: secret_ref)
+
+    try:
+        data = yaml.load(text, Loader=_CheckLoader)  # noqa: S506 - SafeLoader subclass
+    except yaml.YAMLError:
+        print("Error: apps.yaml could not be parsed for the option check")
+        sys.exit(1)
+    if not isinstance(data, dict) or not isinstance(data.get("pred_bat"), dict):
+        print("Error: apps.yaml has no pred_bat section")
+        sys.exit(1)
+    root = data["pred_bat"]
+
     for option in FORBIDDEN_ENABLED_OPTIONS:
+        if option in root and (root[option] is secret_ref or not _option_is_off(root[option])):
+            _refuse(option)
+
         pattern = re.compile(r"^\s*['\"]?" + re.escape(option) + r"['\"]?\s*:(.*)$")
-        for line in lines:
+        for line in text.splitlines():
             match = pattern.match(line)
             if not match:
                 continue
-            value = match.group(1).split("#", 1)[0].strip().strip("'\"").lower()
-            if value not in _FALSE_VALUES:
-                print(
-                    "Error: apps.yaml option {} is not supported in the kamien5 fork".format(
-                        option
-                    )
-                )
-                sys.exit(1)
+            value = match.group(1).split("#", 1)[0].strip().strip("'\"")
+            if not _option_is_off(value):
+                _refuse(option)
 
 
 def main() -> None:

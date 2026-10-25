@@ -26,6 +26,13 @@ import unittest
 from contextlib import redirect_stdout
 
 try:
+    import yaml  # noqa: F401
+
+    _YAML_AVAILABLE = True
+except ImportError:
+    _YAML_AVAILABLE = False
+
+try:
     import aiohttp  # noqa: F401
 
     _AIOHTTP_AVAILABLE = True
@@ -394,6 +401,7 @@ class WebHardeningTestCase(unittest.TestCase):
             handle.write("pred_bat:\n  module: predbat\n" + body)
         return path
 
+    @unittest.skipUnless(_YAML_AVAILABLE, "pyyaml not installed")
     def test_unsupported_option_enabled_exits(self) -> None:
         launch_mod = self._load_launch("predbat_launch_options")
         for value in ("true", "True", "yes", "on", "1", "'true'", "\"yes\"", "maybe"):
@@ -404,6 +412,7 @@ class WebHardeningTestCase(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 1, msg=value)
             self.assertIn("not supported", buf.getvalue())
 
+    @unittest.skipUnless(_YAML_AVAILABLE, "pyyaml not installed")
     def test_unsupported_option_absent_or_false_passes(self) -> None:
         launch_mod = self._load_launch("predbat_launch_options_ok")
         bodies = ["", "  mcp_enable: false\n", "  mcp_enable: False # off\n",
@@ -411,8 +420,75 @@ class WebHardeningTestCase(unittest.TestCase):
         for body in bodies:
             path = self._write_apps_yaml(body)
             launch_mod.refuse_unsupported_options(path)
-        launch_mod.refuse_unsupported_options(os.path.join(self._tmpdir, "missing.yaml"))
 
+    def _write_raw_yaml(self, text: str) -> str:
+        path = os.path.join(self._tmpdir, "apps_raw.yaml")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+
+    def _assert_refused(self, launch_mod, text: str) -> str:
+        path = self._write_raw_yaml(text)
+        with redirect_stdout(io.StringIO()) as buf:
+            with self.assertRaises(SystemExit) as ctx:
+                launch_mod.refuse_unsupported_options(path)
+        self.assertEqual(ctx.exception.code, 1, msg=text)
+        return buf.getvalue()
+
+    def _assert_allowed(self, launch_mod, text: str) -> None:
+        path = self._write_raw_yaml(text)
+        with redirect_stdout(io.StringIO()) as buf:
+            launch_mod.refuse_unsupported_options(path)
+        self.assertEqual(buf.getvalue(), "", msg=text)
+
+    @unittest.skipUnless(_YAML_AVAILABLE, "pyyaml not installed")
+    def test_option_check_parses_yaml_like_predbat(self) -> None:
+        launch_mod = self._load_launch("predbat_launch_yaml_forms")
+        enabled_forms = {
+            "flow style": "pred_bat: {module: predbat, mcp_enable: true}\n",
+            "value on next line": "pred_bat:\n  module: predbat\n  mcp_enable:\n    true\n",
+            "merge key": (
+                "defaults: &d\n  mcp_enable: true\n"
+                "pred_bat:\n  <<: *d\n  module: predbat\n"
+            ),
+            "escaped key": 'pred_bat:\n  module: predbat\n  "mcp\\u005fenable": true\n',
+            "hex escaped key": 'pred_bat:\n  module: predbat\n  "mcp\\x5fenable": yes\n',
+            "complex key": "pred_bat:\n  module: predbat\n  ? mcp_enable\n  : true\n",
+            "secret reference": "pred_bat:\n  module: predbat\n  mcp_enable: !secret mcp\n",
+            "duplicate key": "pred_bat:\n  module: predbat\n  mcp_enable: true\n  mcp_enable: false\n",
+            "non-scalar": "pred_bat:\n  module: predbat\n  mcp_enable: [false]\n",
+            "anchor alias": "x: &on true\npred_bat:\n  module: predbat\n  mcp_enable: *on\n",
+        }
+        for name, text in enabled_forms.items():
+            out = self._assert_refused(launch_mod, text)
+            self.assertIn("not supported", out, msg=name)
+
+    @unittest.skipUnless(_YAML_AVAILABLE, "pyyaml not installed")
+    def test_option_check_allows_explicit_off_forms(self) -> None:
+        launch_mod = self._load_launch("predbat_launch_yaml_off")
+        for text in (
+            "pred_bat: {module: predbat, mcp_enable: false}\n",
+            "pred_bat:\n  module: predbat\n  mcp_enable:\n    false\n",
+            "pred_bat:\n  module: predbat\n  mcp_enable: 'false'\n",
+            "pred_bat:\n  module: predbat\n  mcp_enable: ~\n",
+            "pred_bat:\n  module: predbat\n  mcp_enable: 0\n",
+            "defaults: &d\n  mcp_enable: false\npred_bat:\n  <<: *d\n  module: predbat\n",
+            "pred_bat:\n  module: predbat\n",
+        ):
+            self._assert_allowed(launch_mod, text)
+
+    @unittest.skipUnless(_YAML_AVAILABLE, "pyyaml not installed")
+    def test_option_check_fails_closed_on_unusable_file(self) -> None:
+        launch_mod = self._load_launch("predbat_launch_yaml_bad")
+        self._assert_refused(launch_mod, "pred_bat: [unclosed\n")
+        self._assert_refused(launch_mod, "other_app:\n  module: x\n")
+        self._assert_refused(launch_mod, "- just\n- a list\n")
+        with redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                launch_mod.refuse_unsupported_options(os.path.join(self._tmpdir, "missing.yaml"))
+        self.assertEqual(ctx.exception.code, 1)
+
+    @unittest.skipUnless(_YAML_AVAILABLE, "pyyaml not installed")
     def test_shipped_apps_yaml_passes_option_check(self) -> None:
         launch_mod = self._load_launch("predbat_launch_options_shipped")
         launch_mod.refuse_unsupported_options(
@@ -496,6 +572,7 @@ class WebHardeningTestCase(unittest.TestCase):
         restore()
         return exit_code, calls, os.path.exists(marker), buf.getvalue(), config_dir
 
+    @unittest.skipUnless(_YAML_AVAILABLE, "pyyaml not installed")
     def test_main_refuses_unsupported_option_before_start(self) -> None:
         code, calls, started, out, config_dir = self._run_main_with_apps_yaml(
             "  mcp_enable: true\n", "predbat_launch_main_refuse"
@@ -505,6 +582,7 @@ class WebHardeningTestCase(unittest.TestCase):
         self.assertIn("not supported", out)
         self.assertEqual(calls, [("refuse", os.path.join(config_dir, "apps.yaml"))])
 
+    @unittest.skipUnless(_YAML_AVAILABLE, "pyyaml not installed")
     def test_main_checks_options_first_then_starts(self) -> None:
         code, calls, started, _out, config_dir = self._run_main_with_apps_yaml(
             "  mcp_enable: false\n", "predbat_launch_main_ok"
