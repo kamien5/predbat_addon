@@ -2,17 +2,21 @@
 
 ## Automated
 
-From the repository root (Python 3.9+):
+From the repository root, install the pinned requirements first (Python 3.12,
+the same as the add-on image), otherwise the aiohttp-dependent web tests are
+skipped:
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m venv .venv
+.venv/bin/pip install --require-hashes -r predbat/requirements.txt
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
-These tests use the standard library only. They exercise `predbat/rootfs/startup.py`
+The test code itself uses the standard library only. They exercise `predbat/rootfs/startup.py`
 against a temporary copy of the pinned `predbat/vendor` tree, plus config/build
 static checks and launch web hardening. They do not start Home Assistant or
-Predbat (`PREDBAT_SKIP_LAUNCH=1`). aiohttp-dependent web tests skip when aiohttp
-is not installed.
+Predbat (`PREDBAT_SKIP_LAUNCH=1`). Without the requirements, the aiohttp-dependent
+web tests are reported as skipped, not passed.
 
 Defensive hardening covered here: mask secret-like and location fields in web
 UI/API responses, restrict UI to ingress, disable raw apps.yaml editor/export

@@ -4,20 +4,10 @@ configuration:
     name: Log level
     description: >-
       Controls the level of log details the add-on provides.
-  system_packages:
-    name: System packages
+  notify_device:
+    name: Notify device
     description: >-
-      Allows you to specificy a list of additional Alpine Linux packages to be
-      installed before starts.
-  python_packages:
-    name: Python packages
-    description: >-
-      Allows you to specificy a list of additional Python packages to be
-      installed
-  init_commands:
-    name: Init commands
-    description: >-
-      Allows you to specificy a list of custom shell commands that are ran
-      before start
-network:
-  5050/tcp: The AppDaemon webserver
+      Home Assistant notify service used by Predbat, without the "notify."
+      prefix (for example mobile_app_my_phone). Lowercase letters, digits and
+      underscores only. Leave empty to disable Predbat notifications
+      (notify_devices: []).
