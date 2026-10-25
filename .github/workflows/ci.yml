@@ -1,0 +1,101 @@
+---
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unittest:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Verify vendored code against MANIFEST.sha256
+        working-directory: predbat/vendor
+        run: |
+          sha256sum --strict -c --quiet ../MANIFEST.sha256
+          test "$(find . -type f | wc -l)" -eq "$(wc -l < ../MANIFEST.sha256)"
+
+      - name: Install pinned requirements
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --no-cache-dir --require-hashes --only-binary=:all: -r predbat/requirements.txt
+
+      - name: Run tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          .venv/bin/python -m unittest discover -s tests -v 2>&1 | tee unittest.log
+          if grep -Eq '(^| )skipped' unittest.log; then
+            echo "::error::tests were skipped; all tests must run in CI"
+            exit 1
+          fi
+
+  docker-build:
+    name: Docker build (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: aarch64
+            platform: linux/arm64
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        if: matrix.arch == 'aarch64'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.38.1
+          driver-opts: image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+
+      - name: Build image (no publish)
+        env:
+          ARCH: ${{ matrix.arch }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          BUILD_FROM="$(sed -n "s/^  ${ARCH}: \"\(.*\)\"$/\1/p" predbat/build.yaml)"
+          case "$BUILD_FROM" in
+            *@sha256:*) ;;
+            *) echo "::error::build_from for ${ARCH} is not pinned by digest"; exit 1 ;;
+          esac
+          docker buildx build \
+            --platform "$PLATFORM" \
+            --build-arg "BUILD_FROM=$BUILD_FROM" \
+            --build-arg "BUILD_ARCH=$ARCH" \
+            --build-arg "BUILD_VERSION=ci" \
+            --output type=cacheonly \
+            predbat
