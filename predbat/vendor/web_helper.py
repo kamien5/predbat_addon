@@ -1,0 +1,10210 @@
+# -----------------------------------------------------------------------------
+# Predbat Home Battery System
+# Copyright Trefor Southwell 2026 - All Rights Reserved
+# This application maybe used for personal use only and not for commercial use
+# -----------------------------------------------------------------------------
+# fmt off
+# pylint: disable=consider-using-f-string
+# pylint: disable=line-too-long
+# pylint: disable=attribute-defined-outside-init
+#
+# Helper functions for web pages
+
+
+"""Web UI component generators for CSS and JavaScript.
+
+Contains functions that generate CSS stylesheets and JavaScript code for
+all web dashboard UI components including charts (ApexCharts), entity
+selectors, form controls, code editors (CodeMirror), modals, and responsive
+navigation menus.
+"""
+
+
+def get_refresh_inverter_js():
+    """
+    Returns CSS and JavaScript code for refreshing inverter data.
+    """
+    return """
+        <style>
+        @keyframes inverterStatusFadeOut {
+            0%   { opacity: 1; }
+            60%  { opacity: 1; }
+            100% { opacity: 0; }
+        }
+        #inverterRefreshStatus {
+            display: inline-block;
+            font-size: 13px;
+            color: #666;
+        }
+        #inverterRefreshStatus.fade-out {
+            animation: inverterStatusFadeOut 4s forwards;
+        }
+        </style>
+        <script>
+        function refreshInverterData() {
+            var btn = document.getElementById('inverterRefreshBtn');
+            var status = document.getElementById('inverterRefreshStatus');
+            btn.disabled = true;
+            btn.style.backgroundColor = '#90CAF9';
+            btn.textContent = 'Refreshing\u2026';
+            status.className = '';
+            status.style.color = '#666';
+            status.textContent = '';
+            fetch('./inverter_refresh', {method: 'POST'})
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    status.style.color = '#4CAF50';
+                    status.textContent = 'Done \u2014 reloading in 20s\u2026';
+                    setTimeout(function() { status.classList.add('fade-out'); }, 100);
+                    setTimeout(function() { location.reload(); }, 20000);
+                })
+                .catch(function(e) {
+                    btn.disabled = false;
+                    btn.style.backgroundColor = '#2196F3';
+                    btn.textContent = 'Refresh';
+                    status.style.color = '#f44336';
+                    status.textContent = 'Refresh failed';
+                    setTimeout(function() { status.classList.add('fade-out'); }, 2000);
+                    console.error('Refresh failed:', e);
+                });
+        }
+        </script>
+    """
+
+
+def get_restart_button_js():
+    # Add JavaScript for restart functionality
+    text = """
+<script>
+async function restartComponent(componentName) {
+    const button = event.target;
+    const originalText = button.textContent;
+
+    // Disable button and show loading state
+    button.disabled = true;
+    button.textContent = 'Restarting...';
+
+    try {
+        const response = await fetch('./component_restart', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            body: `component=${encodeURIComponent(componentName)}`
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            button.textContent = 'Restarted!';
+            button.style.backgroundColor = '#4CAF50';
+
+            // Show success message briefly, then restore button
+            setTimeout(() => {
+                button.disabled = false;
+                button.textContent = originalText;
+                button.style.backgroundColor = '';
+                // Optionally refresh the page to show updated status
+                location.reload();
+            }, 2000);
+        } else {
+            throw new Error(result.message || 'Unknown error');
+        }
+    } catch (error) {
+        console.error('Error restarting component:', error);
+        button.textContent = 'Error!';
+        button.style.backgroundColor = '#f44336';
+
+        // Restore button after showing error
+        setTimeout(() => {
+            button.disabled = false;
+            button.textContent = originalText;
+            button.style.backgroundColor = '';
+        }, 2000);
+
+        alert('Failed to restart component: ' + error.message);
+    }
+}
+</script>
+"""
+    return text
+
+
+def get_entity_detailed_row_js():
+    text = """
+    <script>
+    function toggleDetailRow(rowIndex) {
+        var mainRow = document.getElementById('row_' + rowIndex);
+        var detailRows = document.querySelectorAll('#detail_' + rowIndex);
+        var timeCell = mainRow.cells[0];
+        var isExpanded = mainRow.classList.contains('expanded');
+
+        if (isExpanded) {
+            // Collapse
+            detailRows.forEach(function(row) {
+                row.style.display = 'none';
+            });
+            mainRow.classList.remove('expanded');
+            timeCell.innerHTML = timeCell.innerHTML.replace('\u25bc', '\u25b6');
+        } else {
+            // Expand
+            detailRows.forEach(function(row) {
+                row.style.display = 'table-row';
+            });
+            mainRow.classList.add('expanded');
+            timeCell.innerHTML = timeCell.innerHTML.replace('\u25b6', '\u25bc');
+        }
+    }
+    </script>
+    """
+    return text
+
+
+def get_entity_js(selected_entities_json, entity_attributes_json):
+    text = (
+        """
+        <script>
+        // Entity data structure
+        let allEntities = [];
+        let filteredEntities = [];
+        let selectedIndex = -1;
+        let isDropdownVisible = false;
+        let selectedEntities = """
+        + selected_entities_json
+        + """;
+        let entityAttributes = """
+        + entity_attributes_json
+        + """;
+
+        // Initialise entity data
+
+        document.addEventListener('DOMContentLoaded', function() {
+            // Restore the "Show All" preference across page loads (e.g. after submitting the
+            // entity form to add another entity, which is a full page navigation, not an
+            // in-place update)
+            var showAll = localStorage.getItem('entityShowAllEntities') === 'true';
+            var showAllCheckbox = document.getElementById('showAllEntities');
+            if (showAllCheckbox) {
+                showAllCheckbox.checked = showAll;
+            }
+            // Load entity data from API
+            loadEntityData(showAll);
+        });
+
+        async function loadEntityData(showAll) {
+            try {
+                const url = showAll ? './api/entities?all=1' : './api/entities';
+                const response = await fetch(url);
+                if (!response.ok) {
+                    throw new Error('Failed to load entities');
+                }
+                allEntities = await response.json();
+
+                // Set up event listeners after data is loaded
+                setupEventListeners();
+                updateSelectedEntitiesDisplay();
+            } catch (error) {
+                console.error('Error loading entities:', error);
+                allEntities = [];
+                setupEventListeners();
+            }
+        }
+
+        function toggleShowAll(checked) {
+            localStorage.setItem('entityShowAllEntities', checked ? 'true' : 'false');
+            loadEntityData(checked).then(function() {
+                if (isDropdownVisible) {
+                    filterEntityOptions();
+                }
+            });
+        }
+
+        function setupEventListeners() {
+            const entityInput = document.getElementById('entitySearchInput');
+            const clearButton = document.getElementById('clearEntitySearch');
+            const entityForm = document.getElementById('entitySelectForm');
+
+            if (entityInput) {
+                entityInput.addEventListener('input', filterEntityOptions);
+                entityInput.addEventListener('keydown', handleEntityKeyDown);
+                entityInput.addEventListener('focus', showAllEntities);
+                entityInput.addEventListener('click', showAllEntities);
+            }
+
+            if (clearButton) {
+                clearButton.addEventListener('click', function() {
+                    entityInput.value = '';
+                    hideEntityDropdown();
+                    entityInput.focus();
+                });
+            }
+
+            // Intercept form submission to add selected entities and attributes as hidden inputs
+            if (entityForm) {
+                entityForm.addEventListener('submit', function(event) {
+                    // Remove any existing entity_id and entity_attribute inputs
+                    const existingInputs = entityForm.querySelectorAll('input[name=\"entity_id\"], input[name=\"entity_attribute\"]');
+                    existingInputs.forEach(input => input.remove());
+
+                    // Add hidden inputs for each selected entity and its attribute
+                    selectedEntities.forEach(selection => {
+                        const hiddenEntityInput = document.createElement('input');
+                        hiddenEntityInput.type = 'hidden';
+                        hiddenEntityInput.name = 'entity_id';
+                        hiddenEntityInput.value = selection.entity;
+                        entityForm.appendChild(hiddenEntityInput);
+
+                        const hiddenAttrInput = document.createElement('input');
+                        hiddenAttrInput.type = 'hidden';
+                        hiddenAttrInput.name = 'entity_attribute';
+                        hiddenAttrInput.value = selection.attributes.join(',');
+                        entityForm.appendChild(hiddenAttrInput);
+                    });
+                });
+            }
+
+            // Set up click outside handler
+            document.addEventListener('click', function(event) {
+                const container = document.querySelector('.entity-search-container');
+                if (!container.contains(event.target)) {
+                    hideEntityDropdown();
+                }
+            });
+        }
+
+        function updateSelectedEntitiesDisplay() {
+            const display = document.getElementById('selectedEntitiesDisplay');
+            if (!display) return;
+
+            if (selectedEntities.length === 0) {
+                display.innerHTML = '<span style=\"color: #999;\">No entities selected</span>';
+                return;
+            }
+
+            // Create table for selected entities with attribute checkboxes
+            let html = '<table style=\"width: 100%; border-collapse: collapse;\">';
+            html += '<thead><tr>';
+            html += '<th style=\"text-align: left; padding: 8px; border-bottom: 2px solid #ddd;\">Entity</th>';
+            html += '<th style=\"text-align: left; padding: 8px; border-bottom: 2px solid #ddd;\">Attributes</th>';
+            html += '<th style=\"text-align: center; padding: 8px; border-bottom: 2px solid #ddd; width: 50px;\">Remove</th>';
+            html += '</tr></thead><tbody>';
+
+            selectedEntities.forEach((selection, idx) => {
+                const entity = allEntities.find(e => e.id === selection.entity);
+                const entityName = entity ? entity.name : selection.entity;
+                const availableAttrs = entityAttributes[selection.entity] || [];
+
+                html += '<tr style=\"border-bottom: 1px solid #eee;\">';
+                html += '<td style=\"padding: 8px;\">' + entityName + '</td>';
+                html += '<td style=\"padding: 8px; position: relative;\">';
+
+                // Multi-select dropdown with tag display
+                html += '<div class=\"attr-select-container\" id=\"attr-container-' + idx + '\">';
+
+                // Display selected attributes as tags
+                html += '<div class=\"attr-tags\" onclick=\"toggleAttrDropdown(' + idx + ')\" style=\"cursor: pointer; min-height: 30px; padding: 4px 8px; border: 1px solid #ddd; border-radius: 4px; background: var(--input-background, #fff);\">';
+                if (selection.attributes.length === 0 || (selection.attributes.length === 1 && selection.attributes[0] === '')) {
+                    html += '<span style=\"color: #999;\">state (default)</span>';
+                } else {
+                    selection.attributes.forEach(attr => {
+                        const displayName = attr === '' ? 'state' : attr;
+                        html += '<span class=\"attr-tag\">' + displayName + '</span>';
+                    });
+                }
+                html += '<span style=\"float: right; color: #999;\">\u25bc</span>';
+                html += '</div>';
+
+                // Dropdown menu (hidden by default)
+                html += '<div class=\"attr-dropdown\" id=\"attr-dropdown-' + idx + '\" style=\"display: none;\">';
+
+                // State option
+                const stateChecked = selection.attributes.includes('') ? ' checked' : '';
+                html += '<label class=\"attr-option\">';
+                html += '<input type=\"checkbox\" onchange=\"toggleEntityAttribute(' + idx + ', \\'\\')\"' + stateChecked + ' />';
+                html += '<span style=\"font-weight: bold;\">state (default)</span>';
+                html += '</label>';
+
+                // Other attributes
+                availableAttrs.forEach(attr => {
+                    const attrChecked = selection.attributes.includes(attr) ? ' checked' : '';
+                    html += '<label class=\"attr-option\">';
+                    html += '<input type=\"checkbox\" onchange=\"toggleEntityAttribute(' + idx + ', \\'' + attr + '\\')\"' + attrChecked + ' />';
+                    html += attr;
+                    html += '</label>';
+                });
+
+                html += '</div>';
+                html += '</div>';
+
+                html += '</td>';
+                html += '<td style=\"padding: 8px; text-align: center;\">';
+                html += '<button type=\"button\" onclick=\"removeEntity(' + idx + ')\" style=\"background: #ff4444; color: white; border: none; border-radius: 4px; cursor: pointer; padding: 4px 12px; font-weight: bold;\" title=\"Remove\">X</button>';
+                html += '</td>';
+                html += '</tr>';
+            });
+
+            html += '</tbody></table>';
+            display.innerHTML = html;
+        }
+
+        function toggleAttrDropdown(index) {
+            const dropdown = document.getElementById('attr-dropdown-' + index);
+            if (dropdown) {
+                const isVisible = dropdown.style.display !== 'none';
+                // Close all other dropdowns
+                document.querySelectorAll('.attr-dropdown').forEach(d => d.style.display = 'none');
+                // Toggle this dropdown
+                dropdown.style.display = isVisible ? 'none' : 'block';
+            }
+        }
+
+        function toggleEntityAttribute(index, attribute) {
+            if (index >= 0 && index < selectedEntities.length) {
+                const attrs = selectedEntities[index].attributes;
+                const attrIndex = attrs.indexOf(attribute);
+
+                if (attrIndex >= 0) {
+                    // Remove attribute
+                    attrs.splice(attrIndex, 1);
+                } else {
+                    // Add attribute
+                    attrs.push(attribute);
+                }
+
+                // Ensure at least one attribute is selected (default to state)
+                if (attrs.length === 0) {
+                    attrs.push('');
+                }
+
+                updateSelectedEntitiesDisplay();
+                autoSubmitForm(); // Automatically update chart
+            }
+        }
+
+        // Close dropdown when clicking outside
+        document.addEventListener('click', function(event) {
+            if (!event.target.closest('.attr-select-container')) {
+                document.querySelectorAll('.attr-dropdown').forEach(d => d.style.display = 'none');
+            }
+        });
+
+        function toggleEntitySelection(entityId) {
+            const index = selectedEntities.findIndex(s => s.entity === entityId);
+            if (index >= 0) {
+                selectedEntities.splice(index, 1);
+            } else {
+                selectedEntities.push({ entity: entityId, attributes: [''] });
+            }
+            updateSelectedEntitiesDisplay();
+            renderEntityDropdown(); // Re-render to update checkboxes
+            autoSubmitForm(); // Automatically update chart
+        }
+
+        function removeEntity(index) {
+            if (index >= 0 && index < selectedEntities.length) {
+                selectedEntities.splice(index, 1);
+                updateSelectedEntitiesDisplay();
+                if (isDropdownVisible) {
+                    renderEntityDropdown(); // Update checkboxes if dropdown is open
+                }
+                autoSubmitForm(); // Automatically update chart
+            }
+        }
+
+        function autoSubmitForm() {
+            const entityForm = document.getElementById('entitySelectForm');
+            if (entityForm) {
+                // Manually add hidden inputs before submitting
+                const existingInputs = entityForm.querySelectorAll('input[name=\"entity_id\"], input[name=\"entity_attribute\"]');
+                existingInputs.forEach(input => input.remove());
+
+                selectedEntities.forEach(selection => {
+                    const hiddenEntityInput = document.createElement('input');
+                    hiddenEntityInput.type = 'hidden';
+                    hiddenEntityInput.name = 'entity_id';
+                    hiddenEntityInput.value = selection.entity;
+                    entityForm.appendChild(hiddenEntityInput);
+
+                    const hiddenAttrInput = document.createElement('input');
+                    hiddenAttrInput.type = 'hidden';
+                    hiddenAttrInput.name = 'entity_attribute';
+                    hiddenAttrInput.value = selection.attributes.join(',');
+                    entityForm.appendChild(hiddenAttrInput);
+                });
+
+                entityForm.submit();
+            }
+        }
+
+        function filterEntityOptions() {
+            const input = document.getElementById('entitySearchInput');
+            const dropdown = document.getElementById('entityDropdown');
+            const searchTerm = input.value.toLowerCase();
+
+            // Show all entities if no search term, or filter based on search term
+            if (searchTerm.length === 0) {
+                filteredEntities = [...allEntities]; // Show all entities
+            } else {
+                // Filter entities
+                filteredEntities = allEntities.filter(entity =>
+                    entity.name.toLowerCase().includes(searchTerm) ||
+                    entity.id.toLowerCase().includes(searchTerm)
+                );
+            }
+
+            renderEntityDropdown();
+        }
+
+        function showAllEntities() {
+            const input = document.getElementById('entitySearchInput');
+            // If input is empty or contains a selection, show all entities
+            if (input.value === '' || input.value.includes('(')) {
+                filteredEntities = [...allEntities];
+                renderEntityDropdown();
+            }
+        }
+
+        function renderEntityDropdown() {
+            const dropdown = document.getElementById('entityDropdown');
+
+            // Group filtered entities
+            const groups = {};
+            filteredEntities.forEach(entity => {
+                if (!groups[entity.group]) {
+                    groups[entity.group] = [];
+                }
+                groups[entity.group].push(entity);
+            });
+
+            // Detect if we're in dark mode by checking body class or computed styles
+            const isDarkMode = document.body.classList.contains('dark-mode') ||
+                              getComputedStyle(document.body).backgroundColor.includes('rgb(51, 51, 51)') ||
+                              getComputedStyle(document.body).color.includes('rgb(255, 255, 255)');
+
+            // Render dropdown
+            let html = '';
+
+            Object.keys(groups).forEach(groupName => {
+                html += '<div class="entity-group-header">' + groupName + '</div>';
+                groups[groupName].forEach((entity, index) => {
+                    const globalIndex = filteredEntities.indexOf(entity);
+                    const nameColor = isDarkMode ? '#ffffff' : '#333333';
+                    const idColor = isDarkMode ? '#cccccc' : '#666666';
+                    const isChecked = selectedEntities.some(s => s.entity === entity.id);
+
+                    html += '<div class="entity-option" data-index="' + globalIndex + '" onclick="toggleEntitySelection(\\'' + entity.id + '\\')">';
+                    html += '<input type="checkbox" ' + (isChecked ? 'checked' : '') + ' onclick="event.stopPropagation(); toggleEntitySelection(\\'' + entity.id + '\\')" style="margin-right: 8px;" />';
+                    html += '<div style="flex: 1; display: flex; justify-content: space-between;">';
+                    html += '<span class="entity-name" style="color: ' + nameColor + ' !important;">' + entity.name + '</span>';
+                    html += '<span class="entity-id" style="color: ' + idColor + ' !important;">' + entity.id + '</span>';
+                    html += '</div>';
+                    html += '</div>';
+                });
+            });
+
+            if (html === '' || filteredEntities.length === 0) {
+                const textColor = isDarkMode ? '#ffffff' : '#333333';
+                html = '<div class="entity-option" style="color: ' + textColor + ' !important;">No entities found</div>';
+            }
+
+            dropdown.innerHTML = html;
+            dropdown.style.display = 'block';
+            isDropdownVisible = true;
+            selectedIndex = -1;
+        }
+
+        function hideEntityDropdown() {
+            const dropdown = document.getElementById('entityDropdown');
+            dropdown.style.display = 'none';
+            isDropdownVisible = false;
+            selectedIndex = -1;
+        }
+
+        function handleEntityKeyDown(event) {
+            if (!isDropdownVisible) return;
+
+            const options = document.querySelectorAll('.entity-option[data-index]');
+
+            if (event.key === 'ArrowDown') {
+                event.preventDefault();
+                selectedIndex = Math.min(selectedIndex + 1, options.length - 1);
+                updateSelection(options);
+            } else if (event.key === 'ArrowUp') {
+                event.preventDefault();
+                selectedIndex = Math.max(selectedIndex - 1, -1);
+                updateSelection(options);
+            } else if (event.key === 'Enter') {
+                event.preventDefault();
+                if (selectedIndex >= 0 && options[selectedIndex]) {
+                    const entityIndex = parseInt(options[selectedIndex].getAttribute('data-index'));
+                    const entity = filteredEntities[entityIndex];
+                    if (entity) {
+                        toggleEntitySelection(entity.id);
+                    }
+                }
+            } else if (event.key === 'Escape') {
+                event.preventDefault();
+                hideEntityDropdown();
+            }
+        }
+
+        function updateSelection(options) {
+            options.forEach((option, index) => {
+                option.classList.toggle('selected', index === selectedIndex);
+            });
+
+            if (selectedIndex >= 0 && options[selectedIndex]) {
+                options[selectedIndex].scrollIntoView({ block: 'nearest' });
+            }
+        }
+        </script>
+    """
+    )
+    return text
+
+
+def get_entity_css():
+    html = """
+        <style>
+        .entity-search-container {
+            position: relative;
+        }
+        .entity-dropdown {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            min-width: 500px;
+            background: white;
+            border: 1px solid #ddd;
+            border-top: none;
+            max-height: 400px;
+            overflow-y: auto;
+            z-index: 1000;
+            display: none;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .entity-option {
+            padding: 10px 15px;
+            cursor: pointer;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .entity-option:hover,
+        .entity-option.selected {
+            background-color: #f0f0f0;
+        }
+        .entity-option input[type="checkbox"] {
+            flex-shrink: 0;
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+        }
+        .entity-option .entity-name {
+            font-weight: bold;
+            flex: 0 1 40%;
+            margin-right: 15px;
+            font-size: 14px;
+            word-break: break-word;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            color: #333;
+        }
+        .entity-option .entity-id {
+            color: #666;
+            font-size: 11px;
+            flex: 0 1 60%;
+            text-align: right;
+            font-family: monospace;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .entity-group-header {
+            padding: 8px 10px;
+            background-color: #f5f5f5;
+            font-weight: bold;
+            color: #333;
+            border-bottom: 1px solid #ddd;
+            font-size: 12px;
+        }
+        /* Dark mode styles */
+        body.dark-mode .entity-dropdown {
+            background: #333 !important;
+            border: 1px solid #666 !important;
+            color: #fff !important;
+        }
+        body.dark-mode .entity-dropdown * {
+            color: #fff !important;
+        }
+        body.dark-mode .entity-option {
+            border-bottom: 1px solid #555 !important;
+            color: #fff !important;
+        }
+        body.dark-mode .entity-option:hover,
+        body.dark-mode .entity-option.selected {
+            background-color: #555;
+        }
+        body.dark-mode .entity-dropdown .entity-option .entity-name {
+            color: #fff !important;
+        }
+        body.dark-mode .entity-option .entity-name {
+            color: #fff !important;
+        }
+        body.dark-mode .entity-option .entity-id {
+            color: #ccc !important;
+        }
+        body.dark-mode .entity-group-header {
+            background-color: #444;
+            color: #e0e0e0;
+            border-bottom: 1px solid #666;
+        }
+        body.dark-mode #entitySearchInput {
+            background-color: #333;
+            color: #fff;
+            border: 1px solid #666;
+        }
+        body.dark-mode #clearEntitySearch {
+            color: #ccc !important;
+        }
+        body.dark-mode #clearEntitySearch:hover {
+            color: #fff !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay {
+            background-color: #2d2d2d !important;
+            border: 1px solid #555 !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay table {
+            border: none !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay th {
+            background-color: #444 !important;
+            color: #e0e0e0 !important;
+            border-bottom: 2px solid #555 !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay td {
+            color: #e0e0e0 !important;
+            border-bottom: 1px solid #444 !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay tr {
+            border-bottom: 1px solid #444 !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay select {
+            background-color: #333 !important;
+            color: #e0e0e0 !important;
+            border: 1px solid #666 !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay select option {
+            background-color: #333 !important;
+            color: #e0e0e0 !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay button {
+            background-color: #cc3333 !important;
+            color: #e0e0e0 !important;
+            border: none !important;
+        }
+        body.dark-mode #selectedEntitiesDisplay button:hover {
+            background-color: #dd4444 !important;
+        }
+
+        /* Attribute multi-select dropdown styles */
+        .attr-select-container {
+            position: relative;
+        }
+        .attr-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            align-items: center;
+        }
+        .attr-tag {
+            display: inline-block;
+            background: #4CAF50;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 0.9em;
+        }
+        .attr-dropdown {
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+            z-index: 1000;
+            max-height: 300px;
+            overflow-y: auto;
+            margin-top: 2px;
+        }
+        .attr-option {
+            display: block;
+            padding: 8px 12px;
+            cursor: pointer;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        .attr-option:hover {
+            background-color: #f5f5f5;
+        }
+        .attr-option input[type="checkbox"] {
+            margin-right: 8px;
+        }
+
+        /* Dark mode for attribute selector */
+        body.dark-mode .attr-tags {
+            background: #333 !important;
+            border-color: #666;
+            color: #e0e0e0;
+        }
+        body.dark-mode .attr-tag {
+            background: #2e7d32;
+        }
+        body.dark-mode .attr-dropdown {
+            background: #2a2a2a;
+            border-color: #555;
+        }
+        body.dark-mode .attr-option {
+            color: #e0e0e0;
+            border-bottom-color: #444;
+        }
+        body.dark-mode .attr-option:hover {
+            background-color: #333;
+        }
+        body.dark-mode .attr-option input[type="checkbox"] {
+            cursor: pointer;
+        }
+        </style>
+"""
+    return html
+
+
+def get_entity_control_css():
+    # Add CSS for dark mode support
+    html = """
+    <style>
+    .entity-edit-container {
+        --border-color: #ddd;
+        --background-secondary: #f9f9f9;
+        --text-color: #333;
+        --text-secondary: #666;
+        --input-background: #fff;
+    }
+
+    body.dark-mode .entity-edit-container {
+        --border-color: #555;
+        --background-secondary: #2d2d2d;
+        --text-color: #e0e0e0;
+        --text-secondary: #bbb;
+        --input-background: #3d3d3d;
+        color: var(--text-color);
+    }
+
+    body.dark-mode .entity-edit-container input[type="number"],
+    body.dark-mode .entity-edit-container select {
+        background-color: var(--input-background) !important;
+        border-color: var(--border-color) !important;
+        color: var(--text-color) !important;
+    }
+
+    body.dark-mode .entity-edit-container span {
+        color: var(--text-color) !important;
+    }
+    </style>
+    """
+    return html
+
+
+def get_entity_toggle_js():
+    """
+    JavaScript for entity toggle buttons
+    """
+    html = f"""
+    <script>
+    function toggleEntitySwitch(button, entityId, days) {{
+        // Toggle the visual state
+        button.classList.toggle('active');
+
+        // Determine the new value
+        const newValue = button.classList.contains('active') ? 'on' : 'off';
+
+        // Create form data
+        const formData = new FormData();
+        formData.append('entity_id', entityId);
+        formData.append('days', days);
+        formData.append('value', newValue);
+
+        // Submit the form
+        fetch('./entity', {{
+            method: 'POST',
+            body: formData
+        }}).then(response => {{
+            if (response.redirected) {{
+                window.location.href = response.url;
+            }}
+        }}).catch(error => {{
+            console.error('Error:', error);
+            // Revert the toggle on error
+            button.classList.toggle('active');
+        }});
+    }}
+    </script>
+    """
+    return html
+
+
+def get_apps_js(all_states_json):
+    text = (
+        f"""
+<script>
+// Global object to track pending changes
+let pendingChanges = {{}};
+
+// All Home Assistant states for entity dropdown
+const allStates = """
+        + all_states_json
+        + """;
+function showMessage(message, type) {
+    const container = document.getElementById('messageContainer');
+    container.className = 'message-container message-' + type;
+    container.textContent = message;
+    container.style.display = 'block';
+
+    // Auto-hide success messages after 5 seconds
+    if (type === 'success') {
+        setTimeout(() => {
+            container.style.display = 'none';
+        }, 5000);
+    }
+}
+
+function updateChangeCounter() {
+    const changeCount = Object.keys(pendingChanges).length;
+    const changeCountElement = document.getElementById('changeCount');
+    const saveButton = document.getElementById('saveAllButton');
+    const discardButton = document.getElementById('discardAllButton');
+
+    if (changeCount === 0) {
+        changeCountElement.textContent = 'No unsaved changes';
+        saveButton.disabled = true;
+        discardButton.disabled = true;
+    } else {
+        changeCountElement.textContent = `${changeCount} unsaved change${changeCount > 1 ? 's' : ''}`;
+        saveButton.disabled = false;
+        discardButton.disabled = false;
+    }
+}
+
+function markRowAsChanged(rowId) {
+    const row = document.getElementById('row_' + rowId);
+    row.classList.add('row-changed');
+}
+
+function unmarkRowAsChanged(rowId) {
+    const row = document.getElementById('row_' + rowId);
+    row.classList.remove('row-changed');
+}
+
+function toggleValue(rowId) {
+    const row = document.getElementById('row_' + rowId);
+    const argName = row.dataset.argName;
+    const toggleButton = row.querySelector('.toggle-button');
+    const currentValue = toggleButton.dataset.value === 'true';
+    const newValue = !currentValue;
+
+    // Track the change locally
+    pendingChanges[argName] = {
+        rowId: rowId,
+        originalValue: row.dataset.originalValue,
+        newValue: newValue.toString(),
+        type: 'boolean'
+    };
+
+    // Update the toggle button state visually
+    toggleButton.dataset.value = newValue.toString();
+    if (newValue) {
+        toggleButton.classList.add('active');
+    } else {
+        toggleButton.classList.remove('active');
+    }
+
+    // Update the value display
+    const valueCell = document.getElementById('value_' + rowId);
+    valueCell.innerHTML = newValue.toString();
+
+    // Mark row as changed and update counter
+    markRowAsChanged(rowId);
+    updateChangeCounter();
+}
+
+async function revealSecretValue(row, attribute, path) {
+    // The page serves credentials masked, so a data-secret row's original is the placeholder,
+    // not the key - fetch the real value once and make it the row's original, so the input
+    // offers the real key and saving it unchanged is not seen as a change
+    try {
+        const response = await fetch('./apps_value?path=' + encodeURIComponent(path));
+        const result = await response.json();
+        if (!result.success) {
+            showMessage(result.message, 'error');
+            return false;
+        }
+        row.dataset[attribute] = result.value;
+        delete row.dataset.secret;
+        // A credential is text whatever it looks like - revealed marks the row so the editor
+        // neither offers the entity dropdown for a dotted key nor saves a digit-only one as a number
+        row.dataset.revealed = '1';
+        return true;
+    } catch (error) {
+        showMessage('Could not load the value to edit: ' + error.message, 'error');
+        return false;
+    }
+}
+
+async function editValue(rowId) {
+    const row = document.getElementById('row_' + rowId);
+    const valueCell = document.getElementById('value_' + rowId);
+    const argName = row.dataset.argName;
+    if (row.dataset.secret === '1' && !(await revealSecretValue(row, 'originalValue', argName))) {
+        return;
+    }
+    const originalValue = row.dataset.originalValue;
+
+    // Check if there's a pending change, use that value instead of original
+    const currentValue = pendingChanges[argName] ? pendingChanges[argName].newValue : originalValue;
+
+    // Check if this is an entity string (contains dots)
+    if (row.dataset.revealed !== '1' && currentValue && currentValue.match(/^[a-zA-Z]+\\.\\S+/)) {
+        // Show entity dropdown
+        showEntityDropdown(rowId, currentValue);
+    } else {
+        // Show regular text input for non-entity values
+        valueCell.innerHTML = `
+            <input type="text" class="edit-input" id="input_${rowId}">
+            <button class="save-button" onclick="saveValue(${rowId})">Apply</button>
+            <button class="cancel-button" onclick="cancelEdit(${rowId})">Cancel</button>
+        `;
+
+        // Set as a property rather than written into the markup, so a value holding a quote
+        // (ordinary in a password) cannot end the attribute early and be saved back truncated
+        const input = document.getElementById('input_' + rowId);
+        input.value = currentValue;
+        input.focus();
+    }
+}
+
+function getDisplayValueEntity(entityId) {
+    // Get the state of the entity from allStates
+    if (typeIsEntity(entityId) && allStates[entityId])
+    {
+        const entityState = allStates[entityId];
+        const state = entityState.state || '';
+        const unit = entityState.unit_of_measurement || '';
+        return escapeHtml(`${entityId} = ${state} ${unit}`);
+    }
+    // Every caller assigns the result to innerHTML, and a revealed credential can hold < or &
+    return escapeHtml(entityId); // Fallback to just the entity ID if no state found
+}
+
+function cancelEdit(rowId) {
+    const row = document.getElementById('row_' + rowId);
+    const valueCell = document.getElementById('value_' + rowId);
+    const argName = row.dataset.argName;
+
+    // Check if there's a pending change for this row
+    if (pendingChanges[argName]) {
+        // Show the pending value - need to check if it's an entity
+        const pendingValue = pendingChanges[argName].newValue;
+        valueCell.innerHTML = getDisplayValueEntity(pendingValue);
+    } else {
+        // Show the original value - need to check if it's an entity
+        const originalValue = row.dataset.originalValue;
+        valueCell.innerHTML = getDisplayValueEntity(originalValue);
+    }
+}
+
+function typeIsEntity(value) {
+    if (value.match(/^[a-zA-Z]+\\.\\S+/) && !typeIsNumerical(value))
+    {
+        return true; // This looks like an entity ID (contains dots but is not a number)
+    }
+    return false; // Not an entity ID
+}
+
+function typeIsNumerical(value) {
+    // Check if the string value can be number (integer or float)
+
+    // Check if the value is a valid number
+    if (!/^-?\\d*\\.?\\d+$/.test(value)) {
+        return false; // Not a valid numerical format
+    }
+
+    try {
+        if (value.includes('.')) {
+            value = parseFloat(value);
+        } else {
+            value = parseInt(value);
+        }
+    } catch (e) {
+        return false; // Not a numerical value
+    }
+    return !isNaN(value); // Check if it's a valid number
+}
+
+function determineValueType(value) {
+    let valueType = 'string';
+    if (typeIsEntity(value)) {
+        valueType = 'entity';
+    } else if (typeIsNumerical(value)) {
+        valueType = 'numerical';
+    }
+    return valueType;
+}
+
+function saveValue(rowId) {
+    const row = document.getElementById('row_' + rowId);
+    const input = document.getElementById('input_' + rowId);
+    const argName = row.dataset.argName;
+    const newValue = input.value.trim();
+    const originalValue = row.dataset.originalValue;
+
+    // Validate the input
+    if (newValue === '') {
+        showMessage('Value cannot be empty', 'error');
+        return;
+    }
+
+    // Determine if this is an entity or numerical value
+    let valueType = row.dataset.revealed === '1' ? 'string' : determineValueType(originalValue);
+    if (valueType === 'numerical' && newValue !== originalValue) {
+        if (!typeIsNumerical(newValue)) {
+            showMessage('Invalid number format', 'error');
+            return;
+        }
+    }
+
+    // Track the change locally
+    if (newValue !== originalValue) {
+        pendingChanges[argName] = {
+            rowId: rowId,
+            originalValue: originalValue,
+            newValue: newValue,
+            type: valueType
+        };
+        markRowAsChanged(rowId);
+    } else {
+        // If value is same as original, remove from pending changes
+        if (pendingChanges[argName]) {
+            delete pendingChanges[argName];
+            unmarkRowAsChanged(rowId);
+        }
+    }
+
+    // Update the display value
+    const valueCell = document.getElementById('value_' + rowId);
+    valueCell.innerHTML = getDisplayValueEntity(newValue);
+
+    updateChangeCounter();
+}
+
+// Entity dropdown functions for editing entity strings
+function showEntityDropdown(rowId, currentValue) {
+    const valueCell = document.getElementById('value_' + rowId);
+
+    // Create the dropdown container
+    valueCell.innerHTML = `
+        <div class="entity-dropdown-container">
+            <input type="text" class="entity-search-input" id="entity_search_${rowId}"
+                   placeholder="Type to filter entities..." autocomplete="off">
+            <div class="entity-dropdown" id="entity_dropdown_${rowId}"></div>
+            <div style="margin-top: 5px;">
+                <button class="save-button" onclick="saveEntityValue(${rowId})">Apply</button>
+                <button class="cancel-button" onclick="cancelEdit(${rowId})">Cancel</button>
+            </div>
+        </div>
+    `;
+
+    // Set up search functionality first
+    setupEntitySearch(rowId, currentValue);
+
+    // If current value is an entity, populate with it as initial filter
+    if (currentValue && typeIsEntity(currentValue)) {
+        populateEntityDropdown(rowId, currentValue, currentValue);
+    } else {
+        populateEntityDropdown(rowId, currentValue);
+    }
+
+    // Focus the search input and select all text for easy replacement
+    const searchInput = document.getElementById('entity_search_' + rowId);
+    searchInput.focus();
+    searchInput.select();
+}
+
+function populateEntityDropdown(rowId, currentValue, filterText = '') {
+    const dropdown = document.getElementById('entity_dropdown_' + rowId);
+    const searchInput = document.getElementById('entity_search_' + rowId);
+
+    if (!dropdown) return;
+
+    dropdown.innerHTML = '';
+
+    // Get all entity IDs and filter them
+    const entities = Object.keys(allStates);
+    const filteredEntities = entities.filter(entityId =>
+        entityId.toLowerCase().includes(filterText.toLowerCase())
+    ).sort();
+
+    // Limit results to prevent performance issues
+    const maxResults = 100;
+    const limitedEntities = filteredEntities.slice(0, maxResults);
+
+    if (limitedEntities.length === 0) {
+        dropdown.innerHTML = '<div class="entity-option">No entities found</div>';
+        return;
+    }
+
+    limitedEntities.forEach(entityId => {
+        const entityState = allStates[entityId];
+        const entityValue = entityState && entityState.state ? entityState.state : 'unknown';
+        const unit_of_measurement = entityState && entityState.unit_of_measurement ? entityState.unit_of_measurement : '';
+
+        const option = document.createElement('div');
+        option.className = 'entity-option';
+        option.dataset.entityId = entityId;
+
+        // Highlight current selection (only if search input is empty or matches exactly)
+        if (entityId === currentValue && (!filterText || filterText === entityId)) {
+            option.classList.add('selected');
+        }
+
+        option.innerHTML = `
+            <div class="entity-name">${entityId}</div>
+            <div class="entity-value">${entityValue}${unit_of_measurement}</div>
+        `;
+
+        option.addEventListener('click', () => {
+            // Clear previous selections
+            dropdown.querySelectorAll('.entity-option').forEach(opt => opt.classList.remove('selected'));
+            // Select this option
+            option.classList.add('selected');
+            searchInput.value = entityId;
+        });
+
+        dropdown.appendChild(option);
+    });
+
+    if (filteredEntities.length > maxResults) {
+        const moreOption = document.createElement('div');
+        moreOption.className = 'entity-option';
+        moreOption.style.fontStyle = 'italic';
+        moreOption.innerHTML = `<div class="entity-name">... and ${filteredEntities.length - maxResults} more (refine search)</div>`;
+        dropdown.appendChild(moreOption);
+    }
+}
+
+function setupEntitySearch(rowId, currentValue) {
+    const searchInput = document.getElementById('entity_search_' + rowId);
+
+    if (!searchInput) return;
+
+    // Set initial value if it's an entity
+    if (currentValue && currentValue.includes('.')) {
+        searchInput.value = currentValue;
+    }
+
+    // Handle search input
+    searchInput.addEventListener('input', (e) => {
+        const filterText = e.target.value;
+        populateEntityDropdown(rowId, currentValue, filterText);
+    });
+
+    // Handle keyboard navigation
+    searchInput.addEventListener('keydown', (e) => {
+        const dropdown = document.getElementById('entity_dropdown_' + rowId);
+        const options = dropdown.querySelectorAll('.entity-option[data-entity-id]');
+        const selected = dropdown.querySelector('.entity-option.selected');
+
+        let newSelection = null;
+
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            if (selected) {
+                newSelection = selected.nextElementSibling;
+                if (!newSelection || !newSelection.dataset.entityId) {
+                    newSelection = options[0];
+                }
+            } else {
+                newSelection = options[0];
+            }
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            if (selected) {
+                newSelection = selected.previousElementSibling;
+                if (!newSelection || !newSelection.dataset.entityId) {
+                    newSelection = options[options.length - 1];
+                }
+            } else {
+                newSelection = options[options.length - 1];
+            }
+        } else if (e.key === 'Enter') {
+            e.preventDefault();
+            if (selected && selected.dataset.entityId) {
+                searchInput.value = selected.dataset.entityId;
+            }
+            saveEntityValue(rowId);
+            return;
+        } else if (e.key === 'Escape') {
+            e.preventDefault();
+            cancelEdit(rowId);
+            return;
+        }
+
+        if (newSelection) {
+            // Clear previous selections
+            options.forEach(opt => opt.classList.remove('selected'));
+            // Select new option
+            newSelection.classList.add('selected');
+            // Only update input value on Enter, not on arrow key navigation
+            // searchInput.value = newSelection.dataset.entityId;
+            // Scroll into view if needed
+            newSelection.scrollIntoView({ block: 'nearest' });
+        }
+    });
+}
+
+function saveEntityValue(rowId) {
+    const row = document.getElementById('row_' + rowId);
+    const searchInput = document.getElementById('entity_search_' + rowId);
+    const argName = row.dataset.argName;
+    const newValue = searchInput.value.trim();
+    const originalValue = row.dataset.originalValue;
+
+    // Validate the input
+    if (newValue === '') {
+        showMessage('Entity value cannot be empty', 'error');
+        return;
+    }
+
+    // Validate that it's a valid entity ID (contains at least one dot)
+    if (!typeIsEntity(newValue)) {
+        showMessage('Please select a valid entity ID', 'error');
+        return;
+    }
+
+    // New value without text after dollar (if existing)
+    const newValueBase = newValue.split('$')[0].trim();
+
+    // Check if entity exists in allStates
+    if (!allStates[newValueBase]) {
+        if (!confirm(`Entity "${newValueBase}" was not found in Home Assistant. Do you want to use it anyway?`)) {
+            return;
+        }
+    }
+
+    // Track the change locally
+    if (newValue !== originalValue) {
+        pendingChanges[argName] = {
+            rowId: rowId,
+            originalValue: originalValue,
+            newValue: newValue,
+            type: 'entity'
+        }
+        markRowAsChanged(rowId);
+    } else {
+        // If value is same as original, remove from pending changes
+        if (pendingChanges[argName]) {
+            delete pendingChanges[argName];
+            unmarkRowAsChanged(rowId);
+        }
+    }
+
+    // Update the display value - show entity's current state value, not just the entity ID
+    const valueCell = document.getElementById('value_' + rowId);
+
+    // Get the entity's current state value for display
+    valueCell.innerHTML = getDisplayValueEntity(newValue);
+    updateChangeCounter();
+}
+
+// Nested entity dropdown functions for editing entity strings within lists/dictionaries
+function showNestedEntityDropdown(rowId, currentValue) {
+    const valueCell = document.getElementById('nested_value_' + rowId);
+
+    // Create the dropdown container
+    valueCell.innerHTML = `
+        : <div class="entity-dropdown-container" style="min-width: 450px;">
+            <input type="text" class="entity-search-input" id="nested_entity_search_${rowId}"
+                   placeholder="Type to filter entities..." autocomplete="off" style="min-width: 400px;">
+            <div class="entity-dropdown" id="nested_entity_dropdown_${rowId}" style="min-width: 400px;"></div>
+            <div style="margin-top: 5px;">
+                <button class="save-button" onclick="saveNestedEntityValue(${rowId})">Apply</button>
+                <button class="cancel-button" onclick="cancelNestedEdit(${rowId})">Cancel</button>
+            </div>
+        </div>
+    `;
+
+    // Set up search functionality first
+    setupNestedEntitySearch(rowId, currentValue);
+
+    // If current value is an entity, populate with it as initial filter
+    if (currentValue && currentValue.includes('.')) {
+        populateNestedEntityDropdown(rowId, currentValue, currentValue);
+    } else {
+        populateNestedEntityDropdown(rowId, currentValue);
+    }
+
+    // Focus the search input and select all text for easy replacement
+    const searchInput = document.getElementById('nested_entity_search_' + rowId);
+    searchInput.focus();
+    searchInput.select();
+}
+
+function populateNestedEntityDropdown(rowId, currentValue, filterText = '') {
+    const dropdown = document.getElementById('nested_entity_dropdown_' + rowId);
+    const searchInput = document.getElementById('nested_entity_search_' + rowId);
+
+    if (!dropdown) return;
+
+    dropdown.innerHTML = '';
+
+    // Get all entity IDs and filter them
+    const entities = Object.keys(allStates);
+    const filteredEntities = entities.filter(entityId =>
+        entityId.toLowerCase().includes(filterText.toLowerCase())
+    ).sort();
+
+    // Limit results to prevent performance issues
+    const maxResults = 100;
+    const limitedEntities = filteredEntities.slice(0, maxResults);
+
+    if (limitedEntities.length === 0) {
+        dropdown.innerHTML = '<div class="entity-option">No entities found</div>';
+        return;
+    }
+
+    limitedEntities.forEach(entityId => {
+        const entityState = allStates[entityId];
+        const entityValue = entityState && entityState.state ? entityState.state : 'unknown';
+        const unit_of_measurement = entityState && entityState.unit_of_measurement ? entityState.unit_of_measurement : '';
+
+        const option = document.createElement('div');
+        option.className = 'entity-option';
+        option.dataset.entityId = entityId;
+
+        // Highlight current selection (only if search input is empty or matches exactly)
+        if (entityId === currentValue && (!filterText || filterText === entityId)) {
+            option.classList.add('selected');
+        }
+
+        option.innerHTML = `
+            <div class="entity-name">${entityId}</div>
+            <div class="entity-value">${entityValue}${unit_of_measurement}</div>
+        `;
+
+        option.addEventListener('click', () => {
+            // Clear previous selections
+            dropdown.querySelectorAll('.entity-option').forEach(opt => opt.classList.remove('selected'));
+            // Select this option
+            option.classList.add('selected');
+            searchInput.value = entityId;
+        });
+
+        dropdown.appendChild(option);
+    });
+
+    if (filteredEntities.length > maxResults) {
+        const moreOption = document.createElement('div');
+        moreOption.className = 'entity-option';
+        moreOption.style.fontStyle = 'italic';
+        moreOption.innerHTML = `<div class="entity-name">... and ${filteredEntities.length - maxResults} more (refine search)</div>`;
+        dropdown.appendChild(moreOption);
+    }
+}
+
+function setupNestedEntitySearch(rowId, currentValue) {
+    const searchInput = document.getElementById('nested_entity_search_' + rowId);
+
+    if (!searchInput) return;
+
+    // Set initial value if it's an entity
+    if (currentValue && currentValue.includes('.')) {
+        searchInput.value = currentValue;
+    }
+
+    // Handle search input
+    searchInput.addEventListener('input', (e) => {
+        const filterText = e.target.value;
+        populateNestedEntityDropdown(rowId, currentValue, filterText);
+    });
+
+    // Handle keyboard navigation
+    searchInput.addEventListener('keydown', (e) => {
+        const dropdown = document.getElementById('nested_entity_dropdown_' + rowId);
+        const options = dropdown.querySelectorAll('.entity-option[data-entity-id]');
+        const selected = dropdown.querySelector('.entity-option.selected');
+
+        let newSelection = null;
+
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            if (selected) {
+                newSelection = selected.nextElementSibling;
+                if (!newSelection || !newSelection.dataset.entityId) {
+                    newSelection = options[0];
+                }
+            } else {
+                newSelection = options[0];
+            }
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            if (selected) {
+                newSelection = selected.previousElementSibling;
+                if (!newSelection || !newSelection.dataset.entityId) {
+                    newSelection = options[options.length - 1];
+                }
+            } else {
+                newSelection = options[options.length - 1];
+            }
+        } else if (e.key === 'Enter') {
+            e.preventDefault();
+            if (selected && selected.dataset.entityId) {
+                searchInput.value = selected.dataset.entityId;
+            }
+            saveNestedEntityValue(rowId);
+            return;
+        } else if (e.key === 'Escape') {
+            e.preventDefault();
+            cancelNestedEdit(rowId);
+            return;
+        }
+
+        if (newSelection) {
+            // Clear previous selections
+            options.forEach(opt => opt.classList.remove('selected'));
+            // Select new option
+            newSelection.classList.add('selected');
+            // Scroll into view if needed
+            newSelection.scrollIntoView({ block: 'nearest' });
+        }
+    });
+}
+
+function saveNestedEntityValue(rowId) {
+    const row = document.getElementById('nested_row_' + rowId);
+    const searchInput = document.getElementById('nested_entity_search_' + rowId);
+    const nestedPath = row.dataset.nestedPath;
+    const newValue = searchInput.value.trim();
+    const originalValue = row.dataset.nestedOriginal;
+
+    // Validate the input
+    if (newValue === '') {
+        showMessage('Entity value cannot be empty', 'error');
+        return;
+    }
+
+    // Validate that it's a valid entity ID (contains at least one dot)
+    if (!newValue.includes('.')) {
+        showMessage('Please select a valid entity ID', 'error');
+        return;
+    }
+
+    // New value without text after dollar (if existing)
+    const newValueBase = newValue.split('$')[0].trim();
+
+    // Check if entity exists in allStates
+    if (!allStates[newValueBase]) {
+        if (!confirm(`Entity "${newValueBase}" was not found in Home Assistant. Do you want to use it anyway?`)) {
+            return;
+        }
+    }
+
+    // Track the change locally
+    if (newValue !== originalValue) {
+        pendingChanges[nestedPath] = {
+            rowId: rowId,
+            originalValue: originalValue,
+            newValue: newValue,
+            type: 'entity',
+            isNested: true,
+            path: nestedPath
+        };
+        markNestedRowAsChanged(rowId);
+    } else {
+        // If value is same as original, remove from pending changes
+        if (pendingChanges[nestedPath]) {
+            delete pendingChanges[nestedPath];
+            unmarkNestedRowAsChanged(rowId);
+        }
+    }
+
+    // Update the display value - show entity's current state value, not just the entity ID
+    const valueCell = document.getElementById('nested_value_' + rowId);
+
+    // Get the entity's current state value for display
+    valueCell.innerHTML = getDisplayValueEntity(newValue);
+
+    updateChangeCounter();
+}
+
+function showConfirmationDialog() {
+    const changeCount = Object.keys(pendingChanges).length;
+
+    // Create the overlay
+    const overlay = document.createElement('div');
+    overlay.className = 'confirmation-overlay';
+    overlay.innerHTML = `
+        <div class="confirmation-dialog">
+            <h3>⚠️ Confirm Save Changes</h3>
+            <p>You are about to save <strong>${changeCount}</strong> change${changeCount > 1 ? 's' : ''} to apps.yaml.</p>
+            <p><strong>Warning:</strong> This will restart Predbat to apply the changes.</p>
+            <div class="confirmation-buttons">
+                <button class="cancel-button-dialog" onclick="hideConfirmationDialog()">Cancel</button>
+                <button class="confirm-button" onclick="confirmSaveChanges()">Save & Restart</button>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(overlay);
+}
+
+function hideConfirmationDialog() {
+    const overlay = document.querySelector('.confirmation-overlay');
+    if (overlay) {
+        overlay.remove();
+    }
+}
+
+async function confirmSaveChanges() {
+    hideConfirmationDialog();
+
+    // Disable save buttons
+    document.getElementById('saveAllButton').disabled = true;
+    document.getElementById('discardAllButton').disabled = true;
+
+    showMessage('Saving changes...', 'success');
+
+    // Send all changes to the server
+    try {
+        const formData = new FormData();
+        formData.append('changes', JSON.stringify(pendingChanges));
+
+        const response = await fetch('./apps', {
+            method: 'POST',
+            body: formData
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            showMessage(result.message + ' - Page will reload...', 'success');
+
+            // Clear pending changes
+            pendingChanges = {};
+            updateChangeCounter();
+
+            // Reload the page after a short delay
+            setTimeout(() => {
+                window.location.reload();
+            }, 2000);
+        } else {
+            showMessage(result.message, 'error');
+            // Re-enable buttons
+            document.getElementById('saveAllButton').disabled = false;
+            document.getElementById('discardAllButton').disabled = false;
+        }
+    } catch (error) {
+        showMessage('Error saving changes: ' + error.message, 'error');
+        // Re-enable buttons
+        document.getElementById('saveAllButton').disabled = false;
+        document.getElementById('discardAllButton').disabled = false;
+    }
+}
+
+function saveAllChanges() {
+    if (Object.keys(pendingChanges).length === 0) {
+        showMessage('No changes to save', 'error');
+        return;
+    }
+
+    showConfirmationDialog();
+}
+
+// Functions for handling nested dictionary values
+function toggleNestedValue(rowId) {
+    const row = document.getElementById('nested_row_' + rowId);
+    const nestedPath = row.dataset.nestedPath;
+    const toggleButton = row.querySelector('.toggle-button');
+    const currentValue = toggleButton.dataset.value === 'true';
+    const newValue = !currentValue;
+
+    // Track the change locally
+    pendingChanges[nestedPath] = {
+        rowId: rowId,
+        originalValue: row.dataset.nestedOriginal,
+        newValue: newValue.toString(),
+        type: 'boolean',
+        isNested: true,
+        path: nestedPath
+    };
+
+    // Update the toggle button state visually
+    toggleButton.dataset.value = newValue.toString();
+    if (newValue) {
+        toggleButton.classList.add('active');
+    } else {
+        toggleButton.classList.remove('active');
+    }
+
+    // Update the value display
+    const valueCell = document.getElementById('nested_value_' + rowId);
+    valueCell.innerHTML = newValue.toString();
+
+    // Mark row as changed and update counter
+    markNestedRowAsChanged(rowId);
+    updateChangeCounter();
+}
+
+async function editNestedValue(rowId) {
+    const row = document.getElementById('nested_row_' + rowId);
+    const valueCell = document.getElementById('nested_value_' + rowId);
+    const nestedPath = row.dataset.nestedPath;
+    if (row.dataset.secret === '1' && !(await revealSecretValue(row, 'nestedOriginal', nestedPath))) {
+        return;
+    }
+    const originalValue = row.dataset.nestedOriginal;
+
+    // Check if there's a pending change, use that value instead of original
+    const currentValue = pendingChanges[nestedPath] ? pendingChanges[nestedPath].newValue : originalValue;
+
+    // Check if this is an entity string (contains dots)
+    if (row.dataset.revealed !== '1' && currentValue && currentValue.match(/^[a-zA-Z]+\\.\\S+/)) {
+        // Show entity dropdown for nested values
+        showNestedEntityDropdown(rowId, currentValue);
+    } else {
+        // Replace the value cell content with an input field for non-entity values
+        valueCell.innerHTML = `
+            : <input type="text" class="edit-input" id="nested_input_${rowId}">
+            <button class="save-button" onclick="saveNestedValue(${rowId})">Apply</button>
+            <button class="cancel-button" onclick="cancelNestedEdit(${rowId})">Cancel</button>
+        `;
+
+        // Set as a property rather than written into the markup - see editValue()
+        const input = document.getElementById('nested_input_' + rowId);
+        input.value = currentValue;
+        input.focus();
+    }
+}
+
+function cancelNestedEdit(rowId) {
+    const row = document.getElementById('nested_row_' + rowId);
+    const valueCell = document.getElementById('nested_value_' + rowId);
+    const nestedPath = row.dataset.nestedPath;
+
+    // Check if there's a pending change for this nested value
+    if (pendingChanges[nestedPath]) {
+        // Show the pending value
+        valueCell.innerHTML = getDisplayValueEntity(pendingChanges[nestedPath].newValue);
+    } else {
+        // Show the original value
+        const originalValue = row.dataset.nestedOriginal;
+        valueCell.innerHTML = getDisplayValueEntity(originalValue);
+    }
+}
+
+function saveNestedValue(rowId) {
+    const row = document.getElementById('nested_row_' + rowId);
+    const input = document.getElementById('nested_input_' + rowId);
+    const nestedPath = row.dataset.nestedPath;
+    const newValue = input.value.trim();
+    const originalValue = row.dataset.nestedOriginal;
+
+    // Validate the input
+    if (newValue === '') {
+        showMessage('Value cannot be empty', 'error');
+        return;
+    }
+
+    // Determine the value type and validate accordingly
+    let valueType = row.dataset.revealed === '1' ? 'string' : determineValueType(originalValue);
+    if (valueType === 'numerical' && newValue !== originalValue) {
+        if (!typeIsNumerical(newValue)) {
+            showMessage('Invalid number format', 'error');
+            return;
+        }
+    }
+
+    // Track the change locally
+    if (newValue !== originalValue) {
+        pendingChanges[nestedPath] = {
+            rowId: rowId,
+            originalValue: originalValue,
+            newValue: newValue,
+            type: valueType,
+            isNested: true,
+            path: nestedPath
+        };
+        markNestedRowAsChanged(rowId);
+    } else {
+        // If value is same as original, remove from pending changes
+        if (pendingChanges[nestedPath]) {
+            delete pendingChanges[nestedPath];
+            unmarkNestedRowAsChanged(rowId);
+        }
+    }
+
+    // Update the display value
+    const valueCell = document.getElementById('nested_value_' + rowId);
+    valueCell.innerHTML = getDisplayValueEntity(newValue);
+
+    updateChangeCounter();
+}
+
+// Counter used to give each pending addition a unique key, as several can target the same list
+let addCounter = 0;
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function deleteNestedValue(rowId) {
+    const row = document.getElementById('nested_row_' + rowId);
+    const nestedPath = row.dataset.nestedPath;
+
+    // Keyed separately from an edit of the same value, so that undoing the deletion does not
+    // also silently undo a pending edit - the server applies edits before any deletion
+    pendingChanges[nestedPath + '#delete'] = {
+        rowId: rowId,
+        originalValue: row.dataset.nestedOriginal,
+        newValue: '',
+        type: 'delete',
+        isNested: true,
+        path: nestedPath
+    };
+
+    row.classList.add('row-deleted');
+    setDeleteButtonState(rowId, true);
+    updateChangeCounter();
+}
+
+function undoDeleteNestedValue(rowId) {
+    const row = document.getElementById('nested_row_' + rowId);
+    const nestedPath = row.dataset.nestedPath;
+
+    delete pendingChanges[nestedPath + '#delete'];
+    row.classList.remove('row-deleted');
+    setDeleteButtonState(rowId, false);
+    updateChangeCounter();
+}
+
+function setDeleteButtonState(rowId, deleted) {
+    // The button is looked up by id rather than by class, as a row holding a nested table
+    // also contains the delete buttons of all of its children
+    const button = document.getElementById('delete_button_' + rowId);
+    if (!button) return;
+    if (deleted) {
+        button.textContent = 'Undo';
+        button.setAttribute('onclick', 'undoDeleteNestedValue(' + rowId + ')');
+    } else {
+        button.textContent = 'Delete';
+        button.setAttribute('onclick', 'deleteNestedValue(' + rowId + ')');
+    }
+}
+
+function hideAddDialog() {
+    const overlay = document.querySelector('.add-overlay');
+    if (overlay) {
+        overlay.remove();
+    }
+}
+
+// Show a dialog collecting one or more fields, calling onConfirm with an id -> value object
+function showAddDialog(title, help, fields, onConfirm) {
+    const overlay = document.createElement('div');
+    overlay.className = 'confirmation-overlay add-overlay';
+
+    let fieldsHtml = '';
+    fields.forEach(field => {
+        if (field.type === 'textarea') {
+            fieldsHtml += `<label class="add-dialog-label" for="add_field_${field.id}">${field.label}</label>
+                           <textarea class="add-dialog-input" id="add_field_${field.id}" rows="5"></textarea>`;
+        } else {
+            fieldsHtml += `<label class="add-dialog-label" for="add_field_${field.id}">${field.label}</label>
+                           <input type="text" class="add-dialog-input" id="add_field_${field.id}">`;
+        }
+    });
+
+    overlay.innerHTML = `
+        <div class="confirmation-dialog">
+            <h3>${title}</h3>
+            <p>${help}</p>
+            ${fieldsHtml}
+            <div class="confirmation-buttons">
+                <button class="cancel-button-dialog" onclick="hideAddDialog()">Cancel</button>
+                <button class="confirm-button" id="addDialogConfirm">Add</button>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(overlay);
+
+    // Pre-fill any defaults, which cannot go in the markup above as they may contain newlines
+    fields.forEach(field => {
+        document.getElementById('add_field_' + field.id).value = field.value || '';
+    });
+
+    document.getElementById('addDialogConfirm').onclick = () => {
+        const values = {};
+        for (const field of fields) {
+            values[field.id] = document.getElementById('add_field_' + field.id).value;
+        }
+        if (onConfirm(values)) {
+            hideAddDialog();
+        }
+    };
+
+    document.getElementById('add_field_' + fields[0].id).focus();
+}
+
+// Insert a pending row above the add button and register the change, returning the change key
+function registerPendingAdd(anchorId, path, valueText, nameHtml, valueHtml) {
+    addCounter += 1;
+    const changeKey = path + '#' + addCounter;
+
+    pendingChanges[changeKey] = {
+        rowId: null,
+        originalValue: '',
+        newValue: valueText,
+        type: 'add',
+        isNested: true,
+        path: path,
+        pendingRowId: addCounter
+    };
+
+    const anchor = document.getElementById('add_anchor_' + anchorId);
+    const row = document.createElement('tr');
+    row.id = 'pending_row_' + addCounter;
+    row.className = 'row-added';
+    row.dataset.changeKey = changeKey;
+    row.innerHTML = `<td>${nameHtml}</td><td>${valueHtml}</td>` +
+                    `<td><button class="cancel-button" onclick="cancelPendingAdd(${addCounter})">Remove</button></td>`;
+    anchor.parentNode.insertBefore(row, anchor);
+
+    updateChangeCounter();
+    return changeKey;
+}
+
+function cancelPendingAdd(pendingRowId) {
+    const row = document.getElementById('pending_row_' + pendingRowId);
+    if (!row) return;
+    delete pendingChanges[row.dataset.changeKey];
+    row.remove();
+    updateChangeCounter();
+}
+
+function addListItem(listPath, argName, anchorId) {
+    // compare_list entries need at least a name and an id, so offer them as a starting point
+    const template = (argName === 'compare_list') ? 'name: My Tariff\\nid: my_tariff' : '';
+    const help = (argName === 'compare_list')
+        ? 'Enter the new tariff to compare, one <b>setting: value</b> per line. A <b>name</b> and a unique <b>id</b> are required.'
+        : 'Enter the new entry in YAML format - a single value, or one <b>setting: value</b> per line.';
+
+    showAddDialog('Add entry to ' + listPath, help, [{id: 'value', label: 'New entry', type: 'textarea', value: template}], (values) => {
+        const valueText = values.value;
+        if (!valueText.trim()) {
+            showMessage('Value cannot be empty', 'error');
+            return false;
+        }
+        registerPendingAdd(anchorId, listPath + '[]', valueText, '+ ', '<pre>' + escapeHtml(valueText) + '</pre>');
+        return true;
+    });
+}
+
+function addDictKey(dictPath, anchorId) {
+    showAddDialog('Add setting to ' + dictPath, 'Enter the name of the new setting and its value.',
+                  [{id: 'key', label: 'Setting name', type: 'text'}, {id: 'value', label: 'Value', type: 'text'}], (values) => {
+        const key = values.key.trim();
+        const valueText = values.value;
+        if (!key.match(/^[A-Za-z0-9_-]+$/)) {
+            showMessage('Setting name must contain only letters, numbers, dashes or underscores', 'error');
+            return false;
+        }
+        if (!valueText.trim()) {
+            showMessage('Value cannot be empty', 'error');
+            return false;
+        }
+        registerPendingAdd(anchorId, dictPath + '.' + key, valueText, '<b>' + escapeHtml(key) + ': </b>', escapeHtml(valueText));
+        return true;
+    });
+}
+
+function markNestedRowAsChanged(rowId) {
+    const row = document.getElementById('nested_row_' + rowId);
+    row.classList.add('row-changed');
+}
+
+function unmarkNestedRowAsChanged(rowId) {
+    const row = document.getElementById('nested_row_' + rowId);
+    row.classList.remove('row-changed');
+}
+
+// Update the discardAllChanges function to handle nested values
+function discardAllChanges() {
+    // Reset all changed rows to their original values
+    for (const pathOrArgName in pendingChanges) {
+        const change = pendingChanges[pathOrArgName];
+
+        if (change.type === 'delete') {
+            // Restore a row marked for deletion
+            const row = document.getElementById('nested_row_' + change.rowId);
+            if (row) {
+                row.classList.remove('row-deleted');
+            }
+            setDeleteButtonState(change.rowId, false);
+        } else if (change.type === 'add') {
+            // Drop the preview row of a pending addition
+            const row = document.getElementById('pending_row_' + change.pendingRowId);
+            if (row) {
+                row.remove();
+            }
+        } else if (change.isNested) {
+            // Handle nested values
+            const row = document.getElementById('nested_row_' + change.rowId);
+            const valueCell = document.getElementById('nested_value_' + change.rowId);
+
+            if (change.type === 'boolean') {
+                // Reset toggle button
+                const toggleButton = row.querySelector('.toggle-button');
+                const originalValue = change.originalValue === 'True';
+                toggleButton.dataset.value = change.originalValue.toLowerCase();
+                if (originalValue) {
+                    toggleButton.classList.add('active');
+                } else {
+                    toggleButton.classList.remove('active');
+                }
+                valueCell.innerHTML = getDisplayValueEntity(change.originalValue);
+            } else {
+                // Reset numerical value
+                valueCell.innerHTML = getDisplayValueEntity(change.originalValue);
+            }
+
+            unmarkNestedRowAsChanged(change.rowId);
+        } else {
+            // Handle top-level values (existing logic)
+            const row = document.getElementById('row_' + change.rowId);
+            const valueCell = document.getElementById('value_' + change.rowId);
+
+            if (change.type === 'boolean') {
+                // Reset toggle button
+                const toggleButton = row.querySelector('.toggle-button');
+                const originalValue = change.originalValue === 'True';
+                toggleButton.dataset.value = change.originalValue.toLowerCase();
+                if (originalValue) {
+                    toggleButton.classList.add('active');
+                } else {
+                    toggleButton.classList.remove('active');
+                }
+                valueCell.innerHTML = getDisplayValueEntity(change.originalValue);
+            } else {
+                // Reset numerical or entity value
+                valueCell.innerHTML = getDisplayValueEntity(change.originalValue);
+            }
+
+            unmarkRowAsChanged(change.rowId);
+        }
+    }
+
+    // Clear all pending changes
+    pendingChanges = {};
+    updateChangeCounter();
+    showMessage('All changes discarded', 'success');
+}
+</script>
+"""
+    )
+    return text
+
+
+def get_filter_css():
+    """
+    Return the CSS for the filter box, shared by the Config and Apps pages
+    """
+    text = """
+        <style>
+        .filter-container {
+            margin: 20px 0;
+            display: flex;
+            align-items: center;
+        }
+        .filter-input {
+            padding: 8px 12px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            font-size: 16px;
+            width: 300px;
+            margin-left: 10px;
+        }
+        body.dark-mode .filter-input {
+            background-color: #333;
+            color: #e0e0e0;
+            border-color: #555;
+        }
+        </style>
+    """
+    return text
+
+
+def get_html_config_css():
+    text = get_filter_css()
+    text += """
+        <script>
+        // Save and restore filter value between page loads
+        function saveFilterValue() {
+            localStorage.setItem('configFilterValue', document.getElementById('configFilter').value);
+        }
+
+        function restoreFilterValue() {
+            const savedFilter = localStorage.getItem('configFilterValue');
+            if (savedFilter) {
+                document.getElementById('configFilter').value = savedFilter;
+                filterConfig();
+            }
+        }
+
+        function filterConfig() {
+            const filterValue = document.getElementById('configFilter').value.toLowerCase();
+            const rows = document.querySelectorAll('#configTable tr');
+
+            // Save filter value for persistence
+            saveFilterValue();
+
+            // Skip header row
+            for(let i = 1; i < rows.length; i++) {
+                const row = rows[i];
+                const nameCell = row.querySelector('td:nth-child(2)');
+                const entityCell = row.querySelector('td:nth-child(3)');
+
+                if (!nameCell || !entityCell) continue;
+
+                const nameText = nameCell.textContent.toLowerCase();
+                const entityText = entityCell.textContent.toLowerCase();
+
+                if (nameText.includes(filterValue) || entityText.includes(filterValue)) {
+                    row.style.display = '';
+                } else {
+                    row.style.display = 'none';
+                }
+            }
+        }
+
+        // Register event to restore filter value after page load
+        document.addEventListener('DOMContentLoaded', restoreFilterValue);
+        </script>
+    """
+    return text
+
+
+def get_apps_filter_js():
+    """
+    Return the client-side row filter for the apps.yaml page filter box
+    """
+    text = """
+        <script>
+        // Save and restore the filter value between page loads, as the apps page auto-refreshes
+        function saveAppsFilterValue() {
+            localStorage.setItem('appsFilterValue', document.getElementById('appsFilter').value);
+        }
+
+        function restoreAppsFilterValue() {
+            const savedFilter = localStorage.getItem('appsFilterValue');
+            if (savedFilter) {
+                document.getElementById('appsFilter').value = savedFilter;
+                filterApps();
+            }
+        }
+
+        function filterApps() {
+            const filterValue = document.getElementById('appsFilter').value.toLowerCase();
+            const rows = document.querySelectorAll('tr[data-arg-name], tr[data-nested-path]');
+
+            // Save filter value for persistence
+            saveAppsFilterValue();
+
+            rows.forEach(function(row) {
+                // A nested row's path starts with the name of the setting it sits under, so a
+                // match on a setting keeps everything nested below it visible with no extra work
+                const path = (row.getAttribute('data-nested-path') || row.getAttribute('data-arg-name') || '').toLowerCase();
+                let matched = path.includes(filterValue);
+                if (!matched) {
+                    // Only match the value of a leaf row - a parent's value cell holds the text of
+                    // every row nested below it, so matching it would show the whole subtree
+                    const valueCell = row.children[1];
+                    if (valueCell && !valueCell.querySelector('tr')) {
+                        matched = valueCell.textContent.toLowerCase().includes(filterValue);
+                    }
+                }
+                row.style.display = matched ? '' : 'none';
+            });
+
+            // Re-show the parents of every row left visible, so a match nested inside a setting
+            // whose own name does not match is still reachable
+            rows.forEach(function(row) {
+                if (row.style.display === 'none') {
+                    return;
+                }
+                let parent = row.parentElement ? row.parentElement.closest('tr[data-arg-name], tr[data-nested-path]') : null;
+                while (parent) {
+                    parent.style.display = '';
+                    parent = parent.parentElement ? parent.parentElement.closest('tr[data-arg-name], tr[data-nested-path]') : null;
+                }
+            });
+        }
+
+        // Register event to restore filter value after page load
+        document.addEventListener('DOMContentLoaded', restoreAppsFilterValue);
+        </script>
+    """
+    return text
+
+
+def get_apps_css():
+    text = """
+<style>
+.edit-button {
+    background-color: #4CAF50;
+    color: white;
+    border: none;
+    padding: 4px 8px;
+    text-align: center;
+    text-decoration: none;
+    display: inline-block;
+    font-size: 12px;
+    margin: 2px 2px;
+    cursor: pointer;
+    border-radius: 3px;
+}
+
+.edit-button:hover {
+    background-color: #45a049;
+}
+
+.delete-button, .add-button {
+    color: white;
+    border: none;
+    padding: 4px 8px;
+    text-align: center;
+    text-decoration: none;
+    display: inline-block;
+    font-size: 12px;
+    margin: 2px 2px;
+    cursor: pointer;
+    border-radius: 3px;
+}
+
+.delete-button {
+    background-color: #dc3545;
+}
+
+.delete-button:hover {
+    background-color: #c82333;
+}
+
+.add-button {
+    background-color: #17a2b8;
+}
+
+.add-button:hover {
+    background-color: #138496;
+}
+
+.add-dialog-label {
+    display: block;
+    font-weight: bold;
+    margin-top: 10px;
+}
+
+.add-dialog-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 6px;
+    border: 1px solid #ddd;
+    border-radius: 3px;
+    font-family: monospace;
+    font-size: 13px;
+}
+
+body.dark-mode .add-dialog-input {
+    background-color: #2d2d2d;
+    color: #e0e0e0;
+    border: 1px solid #555;
+}
+
+.edit-input {
+    width: 300px;
+    padding: 4px;
+    border: 1px solid #ddd;
+    border-radius: 3px;
+    font-size: 12px;
+}
+
+.save-button, .cancel-button {
+    background-color: #2196F3;
+    color: white;
+    border: none;
+    padding: 4px 8px;
+    text-align: center;
+    text-decoration: none;
+    display: inline-block;
+    font-size: 12px;
+    margin: 2px 2px;
+    cursor: pointer;
+    border-radius: 3px;
+}
+
+.cancel-button {
+    background-color: #f44336;
+}
+
+.save-button:hover {
+    background-color: #0b7dda;
+}
+
+.cancel-button:hover {
+    background-color: #da190b;
+}
+
+.message-container {
+    padding: 10px;
+    margin: 10px 0;
+    border-radius: 4px;
+    display: none;
+}
+
+.message-success {
+    background-color: #d4edda;
+    color: #155724;
+    border: 1px solid #c3e6cb;
+}
+
+.message-error {
+    background-color: #f8d7da;
+    color: #721c24;
+    border: 1px solid #f5c6cb;
+}
+
+/* Dark mode styles */
+body.dark-mode .edit-button {
+    background-color: #4CAF50;
+    color: white;
+}
+
+body.dark-mode .edit-button:hover {
+    background-color: #45a049;
+}
+
+body.dark-mode .edit-input {
+    background-color: #2d2d2d;
+    color: #e0e0e0;
+    border: 1px solid #555;
+}
+
+body.dark-mode .save-button {
+    background-color: #2196F3;
+    color: white;
+}
+
+body.dark-mode .cancel-button {
+    background-color: #f44336;
+    color: white;
+}
+
+body.dark-mode .message-success {
+    background-color: #1e3f20;
+    color: #7bc97d;
+    border: 1px solid #2d5a2f;
+}
+
+body.dark-mode .message-error {
+    background-color: #3f1e1e;
+    color: #f5c6cb;
+    border: 1px solid #5a2d2d;
+}
+
+/* Toggle button styles */
+.toggle-button {
+    position: relative;
+    display: inline-block;
+    width: 60px;
+    height: 24px;
+    background-color: #ccc;
+    border-radius: 12px;
+    cursor: pointer;
+    transition: background-color 0.3s;
+    border: none;
+    outline: none;
+}
+
+.toggle-button.active {
+    background-color: #f44336;
+}
+
+.toggle-button::before {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 20px;
+    height: 20px;
+    background-color: white;
+    border-radius: 50%;
+    transition: transform 0.3s;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+}
+
+.toggle-button.active::before {
+    transform: translateX(36px);
+}
+
+.toggle-button:hover {
+    opacity: 0.8;
+}
+
+/* Dark mode toggle styles */
+body.dark-mode .toggle-button {
+    background-color: #555 !important;
+}
+
+body.dark-mode .toggle-button.active {
+    background-color: #f44336 !important;
+}
+
+body.dark-mode .toggle-button::before {
+    background-color: #e0e0e0 !important;
+}
+
+/* Save controls styles */
+.save-controls {
+    background-color: #f8f9fa;
+    border: 1px solid #dee2e6;
+    border-radius: 8px;
+    padding: 15px;
+    margin: 10px 0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.save-status {
+    display: flex;
+    align-items: center;
+    font-weight: bold;
+    color: #495057;
+}
+
+.save-all-button {
+    background-color: #28a745;
+    color: white;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: bold;
+    transition: background-color 0.3s;
+}
+
+.save-all-button:hover:not(:disabled) {
+    background-color: #218838;
+}
+
+.save-all-button:disabled {
+    background-color: #6c757d;
+    cursor: not-allowed;
+}
+
+.discard-all-button {
+    background-color: #dc3545;
+    color: white;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: bold;
+    transition: background-color 0.3s;
+}
+
+.discard-all-button:hover:not(:disabled) {
+    background-color: #c82333;
+}
+
+.discard-all-button:disabled {
+    background-color: #6c757d;
+    cursor: not-allowed;
+}
+
+/* Highlight changed rows */
+.row-changed {
+    background-color: #fff3cd !important;
+    border-left: 4px solid #ffc107 !important;
+}
+
+/* Rows pending deletion or addition */
+.row-deleted {
+    background-color: #f8d7da !important;
+    border-left: 4px solid #dc3545 !important;
+    text-decoration: line-through;
+    opacity: 0.7;
+}
+
+.row-added {
+    background-color: #d4edda !important;
+    border-left: 4px solid #28a745 !important;
+}
+
+body.dark-mode .row-deleted {
+    background-color: #3f1e1e !important;
+    border-left: 4px solid #dc3545 !important;
+}
+
+body.dark-mode .row-added {
+    background-color: #1e3f20 !important;
+    border-left: 4px solid #28a745 !important;
+}
+
+/* Dark mode save controls styles */
+body.dark-mode .save-controls {
+    background-color: #2d2d2d;
+    border: 1px solid #404040;
+}
+
+body.dark-mode .save-status {
+    color: #e0e0e0;
+}
+
+body.dark-mode .row-changed {
+    background-color: #3d3d1d !important;
+    border-left: 4px solid #ffc107 !important;
+}
+
+/* Confirmation dialog styles */
+.confirmation-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.5);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 9999;
+}
+
+.confirmation-dialog {
+    background-color: white;
+    border-radius: 8px;
+    padding: 25px;
+    max-width: 600px;
+    width: 95%;
+    max-height: 90vh;
+    overflow-y: auto;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+    word-wrap: break-word;
+}
+
+.confirmation-dialog h3 {
+    margin-top: 0;
+    color: #dc3545;
+    font-size: 18px;
+    word-wrap: break-word;
+}
+
+.confirmation-dialog p {
+    margin: 15px 0;
+    line-height: 1.6;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}
+
+.confirmation-buttons {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+    margin-top: 20px;
+}
+
+.confirm-button, .cancel-button-dialog {
+    padding: 10px 20px;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: bold;
+}
+
+.confirm-button {
+    background-color: #dc3545;
+    color: white;
+}
+
+.confirm-button:hover {
+    background-color: #c82333;
+}
+
+.cancel-button-dialog {
+    background-color: #6c757d;
+    color: white;
+}
+
+.cancel-button-dialog:hover {
+    background-color: #545b62;
+}
+
+/* Dark mode confirmation dialog */
+body.dark-mode .confirmation-dialog {
+    background-color: #2d2d2d;
+    color: #e0e0e0;
+}
+
+body.dark-mode .confirmation-dialog h3 {
+    color: #ff6b6b;
+}
+
+/* Entity dropdown styles */
+.entity-dropdown-container {
+    position: relative;
+    width: 100%;
+    min-width: 400px;
+}
+
+.entity-search-input {
+    width: 100%;
+    min-width: 400px;
+    padding: 8px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    font-size: 14px;
+    box-sizing: border-box;
+}
+
+.entity-dropdown {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    min-width: 400px;
+    background: white;
+    border: 1px solid #ddd;
+    border-top: none;
+    max-height: 200px;
+    overflow-y: auto;
+    z-index: 1000;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.entity-option {
+    padding: 8px;
+    cursor: pointer;
+    border-bottom: 1px solid #eee;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.entity-option:hover,
+.entity-option.selected {
+    background-color: #f0f0f0;
+}
+
+.entity-name {
+    font-weight: bold;
+    flex: 1;
+    margin-right: 10px;
+    word-break: break-all;
+}
+
+.entity-value {
+    color: #666;
+    font-size: 12px;
+    flex-shrink: 0;
+    max-width: 150px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Dark mode entity dropdown styles */
+body.dark-mode .entity-search-input {
+    background-color: #444;
+    color: #fff;
+    border: 1px solid #666;
+}
+
+body.dark-mode .entity-dropdown {
+    background: #333;
+    border: 1px solid #666;
+    color: #fff;
+}
+
+body.dark-mode .entity-option {
+    border-bottom: 1px solid #555;
+}
+
+body.dark-mode .entity-option:hover,
+body.dark-mode .entity-option.selected {
+    background-color: #555;
+}
+
+body.dark-mode .entity-value {
+    color: #ccc;
+}
+</style>
+"""
+    return text
+
+
+def get_dashboard_collapsible_js():
+    """
+    Return JavaScript for dashboard collapsible sections
+    """
+    text = """
+<script>
+function saveSectionState() {
+    const allSections = document.querySelectorAll('.dashboard-section-content');
+    const state = {};
+    allSections.forEach(section => {
+        state[section.id] = section.classList.contains('collapsed');
+    });
+    sessionStorage.setItem('dashboardSectionState', JSON.stringify(state));
+}
+
+function restoreSectionState() {
+    const stateStr = sessionStorage.getItem('dashboardSectionState');
+    if (!stateStr) return;
+
+    try {
+        const state = JSON.parse(stateStr);
+        Object.keys(state).forEach(sectionId => {
+            const section = document.getElementById(sectionId);
+            const icon = document.getElementById('icon-' + sectionId);
+            if (section && icon) {
+                if (state[sectionId]) {
+                    section.classList.add('collapsed');
+                    icon.textContent = '+';
+                } else {
+                    section.classList.remove('collapsed');
+                    icon.textContent = '−';
+                }
+            }
+        });
+        updateExpandAllButton();
+    } catch (e) {
+        console.error('Error restoring section state:', e);
+    }
+}
+
+function updateExpandAllButton() {
+    const allSections = document.querySelectorAll('.dashboard-section-content');
+    const btn = document.getElementById('expandAllBtn');
+    if (!btn) return;
+
+    const allExpanded = Array.from(allSections).every(s => !s.classList.contains('collapsed'));
+    btn.textContent = allExpanded ? 'Collapse All' : 'Expand All';
+}
+
+function toggleDashboardSection(sectionId) {
+    const section = document.getElementById(sectionId);
+    const icon = document.getElementById('icon-' + sectionId);
+
+    if (section.classList.contains('collapsed')) {
+        section.classList.remove('collapsed');
+        icon.textContent = '−';
+    } else {
+        section.classList.add('collapsed');
+        icon.textContent = '+';
+    }
+
+    // Save state and update the expand all button text
+    saveSectionState();
+    updateExpandAllButton();
+}
+
+function toggleAllSections() {
+    const allSections = document.querySelectorAll('.dashboard-section-content');
+    const allIcons = document.querySelectorAll('.expand-icon');
+    const btn = document.getElementById('expandAllBtn');
+
+    // Check if all are expanded or not
+    const allExpanded = Array.from(allSections).every(s => !s.classList.contains('collapsed'));
+
+    allSections.forEach((section, index) => {
+        if (allExpanded) {
+            section.classList.add('collapsed');
+            if (allIcons[index]) allIcons[index].textContent = '+';
+        } else {
+            section.classList.remove('collapsed');
+            if (allIcons[index]) allIcons[index].textContent = '−';
+        }
+    });
+
+    btn.textContent = allExpanded ? 'Expand All' : 'Collapse All';
+    saveSectionState();
+}
+
+// Restore state when page loads
+document.addEventListener('DOMContentLoaded', restoreSectionState);
+</script>
+"""
+    return text
+
+
+def get_dashboard_css():
+    """
+    Return CSS for dashboard collapsible sections
+    """
+    text = """
+<style>
+.expand-all-button {
+    background-color: #4CAF50;
+    color: white;
+    border: none;
+    padding: 10px 20px;
+    text-align: center;
+    text-decoration: none;
+    display: inline-block;
+    font-size: 14px;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: background-color 0.3s ease;
+}
+
+.expand-all-button:hover {
+    background-color: #45a049;
+}
+
+.dashboard-section {
+    margin: 0;
+    margin-bottom: 2px;
+}
+
+.dashboard-section-header {
+    cursor: pointer;
+    user-select: none;
+    padding: 6px 10px;
+    background-color: #f5f5f5;
+    border-radius: 4px;
+    transition: background-color 0.3s ease;
+    display: flex;
+    align-items: center;
+    margin: 0;
+}
+
+.dashboard-section-header:hover {
+    background-color: #e8e8e8;
+}
+
+.expand-icon {
+    display: inline-block;
+    width: 24px;
+    height: 24px;
+    line-height: 24px;
+    text-align: center;
+    margin-right: 8px;
+    font-weight: bold;
+    font-size: 20px;
+    color: #4CAF50;
+}
+
+.dashboard-section-content {
+    transition: max-height 0.3s ease, opacity 0.3s ease;
+    overflow-y: auto;
+    padding-bottom: 20px;
+}
+
+.dashboard-section-content.collapsed {
+    max-height: 0;
+    opacity: 0;
+}
+
+.dashboard-section-content:not(.collapsed) {
+    max-height: 50000px;
+    opacity: 1;
+}
+
+/* Dark mode for dashboard sections */
+body.dark-mode .expand-all-button {
+    background-color: #4CAF50;
+}
+
+body.dark-mode .expand-all-button:hover {
+    background-color: #45a049;
+}
+
+body.dark-mode .dashboard-section-header {
+    background-color: #333;
+    color: #e0e0e0;
+}
+
+body.dark-mode .dashboard-section-header:hover {
+    background-color: #3a3a3a;
+}
+
+body.dark-mode .expand-icon {
+    color: #4CAF50;
+}
+</style>
+"""
+    return text
+
+
+def get_components_css():
+    """
+    Return CSS for components page
+    """
+    text = """
+<style>
+.components-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+    gap: 20px;
+    margin: 20px 0;
+}
+
+.component-card {
+    border: 2px solid #ddd;
+    border-radius: 8px;
+    padding: 20px;
+    background: #fff;
+    color: #333;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    transition: border-color 0.3s ease;
+    overflow-wrap: break-word;
+    word-wrap: break-word;
+}
+
+.component-card.active {
+    border-color: #4CAF50;
+}
+
+.component-card.error {
+    border-color: #dc3545;
+}
+
+.component-card.inactive {
+    border-color: #999;
+    background: #f9f9f9;
+    color: #333;
+}
+
+.component-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 15px;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.component-header h3 {
+    margin: 0;
+    color: #333;
+    font-size: 1.2em;
+}
+
+.status-indicator {
+    font-size: 1.5em;
+    margin-right: 8px;
+}
+
+.status-healthy {
+    color: #4CAF50;
+}
+
+.status-error {
+    color: #f44336;
+}
+
+.status-inactive {
+    color: #999;
+}
+
+.status-text {
+    flex-grow: 1;
+    font-weight: bold;
+    font-size: 0.9em;
+    color: #333;
+}
+
+.restart-button, .edit-button {
+    color: white;
+    border: none;
+    padding: 6px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85em;
+    font-weight: bold;
+    transition: background-color 0.3s ease;
+    margin-left: 10px;
+}
+
+.restart-button {
+    background-color: #2196F3;
+}
+
+.restart-button:hover {
+    background-color: #1976D2;
+}
+
+.restart-button:disabled {
+    background-color: #ccc;
+    cursor: not-allowed;
+}
+
+.edit-button {
+    background-color: #FF9800;
+}
+
+.edit-button:hover {
+    background-color: #F57C00;
+}
+
+.component-details {
+    border-top: 1px solid #eee;
+    padding-top: 15px;
+}
+
+.component-details p {
+    margin: 8px 0;
+    font-size: 0.95em;
+    color: #333;
+}
+
+.component-args {
+    margin-top: 15px;
+    overflow: hidden;
+}
+
+.component-args h4 {
+    margin: 10px 0;
+    color: #333;
+    font-size: 1em;
+}
+
+.args-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9em;
+    margin: 10px 0;
+    table-layout: fixed;
+}
+
+.args-table th {
+    background-color: #f5f5f5;
+    padding: 8px;
+    text-align: left;
+    border: 1px solid #ddd;
+    font-weight: bold;
+    color: #333;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}
+
+.args-table th:nth-child(1) {
+    width: 40%;
+}
+
+.args-table th:nth-child(2) {
+    width: 20%;
+}
+
+.args-table th:nth-child(3) {
+    width: 40%;
+}
+
+.args-table td {
+    padding: 8px;
+    border: 1px solid #ddd;
+    vertical-align: top;
+    color: #333;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    word-break: break-all;
+    max-width: 0;
+}
+
+.args-table tr.required-arg {
+    background-color: #fff8e1;
+}
+
+.args-table tr.optional-arg {
+    background-color: #f9f9f9;
+}
+
+/* Special handling for long values like URLs */
+.args-table td:nth-child(3) {
+    word-break: break-all;
+    overflow-wrap: anywhere;
+    hyphens: auto;
+    max-width: 200px;
+}
+
+.entity-count-positive {
+    color: #4CAF50;
+    font-weight: bold;
+}
+
+.entity-count-zero {
+    color: #999;
+    font-weight: bold;
+}
+
+.last-updated-time {
+    color: #666;
+    font-style: italic;
+}
+
+.error-count-none {
+    color: #4CAF50;
+    font-weight: bold;
+}
+
+.error-count-high {
+    color: #f44336;
+    font-weight: bold;
+}
+
+/* Dark mode styles */
+body.dark-mode .component-card {
+    background: #2d2d2d;
+    border-color: #555;
+    color: #e0e0e0;
+}
+
+body.dark-mode .component-card.active {
+    border-color: #4CAF50;
+}
+
+body.dark-mode .component-card.error {
+    border-color: #dc3545;
+}
+
+body.dark-mode .component-card.inactive {
+    border-color: #666;
+    background: #1e1e1e;
+}
+
+body.dark-mode .component-header h3 {
+    color: #e0e0e0;
+}
+
+body.dark-mode .component-details {
+    border-top-color: #555;
+}
+
+body.dark-mode .component-details p {
+    color: #e0e0e0;
+}
+
+body.dark-mode .component-details strong {
+    color: #e0e0e0;
+}
+
+body.dark-mode .component-args h4 {
+    color: #e0e0e0;
+}
+
+body.dark-mode .args-table th {
+    background-color: #333;
+    color: #e0e0e0;
+    border-color: #555;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+}
+
+body.dark-mode .args-table th:nth-child(1) {
+    width: 40%;
+}
+
+body.dark-mode .args-table th:nth-child(2) {
+    width: 20%;
+}
+
+body.dark-mode .args-table th:nth-child(3) {
+    width: 40%;
+}
+
+body.dark-mode .args-table td {
+    border-color: #555;
+    color: #e0e0e0;
+    word-wrap: break-word;
+    overflow-wrap: break-word;
+    word-break: break-all;
+}
+
+body.dark-mode .args-table tr.required-arg {
+    background-color: #3a3a1a;
+}
+
+body.dark-mode .args-table tr.optional-arg {
+    background-color: #2a2a2a;
+}
+
+body.dark-mode .entity-count-positive {
+    color: #4CAF50;
+    font-weight: bold;
+}
+
+body.dark-mode .entity-count-zero {
+    color: #666;
+    font-weight: bold;
+}
+
+body.dark-mode .last-updated-time {
+    color: #aaa;
+    font-style: italic;
+}
+
+body.dark-mode .error-count-none {
+    color: #4CAF50;
+    font-weight: bold;
+}
+
+body.dark-mode .error-count-high {
+    color: #f44336;
+    font-weight: bold;
+}
+
+body.dark-mode .restart-button, body.dark-mode .edit-button {
+    color: white;
+}
+
+body.dark-mode .restart-button {
+    background-color: #2196F3;
+}
+
+body.dark-mode .restart-button:hover {
+    background-color: #1976D2;
+}
+
+body.dark-mode .restart-button:disabled {
+    background-color: #555;
+    color: #999;
+}
+
+body.dark-mode .edit-button {
+    background-color: #FF9800;
+}
+
+body.dark-mode .edit-button:hover {
+    background-color: #F57C00;
+}
+
+/* Responsive design */
+@media (max-width: 768px) {
+    .components-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .component-header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 5px;
+    }
+
+    .args-table {
+        font-size: 0.8em;
+    }
+
+    .args-table th,
+    .args-table td {
+        padding: 6px;
+    }
+}
+</style>
+"""
+    return text
+
+
+def get_discovery_css():
+    """
+    Return CSS for the discovery catalogue page
+    """
+    text = """
+<style>
+.discovery-bar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin: 12px 0 20px 0;
+}
+
+.discovery-counts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.discovery-count {
+    background: #eceff1;
+    border-radius: 12px;
+    padding: 3px 10px;
+    font-size: 0.85em;
+    white-space: nowrap;
+}
+
+body.dark-mode .discovery-count {
+    background: #37474f;
+    color: #eee;
+}
+
+.discovery-toggle {
+    margin-left: auto;
+    padding: 6px 14px;
+    border-radius: 4px;
+    text-decoration: none;
+    background: #1976D2;
+    color: #fff;
+    white-space: nowrap;
+}
+
+.discovery-toggle:hover {
+    background: #1565C0;
+}
+
+.discovery-warning {
+    border-left: 5px solid #d32f2f;
+    background: #ffebee;
+    color: #b71c1c;
+    padding: 10px 14px;
+    border-radius: 4px;
+    margin-bottom: 18px;
+}
+
+body.dark-mode .discovery-warning {
+    background: #4a1c1c;
+    color: #ffcdd2;
+}
+
+.discovery-conflicts {
+    border-left: 5px solid #f57c00;
+    background: #fff8e1;
+    color: #6d4c00;
+    padding: 10px 14px;
+    border-radius: 4px;
+    margin-bottom: 18px;
+}
+
+body.dark-mode .discovery-conflicts {
+    background: #4a3c1c;
+    color: #ffe082;
+}
+
+.discovery-clear {
+    border-left: 5px solid #4CAF50;
+    background: #e8f5e9;
+    color: #1b5e20;
+    padding: 10px 14px;
+    border-radius: 4px;
+    margin-bottom: 18px;
+}
+
+body.dark-mode .discovery-clear {
+    background: #1b3a1e;
+    color: #c8e6c9;
+}
+
+.discovery-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
+    gap: 18px;
+    margin-bottom: 26px;
+}
+
+.discovery-card {
+    border: 2px solid #ddd;
+    border-radius: 8px;
+    padding: 16px;
+    background: #fff;
+    color: #333;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    overflow-wrap: break-word;
+    word-wrap: break-word;
+}
+
+body.dark-mode .discovery-card {
+    background: #2c2c2c;
+    color: #eee;
+    border-color: #555;
+}
+
+.discovery-card-title {
+    font-weight: bold;
+    font-size: 1.05em;
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.discovery-source {
+    background: #1976D2;
+    color: #fff;
+    border-radius: 10px;
+    padding: 2px 9px;
+    font-size: 0.75em;
+    font-weight: normal;
+}
+
+.discovery-field {
+    margin: 3px 0;
+    line-height: 1.45;
+}
+
+.discovery-key {
+    color: #555;
+    font-weight: 600;
+}
+
+body.dark-mode .discovery-key {
+    color: #bbb;
+}
+
+.discovery-nested {
+    margin-left: 16px;
+    border-left: 2px solid #e0e0e0;
+    padding-left: 10px;
+}
+
+body.dark-mode .discovery-nested {
+    border-left-color: #555;
+}
+
+.discovery-token {
+    font-family: monospace;
+    background: #f1f1f1;
+    border-radius: 3px;
+    padding: 0 4px;
+}
+
+body.dark-mode .discovery-token {
+    background: #3a3a3a;
+}
+
+.discovery-raw {
+    background: #f6f6f6;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    padding: 12px;
+    overflow-x: auto;
+    font-size: 0.85em;
+    white-space: pre;
+}
+
+body.dark-mode .discovery-raw {
+    background: #1e1e1e;
+    color: #ddd;
+    border-color: #555;
+}
+
+.discovery-empty {
+    padding: 20px;
+    background: #f5f5f5;
+    border-radius: 6px;
+    color: #555;
+}
+
+body.dark-mode .discovery-empty {
+    background: #333;
+    color: #ccc;
+}
+
+@media (max-width: 768px) {
+    .discovery-grid {
+        grid-template-columns: 1fr;
+    }
+}
+</style>
+"""
+    return text
+
+
+def get_entity_modal_css():
+    """
+    Return CSS for entity modal popup
+    """
+    text = """
+<style>
+/* Entity Modal Styles */
+.entity-modal {
+    display: none;
+    position: fixed;
+    z-index: 1000;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    overflow: auto;
+    background-color: rgba(0, 0, 0, 0.5);
+}
+
+.entity-modal-content {
+    background-color: #fff;
+    margin: 5% auto;
+    padding: 20px;
+    border-radius: 8px;
+    width: 90%;
+    max-width: 1200px;
+    max-height: 80vh;
+    overflow-y: auto;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+    color: #333;
+}
+
+.entity-modal-close {
+    color: #aaa;
+    float: right;
+    font-size: 28px;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+.entity-modal-close:hover,
+.entity-modal-close:focus {
+    color: #000;
+}
+
+.entity-search-input {
+    width: 100%;
+    padding: 10px;
+    margin: 10px 0;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    font-size: 14px;
+    box-sizing: border-box;
+}
+
+.entity-list-table-container {
+    overflow-x: auto;
+    margin-top: 10px;
+}
+
+.entity-list-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+}
+
+.entity-list-table th {
+    background-color: #4CAF50;
+    color: white;
+    padding: 12px;
+    text-align: left;
+    border: 1px solid #ddd;
+    font-weight: bold;
+}
+
+.entity-list-table td {
+    padding: 10px;
+    border: 1px solid #ddd;
+    color: #333;
+}
+
+.entity-list-table tbody tr:hover {
+    background-color: #f1f1f1;
+}
+
+.entity-list-table a {
+    color: #2196F3;
+    text-decoration: none;
+}
+
+.entity-list-table a:hover {
+    text-decoration: underline;
+}
+
+.entity-empty-state {
+    text-align: center;
+    padding: 20px;
+    color: #999;
+    font-size: 16px;
+}
+
+/* Dark mode support */
+body.dark-mode .entity-modal-content {
+    background-color: #2c2c2c;
+    color: #e0e0e0;
+}
+
+body.dark-mode .entity-modal-close {
+    color: #aaa;
+}
+
+body.dark-mode .entity-modal-close:hover,
+body.dark-mode .entity-modal-close:focus {
+    color: #fff;
+}
+
+body.dark-mode .entity-search-input {
+    background-color: #333;
+    color: #e0e0e0;
+    border-color: #555;
+}
+
+body.dark-mode .entity-list-table th {
+    background-color: #333;
+    color: #e0e0e0;
+    border-color: #555;
+}
+
+body.dark-mode .entity-list-table td {
+    color: #e0e0e0;
+    border-color: #555;
+}
+
+body.dark-mode .entity-list-table tbody tr:hover {
+    background-color: #3c3c3c;
+}
+
+body.dark-mode .entity-list-table a {
+    color: #64B5F6;
+}
+
+body.dark-mode .entity-empty-state {
+    color: #999;
+}
+
+/* Responsive design */
+@media (max-width: 768px) {
+    .entity-modal-content {
+        width: 90%;
+        margin: 10% auto;
+        padding: 15px;
+    }
+
+    .entity-list-table th,
+    .entity-list-table td {
+        padding: 8px;
+        font-size: 0.9em;
+    }
+}
+</style>
+"""
+    return text
+
+
+def get_component_edit_modal_css():
+    """
+    Return CSS for component edit modal
+    """
+    text = """
+<style>
+/* Component Edit Modal Styles */
+.component-edit-modal-content {
+    max-width: 800px;
+    max-height: 90vh;
+}
+
+.component-edit-form {
+    margin: 20px 0;
+}
+
+.config-field {
+    margin-bottom: 20px;
+    padding: 15px;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    background: #f9f9f9;
+}
+
+.config-field-label {
+    display: block;
+    margin-bottom: 8px;
+    font-weight: bold;
+    color: #333;
+}
+
+.config-field-label .required-star {
+    color: #f44336;
+    margin-left: 4px;
+}
+
+.config-field-label .required-or-star {
+    color: #FF9800;
+    margin-left: 4px;
+}
+
+.config-field-default {
+    color: #666;
+    font-size: 0.9em;
+    margin-left: 10px;
+    font-weight: normal;
+}
+
+.config-field-input-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.config-field-input {
+    flex: 1;
+    padding: 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 14px;
+}
+
+.config-field-textarea {
+    width: 100%;
+    padding: 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 14px;
+    box-sizing: border-box;
+}
+
+.config-field-input:focus,
+.config-field-textarea:focus {
+    outline: none;
+    border-color: #2196F3;
+}
+
+.config-field-input.error,
+.config-field-textarea.error {
+    border-color: #f44336;
+}
+
+.config-field-error {
+    color: #f44336;
+    font-size: 0.85em;
+    margin-top: 4px;
+    display: none;
+}
+
+.config-field-error.visible {
+    display: block;
+}
+
+.delete-button {
+    background-color: #f44336;
+    color: white;
+    border: none;
+    padding: 6px 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 16px;
+    font-weight: bold;
+    transition: background-color 0.3s ease;
+}
+
+.delete-button:hover {
+    background-color: #d32f2f;
+}
+
+.add-button {
+    background-color: #4CAF50;
+    color: white;
+    border: none;
+    padding: 6px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: bold;
+    transition: background-color 0.3s ease;
+    margin-top: 8px;
+}
+
+.add-button:hover {
+    background-color: #45a049;
+}
+
+/* Toggle switch for boolean fields */
+.toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 50px;
+    height: 24px;
+}
+
+.toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.toggle-slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: #ccc;
+    transition: 0.4s;
+    border-radius: 24px;
+}
+
+.toggle-slider:before {
+    position: absolute;
+    content: "";
+    height: 18px;
+    width: 18px;
+    left: 3px;
+    bottom: 3px;
+    background-color: white;
+    transition: 0.4s;
+    border-radius: 50%;
+}
+
+input:checked + .toggle-slider {
+    background-color: #dc3545;
+}
+
+input:checked + .toggle-slider:before {
+    transform: translateX(26px);
+}
+
+.toggle-switch.deleted {
+    opacity: 0.4;
+}
+
+.toggle-switch.deleted .toggle-slider {
+    background-color: #999;
+}
+
+.deleted-indicator {
+    color: #ff4444;
+    font-size: 0.9em;
+    margin-left: 10px;
+    font-style: italic;
+}
+
+.component-edit-buttons {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+    margin-top: 20px;
+    padding-top: 15px;
+    border-top: 1px solid #ddd;
+}
+
+.save-button {
+    background-color: #4CAF50;
+    color: white;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: bold;
+    transition: background-color 0.3s ease;
+}
+
+.save-button:hover {
+    background-color: #45a049;
+}
+
+.save-button:disabled {
+    background-color: #ccc;
+    cursor: not-allowed;
+}
+
+.cancel-button {
+    background-color: #999;
+    color: white;
+    border: none;
+    padding: 10px 20px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: bold;
+    transition: background-color 0.3s ease;
+}
+
+.cancel-button:hover {
+    background-color: #777;
+}
+
+.component-edit-error {
+    color: #f44336;
+    padding: 10px;
+    margin: 10px 0;
+    border-radius: 4px;
+    display: none;
+}
+
+.component-edit-error.visible {
+    display: block;
+    background-color: #ffebee;
+}
+
+/* Dark mode support */
+body.dark-mode .config-field {
+    background: #2a2a2a;
+    border-color: #555;
+}
+
+body.dark-mode .config-field-label {
+    color: #e0e0e0;
+}
+
+body.dark-mode .config-field-default {
+    color: #aaa;
+}
+
+body.dark-mode .config-field-input {
+    background-color: #333;
+    color: #e0e0e0;
+    border-color: #555;
+}
+
+body.dark-mode .config-field-textarea {
+    background-color: #333;
+    color: #e0e0e0;
+    border-color: #555;
+}
+
+body.dark-mode .toggle-slider {
+    background-color: #555;
+}
+
+body.dark-mode input:checked + .toggle-slider {
+    background-color: #dc3545;
+}
+
+body.dark-mode .deleted-indicator {
+    color: #ff6666;
+}
+
+body.dark-mode .component-edit-buttons {
+    border-top-color: #555;
+}
+
+body.dark-mode .component-edit-error.visible {
+    background-color: #3a1a1a;
+}
+
+/* Responsive design */
+@media (max-width: 768px) {
+    .component-edit-modal-content {
+        width: 95%;
+        max-height: 95vh;
+    }
+
+    .config-field {
+        padding: 10px;
+    }
+
+    .config-field-input-row {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .delete-button {
+        width: 100%;
+        margin-top: 8px;
+    }
+}
+</style>
+"""
+    return text
+
+
+def get_entity_modal_js():
+    """
+    Return JavaScript for entity modal popup
+    """
+    text = """
+<script>
+let currentEntityData = [];
+
+async function showEntityModal(filter) {
+    const modal = document.getElementById('entityModal');
+    const modalTitle = document.getElementById('entityModalTitle');
+    const tableBody = document.getElementById('entityTableBody');
+    const emptyState = document.getElementById('entityEmptyState');
+    const searchInput = document.getElementById('entitySearchInput');
+
+    // Clear search input
+    searchInput.value = '';
+
+    // Show modal
+    modal.style.display = 'block';
+    modalTitle.textContent = 'Entities matching: ' + filter;
+
+    // Clear table
+    tableBody.innerHTML = '<tr><td colspan="3" style="text-align: center;">Loading...</td></tr>';
+    emptyState.style.display = 'none';
+
+    try {
+        // Fetch entities
+        const response = await fetch('./component_entities?filter=' + encodeURIComponent(filter));
+        const data = await response.json();
+
+        currentEntityData = data.entities || [];
+
+        // Populate table
+        if (currentEntityData.length === 0) {
+            tableBody.innerHTML = '';
+            emptyState.style.display = 'block';
+        } else {
+            renderEntityTable(currentEntityData);
+        }
+    } catch (error) {
+        console.error('Error fetching entities:', error);
+        tableBody.innerHTML = '<tr><td colspan="3" style="text-align: center; color: red;">Error loading entities</td></tr>';
+    }
+}
+
+function renderEntityTable(entities) {
+    const tableBody = document.getElementById('entityTableBody');
+    const emptyState = document.getElementById('entityEmptyState');
+
+    if (entities.length === 0) {
+        tableBody.innerHTML = '';
+        emptyState.style.display = 'block';
+        return;
+    }
+
+    emptyState.style.display = 'none';
+
+    let html = '';
+    for (const entity of entities) {
+        const entityUrl = './entity?entity_id=' + encodeURIComponent(entity.entity_id);
+        // Combine state and unit in one column
+        let stateWithUnit = escapeHtml(entity.state);
+        if (entity.unit_of_measurement && entity.unit_of_measurement !== '?' && entity.unit_of_measurement !== 'None') {
+            stateWithUnit += ' ' + escapeHtml(entity.unit_of_measurement);
+        }
+        html += '<tr>';
+        html += '<td><a href="' + entityUrl + '">' + escapeHtml(entity.entity_id) + '</a></td>';
+        html += '<td>' + escapeHtml(entity.friendly_name) + '</td>';
+        html += '<td>' + stateWithUnit + '</td>';
+        html += '</tr>';
+    }
+    tableBody.innerHTML = html;
+}
+
+function filterEntityTable() {
+    const searchInput = document.getElementById('entitySearchInput');
+    const searchTerm = searchInput.value.toLowerCase();
+
+    if (!searchTerm) {
+        renderEntityTable(currentEntityData);
+        return;
+    }
+
+    const filtered = currentEntityData.filter(entity =>
+        entity.entity_id.toLowerCase().includes(searchTerm) ||
+        entity.friendly_name.toLowerCase().includes(searchTerm)
+    );
+
+    renderEntityTable(filtered);
+}
+
+function closeEntityModal() {
+    const modal = document.getElementById('entityModal');
+    modal.style.display = 'none';
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+// Close modal when clicking outside of it
+window.onclick = function(event) {
+    const modal = document.getElementById('entityModal');
+    if (event.target === modal) {
+        closeEntityModal();
+    }
+}
+</script>
+"""
+    return text
+
+
+def get_component_edit_modal_js():
+    """
+    Return JavaScript for component edit modal
+    """
+    text = """
+<script>
+let componentConfigData = {};
+let componentFormDirty = false;
+let componentFormValid = true;
+
+async function showComponentEditModal(componentName) {
+    const modal = document.getElementById('componentEditModal');
+    const title = document.getElementById('componentEditModalTitle');
+    const form = document.getElementById('componentEditForm');
+    const errorDiv = document.getElementById('componentEditError');
+
+    // Reset state
+    componentFormDirty = false;
+    componentFormValid = true;
+    form.innerHTML = '<p>Loading...</p>';
+    errorDiv.textContent = '';
+    errorDiv.classList.remove('visible');
+
+    modal.style.display = 'block';
+    title.textContent = 'Edit Component Configuration: ' + componentName;
+
+    try {
+        const response = await fetch('./component_config?component_name=' + encodeURIComponent(componentName));
+        const data = await response.json();
+
+        if (!data.success) {
+            throw new Error(data.message || 'Failed to load configuration');
+        }
+
+        componentConfigData = data;
+        renderComponentConfigForm(data);
+    } catch (error) {
+        console.error('Error loading component config:', error);
+        form.innerHTML = '<p style="color: #f44336;">Error loading configuration: ' + error.message + '</p>';
+    }
+}
+
+function renderComponentConfigForm(data) {
+    const form = document.getElementById('componentEditForm');
+    form.innerHTML = '';
+
+    if (!data.args || data.args.length === 0) {
+        form.innerHTML = '<p>No configurable settings for this component.</p>';
+        return;
+    }
+
+    data.args.forEach(arg => {
+        const fieldDiv = document.createElement('div');
+        fieldDiv.className = 'config-field';
+        fieldDiv.dataset.configKey = arg.config_key;
+
+        // Label with required indicators
+        const label = document.createElement('label');
+        label.className = 'config-field-label';
+        label.textContent = arg.config_key;
+
+        if (arg.required) {
+            const star = document.createElement('span');
+            star.className = 'required-star';
+            star.innerHTML = '&#9733;';
+            star.title = 'Required';
+            label.appendChild(star);
+        } else if (arg.required_or) {
+            const star = document.createElement('span');
+            star.className = 'required-or-star';
+            star.innerHTML = '&#9733;';
+            star.title = 'At least one required';
+            label.appendChild(star);
+        }
+
+        if (arg.default !== null && arg.default !== undefined && arg.default !== '') {
+            const defaultSpan = document.createElement('span');
+            defaultSpan.className = 'config-field-default';
+            defaultSpan.textContent = '(default: ' + arg.default + ')';
+            label.appendChild(defaultSpan);
+        }
+
+        fieldDiv.appendChild(label);
+
+        // Input based on type
+        if (arg.type === 'boolean') {
+            renderBooleanField(fieldDiv, arg);
+        } else if (arg.type === 'string_list') {
+            renderListField(fieldDiv, arg);
+        } else if (arg.type === 'dict') {
+            renderDictField(fieldDiv, arg);
+        } else {
+            renderTextField(fieldDiv, arg);
+        }
+
+        form.appendChild(fieldDiv);
+    });
+}
+
+function renderBooleanField(container, arg) {
+    // Check current state from DOM
+    const existingCheckbox = container.querySelector('input[type="checkbox"]');
+    const existingAddBtn = container.querySelector('.add-button');
+
+    // Determine if we should show the field based on arg or current state
+    let shouldShowField;
+    if (existingCheckbox || existingAddBtn) {
+        // Already rendered, check if we have a checkbox
+        shouldShowField = !!existingCheckbox;
+    } else {
+        // First render, check arg
+        shouldShowField = arg.current_value !== null && arg.current_value !== undefined;
+    }
+
+    // Remove existing input row
+    const existingRow = container.querySelector('.config-field-input-row');
+    if (existingRow) {
+        existingRow.remove();
+    }
+
+    const inputRow = document.createElement('div');
+    inputRow.className = 'config-field-input-row';
+
+    // Define reusable handlers
+    function createAddButton() {
+        const addRow = document.createElement('div');
+        addRow.className = 'config-field-input-row';
+        const addBtn = document.createElement('button');
+        addBtn.className = 'add-button';
+        addBtn.innerHTML = '+ Add';
+        addBtn.type = 'button';
+        addBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            componentFormDirty = true;
+
+            // Remove the add button row
+            addRow.remove();
+
+            // Create the toggle row
+            createToggleWithDelete();
+        };
+        addRow.appendChild(addBtn);
+        container.appendChild(addRow);
+    }
+
+    function createToggleWithDelete() {
+        const newRow = document.createElement('div');
+        newRow.className = 'config-field-input-row';
+
+        const toggleLabel = document.createElement('label');
+        toggleLabel.className = 'toggle-switch';
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = arg.current_value === true || arg.current_value === 'true';
+        checkbox.onchange = function() {
+            componentFormDirty = true;
+        };
+
+        const slider = document.createElement('span');
+        slider.className = 'toggle-slider';
+
+        toggleLabel.appendChild(checkbox);
+        toggleLabel.appendChild(slider);
+        newRow.appendChild(toggleLabel);
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'delete-button';
+        deleteBtn.innerHTML = '×';
+        deleteBtn.type = 'button';
+        deleteBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            componentFormDirty = true;
+
+            // Remove toggle row
+            newRow.remove();
+
+            // Add back the + Add button
+            createAddButton();
+        };
+        newRow.appendChild(deleteBtn);
+
+        container.appendChild(newRow);
+    }
+
+    if (!shouldShowField) {
+        // Show + Add button
+        createAddButton();
+    } else {
+        // Show toggle with delete button
+        createToggleWithDelete();
+    }
+}
+
+function renderTextField(container, arg) {
+    // Check current state from DOM
+    const existingInput = container.querySelector('.config-field-input');
+    const existingAddBtn = container.querySelector('.add-button');
+
+    // Determine if we should show the field
+    let shouldShowField;
+    if (existingInput || existingAddBtn) {
+        // Already rendered, check if we have an input
+        shouldShowField = !!existingInput;
+    } else {
+        // First render, check arg
+        shouldShowField = arg.current_value !== null && arg.current_value !== undefined && arg.current_value !== '';
+    }
+
+    // Remove existing elements
+    const existingRow = container.querySelector('.config-field-input-row');
+    if (existingRow) {
+        existingRow.remove();
+    }
+    const existingError = container.querySelector('.config-field-error');
+    if (existingError) {
+        existingError.remove();
+    }
+
+    // Define reusable handlers
+    function createAddButton() {
+        const addRow = document.createElement('div');
+        addRow.className = 'config-field-input-row';
+        const addBtn = document.createElement('button');
+        addBtn.className = 'add-button';
+        addBtn.innerHTML = '+ Add';
+        addBtn.type = 'button';
+        addBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            componentFormDirty = true;
+
+            // Remove the add button row
+            addRow.remove();
+
+            // Create the input row
+            createInputWithDelete();
+        };
+        addRow.appendChild(addBtn);
+        container.appendChild(addRow);
+    }
+
+    function createInputWithDelete() {
+        const newRow = document.createElement('div');
+        newRow.className = 'config-field-input-row';
+
+        const input = document.createElement('input');
+        input.type = arg.config_key.includes('password') || arg.config_key.includes('key') || arg.config_key.includes('secret') ? 'password' : 'text';
+        input.className = 'config-field-input';
+        input.placeholder = 'Enter value...';
+        input.value = arg.current_value || '';
+        input.onblur = function() { validateField(input, arg.type); };
+        input.oninput = function() { componentFormDirty = true; };
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'delete-button';
+        deleteBtn.innerHTML = '×';
+        deleteBtn.type = 'button';
+        deleteBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            componentFormDirty = true;
+
+            // Remove input row and error
+            newRow.remove();
+            const err = container.querySelector('.config-field-error');
+            if (err) err.remove();
+
+            // Add back the + Add button
+            createAddButton();
+        };
+
+        newRow.appendChild(input);
+        newRow.appendChild(deleteBtn);
+        container.appendChild(newRow);
+
+        // Error message
+        const errorSpan = document.createElement('span');
+        errorSpan.className = 'config-field-error';
+        container.appendChild(errorSpan);
+    }
+
+    if (!shouldShowField) {
+        // Show + Add button
+        createAddButton();
+    } else {
+        // Show input with delete button
+        createInputWithDelete();
+    }
+}
+
+function renderDictField(container, arg) {
+    // Check current state from DOM
+    const existingTextarea = container.querySelector('.config-field-textarea');
+    const existingAddBtn = container.querySelector('.add-button');
+
+    // Determine if we should show the field
+    let shouldShowField;
+    if (existingTextarea || existingAddBtn) {
+        shouldShowField = !!existingTextarea;
+    } else {
+        shouldShowField = arg.current_value !== null && arg.current_value !== undefined;
+    }
+
+    // Remove existing elements
+    const existingRow = container.querySelector('.config-field-input-row');
+    if (existingRow) {
+        existingRow.remove();
+    }
+    const existingError = container.querySelector('.config-field-error');
+    if (existingError) {
+        existingError.remove();
+    }
+
+    // Define reusable handlers
+    function createAddButton() {
+        const addRow = document.createElement('div');
+        addRow.className = 'config-field-input-row';
+        const addBtn = document.createElement('button');
+        addBtn.className = 'add-button';
+        addBtn.innerHTML = '+ Add';
+        addBtn.type = 'button';
+        addBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            componentFormDirty = true;
+            addRow.remove();
+            createTextareaWithDelete();
+        };
+        addRow.appendChild(addBtn);
+        container.appendChild(addRow);
+    }
+
+    function createTextareaWithDelete() {
+        const newRow = document.createElement('div');
+        newRow.className = 'config-field-input-row';
+        newRow.style.flexDirection = 'column';
+        newRow.style.alignItems = 'stretch';
+
+        const textarea = document.createElement('textarea');
+        textarea.className = 'config-field-textarea';
+        textarea.placeholder = 'Enter YAML dictionary...';
+        textarea.rows = 6;
+        textarea.style.fontFamily = 'monospace';
+        textarea.style.fontSize = '0.9em';
+        textarea.style.resize = 'vertical';
+
+        // Convert dict to YAML string
+        if (arg.current_value && typeof arg.current_value === 'object') {
+            try {
+                // Simple YAML formatting - just use JSON with better formatting
+                textarea.value = JSON.stringify(arg.current_value, null, 2);
+            } catch (e) {
+                textarea.value = String(arg.current_value);
+            }
+        } else {
+            textarea.value = arg.current_value || '';
+        }
+
+        textarea.oninput = function() { componentFormDirty = true; };
+
+        const btnRow = document.createElement('div');
+        btnRow.style.display = 'flex';
+        btnRow.style.justifyContent = 'flex-end';
+        btnRow.style.marginTop = '5px';
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'delete-button';
+        deleteBtn.innerHTML = '×';
+        deleteBtn.type = 'button';
+        deleteBtn.onclick = function(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            componentFormDirty = true;
+            newRow.remove();
+            const err = container.querySelector('.config-field-error');
+            if (err) err.remove();
+            createAddButton();
+        };
+
+        btnRow.appendChild(deleteBtn);
+        newRow.appendChild(textarea);
+        newRow.appendChild(btnRow);
+        container.appendChild(newRow);
+
+        // Error message
+        const errorSpan = document.createElement('span');
+        errorSpan.className = 'config-field-error';
+        container.appendChild(errorSpan);
+    }
+
+    if (!shouldShowField) {
+        createAddButton();
+    } else {
+        createTextareaWithDelete();
+    }
+}
+
+function renderListField(container, arg) {
+    const listContainer = document.createElement('div');
+
+    let values = arg.current_value;
+    if (!Array.isArray(values)) {
+        values = values ? [values] : [''];
+    }
+
+    values.forEach((value, index) => {
+        addListEntry(listContainer, value, arg.type);
+    });
+
+    const addBtn = document.createElement('button');
+    addBtn.className = 'add-button';
+    addBtn.textContent = '+ Add Entry';
+    addBtn.type = 'button';
+    addBtn.onclick = () => {
+        addListEntry(listContainer, '', arg.type);
+        componentFormDirty = true;
+    };
+
+    container.appendChild(listContainer);
+    container.appendChild(addBtn);
+}
+
+function addListEntry(listContainer, value, type) {
+    const inputRow = document.createElement('div');
+    inputRow.className = 'config-field-input-row';
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'config-field-input';
+    input.placeholder = 'Enter value...';
+    input.value = value || '';
+    input.onblur = () => validateField(input, type);
+    input.oninput = () => componentFormDirty = true;
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.className = 'delete-button';
+    deleteBtn.innerHTML = '×';
+    deleteBtn.type = 'button';
+    deleteBtn.onclick = () => {
+        inputRow.remove();
+        componentFormDirty = true;
+    };
+
+    inputRow.appendChild(input);
+    inputRow.appendChild(deleteBtn);
+    listContainer.appendChild(inputRow);
+
+    // Error message
+    const errorSpan = document.createElement('span');
+    errorSpan.className = 'config-field-error';
+    listContainer.appendChild(errorSpan);
+}
+
+function validateField(input, type) {
+    const value = input.value.trim();
+    const errorSpan = input.parentElement.nextElementSibling || input.parentElement.parentElement.querySelector('.config-field-error');
+
+    if (!errorSpan) return true;
+
+    // Skip validation for empty fields
+    if (value === '') {
+        input.classList.remove('error');
+        errorSpan.textContent = '';
+        errorSpan.classList.remove('visible');
+        return true;
+    }
+
+    let isValid = true;
+    let errorMsg = '';
+
+    try {
+        if (type === 'integer' || type === 'int') {
+            if (!/^-?\\d+$/.test(value)) {
+                isValid = false;
+                errorMsg = 'Must be a valid integer';
+            }
+        } else if (type === 'float' || type === 'number') {
+            if (isNaN(parseFloat(value)) || !isFinite(value)) {
+                isValid = false;
+                errorMsg = 'Must be a valid number';
+            }
+        }
+    } catch (e) {
+        isValid = false;
+        errorMsg = 'Invalid value';
+    }
+
+    if (isValid) {
+        input.classList.remove('error');
+        errorSpan.textContent = '';
+        errorSpan.classList.remove('visible');
+    } else {
+        input.classList.add('error');
+        errorSpan.textContent = errorMsg;
+        errorSpan.classList.add('visible');
+    }
+
+    // Update global valid state
+    componentFormValid = document.querySelectorAll('.config-field-input.error').length === 0;
+    document.getElementById('componentEditSaveBtn').disabled = !componentFormValid;
+
+    return isValid;
+}
+
+async function saveComponentConfig() {
+    if (!componentFormValid) {
+        alert('Please fix validation errors before saving.');
+        return;
+    }
+
+    const form = document.getElementById('componentEditForm');
+    const fields = form.querySelectorAll('.config-field');
+    const changes = {};
+    const deletions = [];
+    const missingRequired = [];
+
+    // First pass: collect changes and deletions
+    fields.forEach(field => {
+        const configKey = field.dataset.configKey;
+        const argData = componentConfigData.args.find(a => a.config_key === configKey);
+        if (!argData) return;
+
+        if (argData.type === 'boolean') {
+            const checkbox = field.querySelector('input[type="checkbox"]');
+
+            // Check if field is missing (showing + Add button)
+            if (!checkbox) {
+                if (argData.current_value !== null && argData.current_value !== undefined && argData.current_value !== '') {
+                    deletions.push(configKey);
+                    if (argData.required) {
+                        missingRequired.push(configKey);
+                    }
+                }
+            } else {
+                const newValue = checkbox.checked;
+                const oldValue = argData.current_value === true || argData.current_value === 'true';
+                if (newValue !== oldValue) {
+                    changes[configKey] = newValue;
+                }
+            }
+        } else if (argData.type === 'string_list') {
+            const inputs = field.querySelectorAll('.config-field-input');
+            const values = [];
+            inputs.forEach(input => {
+                const val = input.value.trim();
+                if (val !== '') {
+                    values.push(val);
+                }
+            });
+
+            if (values.length === 0) {
+                deletions.push(configKey);
+            } else {
+                const oldValues = Array.isArray(argData.current_value) ? argData.current_value : (argData.current_value ? [argData.current_value] : []);
+                if (JSON.stringify(values) !== JSON.stringify(oldValues)) {
+                    changes[configKey] = values;
+                }
+            }
+        } else if (argData.type === 'dict') {
+            const textarea = field.querySelector('.config-field-textarea');
+
+            // Check if field is missing (showing + Add button)
+            if (!textarea) {
+                if (argData.current_value !== null && argData.current_value !== undefined) {
+                    deletions.push(configKey);
+                    if (argData.required) {
+                        missingRequired.push(configKey);
+                    }
+                }
+            } else {
+                const yamlValue = textarea.value.trim();
+
+                if (yamlValue === '') {
+                    if (argData.current_value !== null && argData.current_value !== undefined) {
+                        deletions.push(configKey);
+                        if (argData.required) {
+                            missingRequired.push(configKey);
+                        }
+                    }
+                } else {
+                    // Store as raw YAML string - backend will parse it
+                    const oldYaml = argData.current_value ? JSON.stringify(argData.current_value) : '';
+                    if (yamlValue !== oldYaml) {
+                        changes[configKey] = yamlValue;
+                    }
+                }
+            }
+        } else {
+            const input = field.querySelector('.config-field-input');
+
+            // Check if field is missing (showing + Add button)
+            if (!input) {
+                if (argData.current_value !== null && argData.current_value !== undefined && argData.current_value !== '') {
+                    deletions.push(configKey);
+                    if (argData.required) {
+                        missingRequired.push(configKey);
+                    }
+                }
+            } else {
+                const newValue = input.value.trim();
+
+                if (newValue === '') {
+                    if (argData.current_value !== null && argData.current_value !== undefined && argData.current_value !== '') {
+                        deletions.push(configKey);
+                        if (argData.required) {
+                            missingRequired.push(configKey);
+                        }
+                    }
+                } else if (newValue !== argData.current_value) {
+                    changes[configKey] = newValue;
+                }
+            }
+        }
+    });
+
+    // Check if any required fields will be missing after save
+    if (missingRequired.length > 0) {
+        const fieldList = missingRequired.join(', ');
+        if (!confirm(`Warning: Deleting required field(s) (${fieldList}) will disable this component.\\n\\nPredbat will restart automatically to apply changes. Continue?`)) {
+            return;
+        }
+    } else {
+        if (!confirm('Predbat will restart automatically to apply changes. Continue?')) {
+            return;
+        }
+    }
+
+    if (Object.keys(changes).length === 0 && deletions.length === 0) {
+        alert('No changes to save.');
+        return;
+    }
+
+    const saveBtn = document.getElementById('componentEditSaveBtn');
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving...';
+
+    try {
+        const response = await fetch('./component_config_save', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                component_name: componentConfigData.component_name,
+                changes: changes,
+                deletions: deletions
+            })
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            // Reset dirty flag before closing to avoid warning
+            componentFormDirty = false;
+            alert(result.message);
+            closeComponentEditModal();
+            // Reload page to show updated configuration
+            setTimeout(() => location.reload(), 1000);
+        } else {
+            throw new Error(result.message || 'Failed to save configuration');
+        }
+    } catch (error) {
+        console.error('Error saving component config:', error);
+        const errorDiv = document.getElementById('componentEditError');
+        errorDiv.textContent = 'Error: ' + error.message;
+        errorDiv.classList.add('visible');
+        saveBtn.disabled = false;
+        saveBtn.textContent = 'Save';
+    }
+}
+
+function closeComponentEditModal() {
+    if (componentFormDirty) {
+        if (!confirm('You have unsaved changes. Are you sure you want to close?')) {
+            return;
+        }
+    }
+
+    const modal = document.getElementById('componentEditModal');
+    modal.style.display = 'none';
+    componentFormDirty = false;
+}
+</script>
+"""
+    return text
+
+
+def get_charts_css():
+    text = """
+<style>
+.charts-menu {
+tabindex="0"  <!-- Make the menu focusable -->
+    background-color: #ffffff;
+    overflow-x: auto; /* Enable horizontal scrolling */
+    white-space: nowrap; /* Prevent menu items from wrapping */
+    display: flex;
+    align-items: center;
+    margin-bottom: 6px;
+    border-bottom: 1px solid #ddd;
+    padding: 4px 0;
+    -webkit-overflow-scrolling: touch; /* Smooth scrolling on iOS */
+    scrollbar-width: thin; /* Firefox */
+    scrollbar-color: #4CAF50 #f0f0f0; /* Firefox */
+}
+
+.charts-menu h3 {
+    margin: 0 10px;
+    flex-shrink: 0; /* Prevent shrinking */
+    white-space: nowrap; /* Prevent text wrapping */
+}
+
+.charts-menu a {
+    color: #333;
+    text-align: center;
+    padding: 4px 12px;
+    text-decoration: none;
+    font-size: 14px;
+    border-radius: 4px;
+    margin: 0 2px;
+    flex-shrink: 0; /* Prevent items from shrinking */
+    white-space: nowrap;
+    display: inline-block;
+}
+
+.charts-menu a:hover {
+    background-color: #f0f0f0;
+    color: #4CAF50;
+}
+
+.charts-menu a.active {
+    background-color: #4CAF50;
+    color: white;
+}
+
+/* Dark mode charts menu styles */
+body.dark-mode .charts-menu {
+    background-color: #1e1e1e;
+    border-bottom: 1px solid #333;
+    scrollbar-color: #4CAF50 #333; /* Firefox */
+}
+
+body.dark-mode .charts-menu h3 {
+    color: #e0e0e0;
+}
+
+body.dark-mode .charts-menu a {
+    color: white;
+}
+
+body.dark-mode .charts-menu a:hover {
+    background-color: #2c652f;
+    color: white;
+}
+
+body.dark-mode .charts-menu a.active {
+    background-color: #4CAF50;
+    color: white;
+}
+</style>
+<script>
+// Initialise the charts menu scrolling functionality
+document.addEventListener("DOMContentLoaded", function() {
+    // Scroll active item into view
+    setTimeout(function() {
+        const activeItem = document.querySelector('.charts-menu a.active');
+        if (activeItem) {
+            const menuBar = document.querySelector('.charts-menu');
+            const activeItemLeft = activeItem.offsetLeft;
+            const menuBarWidth = menuBar.clientWidth;
+            menuBar.scrollLeft = activeItemLeft - menuBarWidth / 2 + activeItem.clientWidth / 2;
+        }
+    }, 100);
+});
+</script>
+"""
+    return text
+
+
+def get_log_css():
+    text = """
+<style>
+.log-menu {
+    background-color: #ffffff;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    margin-bottom: 6px;
+    border-bottom: 1px solid #ddd;
+    padding: 4px 0;
+}
+
+.log-menu a {
+    color: #333;
+    text-align: center;
+    padding: 4px 12px;
+    text-decoration: none;
+    font-size: 14px;
+    border-radius: 4px;
+    margin: 0 2px;
+}
+
+.log-menu a:hover {
+    background-color: #f0f0f0;
+    color: #4CAF50;
+}
+
+.log-menu a.active {
+    background-color: #4CAF50;
+    color: white;
+}
+
+/* Dark mode log menu styles */
+body.dark-mode .log-menu {
+    background-color: #1e1e1e;
+    border-bottom: 1px solid #333;
+}
+
+body.dark-mode .log-menu a {
+    color: white;
+}
+
+body.dark-mode .log-menu a:hover {
+    background-color: #2c652f;
+    color: white;
+}
+
+body.dark-mode .log-menu a.active {
+    background-color: #4CAF50;
+    color: white;
+}
+
+/* Log search container styles */
+.log-search-container {
+    display: flex;
+    align-items: center;
+    margin-bottom: 10px;
+    padding: 8px;
+    background-color: #f8f9fa;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    gap: 8px;
+}
+
+.log-search-input {
+    flex-grow: 1;
+    padding: 6px 10px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    font-size: 14px;
+    min-width: 200px;
+}
+
+.log-search-input:focus {
+    outline: none;
+    border-color: #4CAF50;
+    box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.2);
+}
+
+.clear-search-button {
+    padding: 6px 12px;
+    background-color: #6c757d;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    white-space: nowrap;
+}
+
+.clear-search-button:hover {
+    background-color: #5a6268;
+}
+
+.search-status {
+    font-size: 12px;
+    color: #6c757d;
+    white-space: nowrap;
+}
+
+/* Dark mode search styles */
+body.dark-mode .log-search-container {
+    background-color: #2d3748;
+    border-color: #4a5568;
+}
+
+body.dark-mode .log-search-input {
+    background-color: #4a5568;
+    border-color: #718096;
+    color: #fff;
+}
+
+body.dark-mode .log-search-input:focus {
+    border-color: #4CAF50;
+}
+
+body.dark-mode .log-search-input::placeholder {
+    color: #a0aec0;
+}
+
+body.dark-mode .clear-search-button {
+    background-color: #4a5568;
+}
+
+body.dark-mode .clear-search-button:hover {
+    background-color: #2d3748;
+}
+
+body.dark-mode .search-status {
+    color: #a0aec0;
+}
+
+/* Hide filtered log entries */
+.log-entry-hidden {
+    display: none !important;
+}
+
+/* Highlight matching text */
+mark.search-highlight {
+    background-color: #ffeb3b;
+    color: #000;
+    font-weight: bold;
+    padding: 1px 2px;
+    border-radius: 2px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+}
+
+body.dark-mode mark.search-highlight {
+    background-color: #ffa000;
+    color: #000;
+    font-weight: bold;
+    padding: 1px 2px;
+    border-radius: 2px;
+    box-shadow: 0 1px 2px rgba(255,255,255,0.1);
+}
+</style>
+"""
+
+    # Add custom CSS for live updates
+    text += """
+        <style>
+        .log-status {
+            margin: 10px 0;
+            padding: 8px;
+            background-color: #f0f0f0;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+        body.dark-mode .log-status {
+            background-color: #333;
+            color: #fff;
+        }
+        .new-log-entry {
+            animation: highlight 2s ease-out;
+        }
+        @keyframes highlight {
+            0% { background-color: #ffff99; }
+            100% { background-color: transparent; }
+        }
+        body.dark-mode .new-log-entry {
+            animation: highlight-dark 2s ease-out;
+        }
+        @keyframes highlight-dark {
+            0% { background-color: #555500; }
+            100% { background-color: transparent; }
+        }
+        .auto-scroll-toggle {
+            margin-left: 10px;
+            cursor: pointer;
+        }
+        .scroll-to-bottom {
+            margin-left: 10px;
+            padding: 4px 8px;
+            background: #007cba;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .scroll-to-bottom:hover {
+            background: #005a87;
+        }
+        </style>
+    """
+
+    return text
+
+
+def get_editor_css():
+    text = """
+<style>
+.editor-container {
+    position: fixed;
+    top: 70px; /* Account for fixed header */
+    left: 0;
+    right: 0;
+    bottom: 0;
+    display: flex;
+    flex-direction: column;
+    background-color: inherit;
+    z-index: 10;
+}
+
+.editor-header {
+    flex-shrink: 0;
+    padding: 10px 15px;
+    margin: 0;
+    background-color: inherit;
+}
+
+.editor-form {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 0 15px 15px 15px;
+    min-height: 0; /* Important for flex children */
+    overflow: hidden; /* Prevent form from overflowing */
+}
+
+.editor-textarea {
+    flex: 1;
+    font-family: 'Courier New', monospace;
+    font-size: 14px;
+    line-height: 1.4;
+    padding: 10px;
+    border: 2px solid #4CAF50;
+    border-radius: 4px;
+    resize: none;
+    background-color: #ffffff;
+    color: #333;
+    white-space: pre;
+    overflow-wrap: normal;
+    overflow: auto;
+    min-height: 0; /* Important for flex children */
+    width: 100%;
+    box-sizing: border-box;
+}
+
+.editor-controls {
+    flex-shrink: 0;
+    margin-top: 10px;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+    padding: 10px 0;
+}
+
+.save-button {
+    background-color: #4CAF50;
+    color: white;
+    border: none;
+    padding: 12px 24px;
+    font-size: 16px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: bold;
+}
+
+.save-button:hover {
+    background-color: #45a049;
+}
+
+.save-button:disabled {
+    background-color: #cccccc !important;
+    color: #888888 !important;
+    cursor: not-allowed !important;
+    position: relative !important;
+    border: 2px solid #bbbbbb !important;
+}
+
+.revert-button {
+    background-color: #f44336;
+    color: white;
+    border: none;
+    padding: 12px 24px;
+    font-size: 16px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: bold;
+}
+
+.revert-button:hover {
+    background-color: #d32f2f;
+}
+
+.revert-button:disabled {
+    background-color: #cccccc !important;
+    color: #888888 !important;
+    cursor: not-allowed !important;
+    position: relative !important;
+    border: 2px solid #bbbbbb !important;
+}
+
+.message {
+    padding: 10px;
+    border-radius: 4px;
+    margin: 10px 0;
+    display: none;
+}
+
+.success {
+    background-color: #d4edda;
+    color: #155724;
+    border: 1px solid #c3e6cb;
+}
+
+.error {
+    background-color: #f8d7da;
+    color: #721c24;
+    border: 1px solid #f5c6cb;
+}
+
+/* CodeMirror specific styles */
+.CodeMirror {
+    height: auto;
+    flex: 1;
+    font-family: 'Courier New', monospace;
+    font-size: 14px;
+    border: 2px solid #4CAF50;
+    border-radius: 4px;
+    background-color: #ffffff !important; /* Force white background */
+}
+
+/* Selection style */
+.CodeMirror-selected {
+    background-color: #b5d5ff !important;
+}
+
+/* Dark mode selection style */
+body.dark-mode .CodeMirror-selected {
+    background-color: #3a3d41 !important;
+}
+
+.CodeMirror-gutters {
+    background-color: #f8f8f8;
+    border-right: 1px solid #ddd;
+}
+
+.CodeMirror-linenumber {
+    color: #999;
+}
+
+/* Dark mode styles */
+body.dark-mode .editor-textarea {
+    background-color: #2d2d2d;
+    color: #f0f0f0;
+    border-color: #4CAF50;
+}
+
+body.dark-mode .CodeMirror {
+    border-color: #4CAF50;
+    background-color: #2d2d2d !important; /* Force dark background */
+    color: #f0f0f0 !important; /* Force light text */
+}
+
+body.dark-mode .CodeMirror-gutters {
+    background-color: #2d2d2d;
+    border-right: 1px solid #444;
+}
+
+body.dark-mode .CodeMirror-linenumber {
+    color: #777;
+}
+
+/* Dark mode syntax highlighting adjustments */
+body.dark-mode .cm-s-default .cm-string {
+    color: #ce9178 !important;
+}
+
+body.dark-mode .cm-s-default .cm-number {
+    color: #b5cea8 !important;
+}
+
+body.dark-mode .cm-s-default .cm-keyword {
+    color: #569cd6 !important;
+}
+
+body.dark-mode .cm-s-default .cm-property {
+    color: #9cdcfe !important;
+}
+
+body.dark-mode .cm-s-default .cm-atom {
+    color: #d19a66 !important;
+}
+
+body.dark-mode .cm-s-default .cm-comment {
+    color: #6a9955 !important;
+}
+
+body.dark-mode .cm-s-default .cm-meta {
+    color: #dcdcaa !important;
+}
+
+body.dark-mode .cm-s-default .cm-tag {
+    color: #569cd6 !important;
+}
+
+body.dark-mode .cm-s-default .cm-attribute {
+    color: #9cdcfe !important;
+}
+
+body.dark-mode .cm-s-default .cm-variable {
+    color: #9cdcfe !important;
+}
+
+body.dark-mode .cm-s-default .cm-variable-2 {
+    color: #4ec9b0 !important;
+}
+
+body.dark-mode .cm-s-default .cm-def {
+    color: #dcdcaa !important;
+}
+
+body.dark-mode .CodeMirror-cursor {
+    border-left: 1px solid #f0f0f0 !important;
+}
+
+/* Lint markers for both light and dark mode */
+.CodeMirror-lint-marker-error, .CodeMirror-lint-message-error {
+    background-image: url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjE2IiBoZWlnaHQ9IjE2IiBmaWxsPSJyZWQiPjxwYXRoIGQ9Ik0xMS45OTMgMi4wMDFhMTAgMTAgMCAwMC03LjA3MyAyLjkyOEExMCAxMCAwIDAwMS45OTIgMTIuMDAxYTEwIDEwIDAgMDAyLjkyOCA3LjA3MiAxMCAxMCAwIDAwNy4wNzMgMi45MjkgMTAgMTAgMCAwMDcuMDczLTIuOTMgMTAgMTAgMCAwMDIuOTI4LTcuMDcxIDEwIDEwIDAgMDAtMi45MjgtNy4wNzIgMTAgMTAgMCAwMC03LjA3My0yLjkyOHptMCA0bC4yMzIuMDAzYy41MjUuMDEzLjk5NC4zMzQgMS4yLjgyNWwuMDQuMTAzTDE2LjM0NSAxNWExLjUgMS41IDAgMDEtMi44NS45NDVsLS4wMzItLjFMMTIgMTIuNzYzIDguNTM3IDE1LjgybC0uMDk2LjA4YTEuNSAxLjUgMCAwMS0xLjgxLjEwNmwtLjEwMi0uMDgxYTEuNSAxLjUgMCAwMS0uMTA4LTEuODA2bC4wOC0uMTA0TDkuNCA3Ljk0NWwuMDgxLS4xMjVjLjIzMS0uMzE2LjYxNi0uNTE2IDEuMDM3LS4wMTZsLjA5Mi4wODMuMDc4LjA5My4wOTcuMTM2LjA0OC4wODUuMTYuMDMyeloiLz48L3N2Zz4=');
+    background-position: center;
+    background-repeat: no-repeat;
+}
+
+.CodeMirror-lint-tooltip {
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    background-color: white;
+    z-index: 10000;
+    max-width: 600px;
+    overflow: hidden;
+    white-space: pre-wrap;
+    padding: 8px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+    color: #333;
+}
+
+body.dark-mode .CodeMirror-lint-tooltip {
+    background-color: #2d2d2d;
+    color: #f0f0f0;
+    border-color: #444;
+}
+
+.CodeMirror-lint-marker-error:hover {
+    cursor: pointer;
+}
+
+.CodeMirror-lint-line-error {
+    background-color: rgba(255, 0, 0, 0.1);
+}
+
+body.dark-mode .CodeMirror-lint-line-error {
+    background-color: rgba(255, 0, 0, 0.2);
+}
+
+body.dark-mode .message.success {
+    background-color: #1e3f20;
+    color: #7bc97d;
+    border-color: #2d5a2f;
+}
+
+body.dark-mode .message.error {
+    background-color: #3f1e1e;
+    color: #f5c6cb;
+    border-color: #5a2d2d;
+}
+
+body.dark-mode .save-button:disabled {
+    background-color: #444444 !important;
+    color: #777777 !important;
+    border: 2px solid #555555 !important;
+}
+
+body.dark-mode .revert-button {
+    background-color: #c62828;
+    color: white;
+    border: none;
+}
+
+body.dark-mode .revert-button:hover {
+    background-color: #b71c1c;
+}
+
+body.dark-mode .revert-button:disabled {
+    background-color: #444444 !important;
+    color: #777777 !important;
+    border: 2px solid #555555 !important;
+}
+</style>"""
+    return text
+
+
+def get_logfile_js(filter_type):
+    """
+    Return JavaScript for log file page
+    """
+    text = f"""
+        <script>
+        let currentFilter = '{filter_type}';
+        let lastLineNumber = 0;
+        let updateInterval;
+        let isUpdating = false;
+        let isPaused = false;
+        let searchTimeout = null; // For debouncing search
+
+        // Toggle pause/resume updates
+        function toggleUpdates() {{
+            const btn = document.getElementById('pauseResumeBtn');
+            if (isPaused) {{
+                // Resume
+                isPaused = false;
+                btn.textContent = 'Pause';
+                updateInterval = setInterval(updateLog, 2000);
+                updateLog(); // Immediate update
+                updateStatus('Updates resumed');
+            }} else {{
+                // Pause
+                isPaused = true;
+                btn.textContent = 'Resume';
+                if (updateInterval) {{
+                    clearInterval(updateInterval);
+                    updateInterval = null;
+                }}
+                updateStatus('Updates paused');
+            }}
+        }}
+
+        // Get the highest line number currently displayed
+        function getLastLineNumber() {{
+            const rows = document.querySelectorAll('#logTableBody tr[data-line]');
+            let maxLine = 0;
+            rows.forEach(row => {{
+                const lineNum = parseInt(row.getAttribute('data-line'));
+                if (lineNum > maxLine) {{
+                    maxLine = lineNum;
+                }}
+            }});
+            return maxLine;
+        }}
+
+        // Update log status
+        function updateStatus(message) {{
+            const statusDiv = document.getElementById('logStatus');
+            if (statusDiv) {{
+                const now = new Date().toLocaleTimeString();
+                statusDiv.textContent = `${{message}} (Last updated: ${{now}})`;
+            }}
+        }}
+
+        // Escape HTML to prevent XSS
+        function escapeHtml(text) {{
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }}
+
+        // Add new log entries
+        function addLogEntries(lines) {{
+            const tbody = document.getElementById('logTableBody');
+            if (!tbody) return 0;
+
+            const autoScroll = document.getElementById('autoScroll');
+            const shouldAutoScroll = autoScroll ? autoScroll.checked : false;
+            let newEntriesAdded = 0;
+
+            // Insert entries at the top (newest first)
+            lines.forEach(logLine => {{
+                if (logLine.line_number > lastLineNumber) {{
+                    const row = document.createElement('tr');
+                    row.setAttribute('data-line', logLine.line_number);
+                    row.className = 'new-log-entry';
+
+                    let color = '#33cc33'; // Default green for info
+                    if (logLine.type === 'error') {{
+                        color = '#ff3333';
+                    }} else if (logLine.type === 'warning') {{
+                        color = '#ffA500';
+                    }}
+
+                    // Use highlighted content from server (already HTML-escaped and highlighted)
+                    const timestamp = logLine.timestamp;
+                    const message = logLine.message;
+
+                    row.innerHTML = `<td>${{logLine.line_number}}</td><td nowrap><font color="${{color}}">${{timestamp}}</font> ${{message}}</td>`;
+
+                    // Insert at the top of the table body
+                    tbody.insertBefore(row, tbody.firstChild);
+                    newEntriesAdded++;
+
+                    lastLineNumber = Math.max(lastLineNumber, logLine.line_number);
+                }}
+            }});
+
+            // Auto-scroll to top for new entries (since newest are at top)
+            if (newEntriesAdded > 0 && shouldAutoScroll) {{
+                setTimeout(() => {{
+                    window.scrollTo({{
+                        top: 0,
+                        behavior: 'smooth'
+                    }});
+                }}, 100);
+            }}
+
+            return newEntriesAdded;
+        }}
+
+        // Scroll to bottom function
+        function scrollToBottom() {{
+            window.scrollTo({{
+                top: document.body.scrollHeight,
+                behavior: 'smooth'
+            }});
+        }}
+
+        // Debounced search function
+        function debouncedSearch() {{
+            const searchTerm = document.getElementById('logSearchInput').value.toLowerCase().trim();
+
+            // Clear existing timeout
+            if (searchTimeout) {{
+                clearTimeout(searchTimeout);
+            }}
+
+            // Set new timeout for search (500ms delay)
+            searchTimeout = setTimeout(() => {{
+                performServerSearch(searchTerm);
+            }}, 500);
+        }}
+
+        // Search functionality - now uses server-side search with debouncing
+        function filterLogEntries() {{
+            debouncedSearch();
+        }}
+
+        // Perform server-side search
+        async function performServerSearch(searchTerm) {{
+            if (isUpdating) return;
+            isUpdating = true;
+
+            const statusDiv = document.getElementById('searchStatus');
+            statusDiv.textContent = 'Searching...';
+
+            try {{
+                const searchParam = searchTerm ? `&search=${{encodeURIComponent(searchTerm)}}` : '';
+                const response = await fetch(`./api/log?filter=${{currentFilter}}&since=0&max_lines=1024${{searchParam}}`);
+
+                if (!response.ok) {{
+                    throw new Error(`HTTP ${{response.status}}: ${{response.statusText}}`);
+                }}
+
+                const data = await response.json();
+
+                if (data.status === 'success') {{
+                    // Clear existing table content
+                    const tbody = document.getElementById('logTableBody');
+                    tbody.innerHTML = '';
+
+                    // Reset line number tracking
+                    lastLineNumber = 0;
+
+                    // Add search results
+                    const entriesAdded = addLogEntries(data.lines);
+
+                    // Update status with search results info
+                    if (searchTerm) {{
+                        const searchMatches = data.search_matches || data.returned_lines;
+                        const displayedResults = data.returned_lines;
+
+                        if (searchMatches > displayedResults) {{
+                            statusDiv.textContent = `Found ${{searchMatches}} matching entries (showing ${{displayedResults}})`;
+                        }} else {{
+                            statusDiv.textContent = `Found ${{searchMatches}} matching entries (showing ${{displayedResults}})`;
+                        }}
+
+                        updateStatus(`Search completed - ${{searchMatches}} matches found`);
+                    }} else {{
+                        statusDiv.textContent = '';
+                        updateStatus('Search cleared - showing recent entries');
+                    }}
+                }} else {{
+                    statusDiv.textContent = `Search error: ${{data.message || 'Unknown error'}}`;
+                    updateStatus(`Search error: ${{data.message || 'Unknown error'}}`);
+                }}
+            }} catch (error) {{
+                console.error('Error performing search:', error);
+                statusDiv.textContent = `Search error: ${{error.message}}`;
+                updateStatus(`Search error: ${{error.message}}`);
+            }} finally {{
+                isUpdating = false;
+            }}
+        }}
+
+        // Clear search function
+        function clearLogSearch() {{
+            document.getElementById('logSearchInput').value = '';
+            filterLogEntries();
+        }}
+
+        // Escape special regex characters
+        function escapeRegExp(string) {{
+            return string.replace(/[.*+?^${{}}()|[\\]\\\\]/g, '\\\\$&');
+        }}
+
+        // Fetch new log entries
+        async function updateLog() {{
+            if (isUpdating || isPaused) return;
+
+            const searchTerm = document.getElementById('logSearchInput').value.toLowerCase().trim();
+
+            isUpdating = true;
+
+            try {{
+                let url;
+                if (searchTerm) {{
+                    // If search is active, fetch new entries that match the search criteria
+                    const searchParam = `&search=${{encodeURIComponent(searchTerm)}}`;
+                    url = `./api/log?filter=${{currentFilter}}&since=${{lastLineNumber}}&max_lines=100${{searchParam}}`;
+                }} else {{
+                    // Normal update without search
+                    url = `./api/log?filter=${{currentFilter}}&since=${{lastLineNumber}}&max_lines=1024`;
+                }}
+
+                const response = await fetch(url);
+
+                if (!response.ok) {{
+                    throw new Error(`HTTP ${{response.status}}: ${{response.statusText}}`);
+                }}
+
+                const data = await response.json();
+
+                if (data.status === 'success') {{
+                    const newEntries = addLogEntries(data.lines);
+                    if (newEntries > 0) {{
+                        if (searchTerm) {{
+                            updateStatus(`${{newEntries}} new matching entries added`);
+                            // Update search status to reflect new matches
+                            const statusDiv = document.getElementById('searchStatus');
+                            const rows = document.querySelectorAll('#logTableBody tr[data-line]');
+                            const totalDisplayed = rows.length;
+                            const currentText = statusDiv.textContent;
+
+                            // Try to extract existing match count and update it
+                            if (currentText.includes('Found')) {{
+                                const match = currentText.match(/Found (\\d+)/);
+                                if (match) {{
+                                    const oldCount = parseInt(match[1]);
+                                    const newCount = oldCount + newEntries;
+                                    statusDiv.textContent = `Found ${{newCount}} matching entries (showing ${{totalDisplayed}})`;
+                                }}
+                            }}
+                        }} else {{
+                            updateStatus(`${{newEntries}} new entries added`);
+                        }}
+                    }} else {{
+                        if (searchTerm) {{
+                            updateStatus('No new matching entries');
+                        }} else {{
+                            updateStatus('No new entries');
+                        }}
+                    }}
+                }} else {{
+                    updateStatus(`Error: ${{data.message || 'Unknown error'}}`);
+                }}
+            }} catch (error) {{
+                console.error('Error updating log:', error);
+                updateStatus(`Error fetching log data: ${{error.message}}`);
+            }} finally {{
+                isUpdating = false;
+            }}
+        }}
+
+        // Initialise
+        document.addEventListener('DOMContentLoaded', function() {{
+            lastLineNumber = 0; // Start from 0 since we're loading all initial data
+            updateStatus('Log viewer loaded - fetching initial data...');
+
+            // Load initial data immediately
+            updateLog();
+
+            // Start periodic updates every 2 seconds
+            updateInterval = setInterval(updateLog, 2000);
+
+            // Handle page visibility changes to pause/resume updates
+            document.addEventListener('visibilitychange', function() {{
+                if (isPaused) return; // Don't auto-resume if manually paused
+
+                if (document.hidden) {{
+                    if (updateInterval) {{
+                        clearInterval(updateInterval);
+                        updateInterval = null;
+                    }}
+                }} else {{
+                    if (!updateInterval) {{
+                        updateInterval = setInterval(updateLog, 2000);
+                    }}
+                    updateLog(); // Immediate update when page becomes visible
+                }}
+            }});
+        }});
+
+        // Clean up on page unload
+        window.addEventListener('beforeunload', function() {{
+            if (updateInterval) {{
+                clearInterval(updateInterval);
+                updateInterval = null;
+            }}
+        }});
+        </script>
+        """
+    return text
+
+
+def get_editor_js():
+    text = """
+<script>
+let isSubmitting = false;
+let editor; // CodeMirror instance
+
+document.getElementById('editorForm').addEventListener('submit', function(e) {
+    e.preventDefault(); // Always prevent default initially
+
+    if (isSubmitting) {
+        return;
+    }
+
+    // Get the current content and validate it
+    const content = editor ? editor.getValue() : document.getElementById('appsContent').value;
+    let hasYamlError = false;
+
+    try {
+        // Only validate if content exists and isn't empty
+        if (content && content.trim()) {
+            jsyaml.load(content, { schema: CUSTOM_SCHEMA });
+        }
+    } catch (e) {
+        console.log('YAML validation error during form submit:', e.message);
+        hasYamlError = true;
+    }
+
+    // Safety check - don't allow submission if there are YAML errors
+    if (hasYamlError) {
+        showMessage("Cannot save while there are YAML syntax errors. Please fix the errors first.", "error");
+        return;
+    }
+
+    // Show confirmation popup
+    const confirmed = confirm("Warning: Saving changes will restart Predbat. Are you sure you want to continue?");
+
+    if (!confirmed) {
+        return; // User cancelled the save
+    }
+
+    // Update the hidden textarea with CodeMirror content before submission
+    if (editor) {
+        document.getElementById('appsContent').value = editor.getValue();
+    }
+
+    isSubmitting = true;
+    const saveButton = document.getElementById('saveButton');
+    const saveStatus = document.getElementById('saveStatus');
+
+    saveButton.disabled = true;
+    saveButton.textContent = 'Saving...';
+    saveStatus.textContent = 'Please wait...';
+
+    // Clear stored content as we're saving now
+    localStorage.removeItem('appsYamlContent');
+
+    // Submit the form programmatically
+    this.submit();
+});
+
+// Show messages
+function showMessage(message, type = 'success') {
+    const messageContainer = document.getElementById('messageContainer');
+    const messageDiv = document.createElement('div');
+    messageDiv.className = `message ${type}`;
+    messageDiv.style.display = 'block';
+    messageDiv.textContent = message;
+
+    messageContainer.innerHTML = '';
+    messageContainer.appendChild(messageDiv);
+
+    // Auto-hide success messages after 5 seconds
+    if (type === 'success') {
+        setTimeout(() => {
+            messageDiv.style.display = 'none';
+        }, 5000);
+    }
+}
+
+// Function to update button states based on content changes and validation
+function updateButtonStates(saveButton, revertButton, content, hasError = false) {
+    if (!saveButton && !revertButton) return;
+
+    const isDarkMode = document.body.classList.contains('dark-mode');
+    const hasChanged = content !== window.originalContent;
+
+    // Update Save button
+    if (saveButton) {
+        // First set the disabled property, which is crucial for behavior
+        const shouldDisableSave = hasError || !hasChanged;
+        saveButton.disabled = shouldDisableSave;
+
+        // Update tooltip
+        if (hasError) {
+            saveButton.title = 'Fix YAML errors before saving';
+        } else {
+            saveButton.title = hasChanged ? 'Save changes' : 'No changes to save';
+        }
+
+        // Apply styling - ensure disabled style gets applied correctly
+        if (shouldDisableSave) {
+            // Disabled styling
+            saveButton.style.backgroundColor = isDarkMode ? '#444444' : '#cccccc';
+            saveButton.style.color = isDarkMode ? '#777777' : '#888888';
+            saveButton.style.border = `2px solid ${isDarkMode ? '#555555' : '#bbbbbb'}`;
+        } else {
+            // Enabled styling
+            saveButton.style.backgroundColor = '#4CAF50';
+            saveButton.style.color = 'white';
+            saveButton.style.border = 'none';
+        }
+    }
+
+    // Update Revert button - always enable if content changed, regardless of errors
+    if (revertButton) {
+        // First set the disabled property
+        const shouldDisableRevert = !hasChanged;
+        revertButton.disabled = shouldDisableRevert;
+        revertButton.title = hasChanged ? 'Discard changes and reload from disk' : 'No changes to revert';
+
+        // Apply styling - ensure disabled style gets applied correctly
+        if (shouldDisableRevert) {
+            // Disabled styling
+            revertButton.style.backgroundColor = isDarkMode ? '#444444' : '#cccccc';
+            revertButton.style.color = isDarkMode ? '#777777' : '#888888';
+            revertButton.style.border = `2px solid ${isDarkMode ? '#555555' : '#bbbbbb'}`;
+        } else {
+            // Enabled styling
+            revertButton.style.backgroundColor = '#4CAF50';
+            revertButton.style.color = 'white';
+            revertButton.style.border = 'none';
+        }
+    }
+}
+
+// Define custom YAML types for Home Assistant/Predbat tags
+const SECRET_TYPE = new jsyaml.Type('!secret', {
+    kind: 'scalar',
+    construct: function(data) {
+        return '***SECRET***'; // Placeholder value for secrets
+    }
+});
+
+// Create a custom schema that includes the !secret tag
+const CUSTOM_SCHEMA = jsyaml.DEFAULT_SCHEMA.extend([SECRET_TYPE]);
+
+// Custom YAML linter using js-yaml with custom schema
+CodeMirror.registerHelper("lint", "yaml", function(text) {
+    const found = [];
+    if (!text.trim()) {
+        return found; // Return empty array for empty text to avoid false errors
+    }
+
+    try {
+        jsyaml.load(text, { schema: CUSTOM_SCHEMA });
+    } catch (e) {
+        // Convert js-yaml error to CodeMirror lint format
+        const line = e.mark && e.mark.line ? e.mark.line : 0;
+        const ch = e.mark && e.mark.column ? e.mark.column : 0;
+        found.push({
+            from: CodeMirror.Pos(line, ch),
+            to: CodeMirror.Pos(line, ch + 1),
+            message: e.message,
+            severity: "error"
+        });
+    }
+
+    // Return the array of found issues
+    return found;
+});
+
+// Initialise CodeMirror and handle dark mode
+function initializeCodeMirror() {
+    const textarea = document.getElementById('appsContent');
+
+    if (!textarea) return;
+
+    const isDarkMode = document.body.classList.contains('dark-mode');
+
+    // Check if we have unsaved content in localStorage
+    const savedContent = localStorage.getItem('appsYamlContent');
+
+    // Store the original content for change comparison
+    window.originalContent = textarea.value;
+
+    // If we have saved content and the textarea is empty or the saved content differs from current
+    if (savedContent && (!textarea.value.trim() || savedContent !== textarea.value)) {
+        // Always load the saved content automatically
+        textarea.value = savedContent;
+        console.log('Automatically restored content from localStorage');
+    }
+
+    // Create CodeMirror instance
+    editor = CodeMirror.fromTextArea(textarea, {
+        mode: 'yaml',
+        theme: isDarkMode ? 'monokai' : 'default', // Use default theme for light mode (pure white background)
+        lineNumbers: true,
+        indentUnit: 2,
+        smartIndent: true,
+        tabSize: 2,
+        indentWithTabs: false,
+        lineWrapping: false,
+        gutters: ['CodeMirror-linenumbers', 'CodeMirror-lint-markers'],
+        lint: {
+            getAnnotations: CodeMirror.helpers.lint.yaml,
+            lintOnChange: true,
+            delay: 300 // Reduced delay for faster feedback
+        },
+        autofocus: true,
+        extraKeys: {
+            'Tab': function(cm) {
+                if (cm.somethingSelected()) {
+                    cm.indentSelection('add');
+                } else {
+                    cm.replaceSelection('  ', 'end', '+input');
+                }
+            },
+            'Ctrl-Space': 'autocomplete'
+        }
+    });
+
+    // Manually validate YAML when editor is ready
+    editor.on('change', function() {
+        // Get the content and buttons
+        const content = editor.getValue();
+        const saveButton = document.getElementById('saveButton');
+        const revertButton = document.getElementById('revertButton');
+        let isValid = true;
+
+        try {
+            // Parse YAML to check for errors
+            if (content.trim()) {
+                jsyaml.load(content, { schema: CUSTOM_SCHEMA });
+            }
+        } catch (e) {
+            isValid = false;
+            console.log('YAML validation error in change handler:', e.message);
+        }
+
+        // Update button states based on YAML validation result
+        updateButtonStates(saveButton, revertButton, content, !isValid);
+
+        // Save content to localStorage whenever it changes
+        localStorage.setItem('appsYamlContent', content);
+    });
+
+    // Make CodeMirror fill the available space
+    editor.setSize('100%', '100%');
+
+    // Add custom CSS to make CodeMirror fill its container properly
+    const cmElement = editor.getWrapperElement();
+    cmElement.style.flex = '1';
+    cmElement.style.minHeight = '0';
+    cmElement.style.height = 'auto';
+
+    // Set up the lint status display
+    const lintStatusEl = document.getElementById('lintStatus');
+    if (lintStatusEl) {
+        // Update lint status when linting is done
+        editor.on('lint', (errors) => {
+            console.log('Lint event fired:', errors ? errors.length : 0, 'errors found');
+            const saveButton = document.getElementById('saveButton');
+
+            // Make a direct validation attempt as backup
+            let isValid = true;
+            try {
+                const content = editor.getValue();
+                if (content && content.trim()) {
+                    jsyaml.load(content, { schema: CUSTOM_SCHEMA });
+                }
+            } catch (e) {
+                console.log('Manual YAML validation error during lint event:', e.message);
+                isValid = false;
+            }
+
+            const content = editor.getValue();
+            const revertButton = document.getElementById('revertButton');
+            const hasErrors = (errors && errors.length > 0) || !isValid;
+
+            if (hasErrors) {
+                lintStatusEl.innerHTML = `<div style="color: #d32f2f; padding: 5px; border-radius: 4px; background-color: ${isDarkMode ? '#3f1e1e' : '#fff0f0'}; border: 1px solid #d32f2f;">
+                    <strong>⚠️ Found ${errors ? errors.length : 'syntax'} YAML ${errors && errors.length === 1 ? 'error' : 'errors'}</strong>
+                    <p style="margin: 5px 0 0 0; font-size: 14px;">Hover over the red markers in the editor gutter to see details.</p>
+                </div>`;
+
+                // Update button states with error flag
+                updateButtonStates(saveButton, revertButton, content, true);
+            } else {
+                // Clear the lint status when syntax is valid
+                lintStatusEl.innerHTML = '';
+
+                // Update button states with no error flag
+                updateButtonStates(saveButton, revertButton, content, false);
+            }
+        });
+
+        // Set up external change detection
+        const form = document.getElementById('editorForm');
+        let originalChecksum = form.getAttribute('data-file-checksum');
+        let externalChangeWarningShown = false;
+
+        function checkForExternalChanges() {
+            fetch('./apps_editor_checksum')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.checksum && data.checksum !== originalChecksum && !externalChangeWarningShown) {
+                        const currentContent = editor.getValue();
+                        const hasLocalChanges = currentContent !== window.originalContent;
+
+                        if (!hasLocalChanges) {
+                            // No local edits - auto-reload
+                            editor.setValue(data.content);
+                            window.originalContent = data.content;
+                            originalChecksum = data.checksum;  // Update the variable
+                            form.setAttribute('data-file-checksum', data.checksum);
+                            showMessage('File was changed externally and has been reloaded.', 'success');
+                            externalChangeWarningShown = false;  // Reset so we can detect future changes
+                        } else {
+                            // Has local edits - show warning
+                            externalChangeWarningShown = true;
+                            const warningDiv = document.createElement('div');
+                            warningDiv.className = 'message warning';
+                            warningDiv.style.display = 'block';
+                            warningDiv.style.backgroundColor = '#fff3cd';
+                            warningDiv.style.color = '#856404';
+                            warningDiv.style.border = '1px solid #ffeeba';
+                            warningDiv.innerHTML = `
+                                <strong>⚠️ Warning:</strong> The apps.yaml file has been changed externally. You have unsaved local changes.<br>
+                                <button onclick="location.reload()" style="margin-top: 10px; padding: 5px 10px; background: #856404; color: white; border: none; border-radius: 4px; cursor: pointer;">Reload and discard local changes</button>
+                            `;
+                            const messageContainer = document.getElementById('messageContainer');
+                            messageContainer.innerHTML = '';
+                            messageContainer.appendChild(warningDiv);
+                        }
+                    }
+                })
+                .catch(err => console.error('Error checking for external changes:', err));
+        }
+
+        // Check every 5 seconds for external changes
+        setInterval(checkForExternalChanges, 5000);
+
+        // Initial lint after a short delay to ensure editor is fully loaded
+        setTimeout(() => {
+            // Perform the lint
+            editor.performLint();
+
+            // Manually check and enable the button if there are no errors
+            // This is a fallback in case the lint event doesn't fire correctly
+            setTimeout(() => {
+                const saveButton = document.getElementById('saveButton');
+                const revertButton = document.getElementById('revertButton');
+                try {
+                    const content = editor.getValue();
+                    let isValidYaml = true;
+
+                    // Only validate if we have content
+                    if (content && content.trim()) {
+                        try {
+                            jsyaml.load(content, { schema: CUSTOM_SCHEMA });
+                        } catch (e) {
+                            isValidYaml = false;
+                            console.log('YAML validation error in initialisation:', e.message);
+                        }
+
+                        // Update button states based on content validity
+                        updateButtonStates(saveButton, revertButton, content, !isValidYaml);
+
+                        // Also clear the lint status if it exists and YAML is valid
+                        if (lintStatusEl && isValidYaml) {
+                            lintStatusEl.innerHTML = '';
+                        }
+                    } else {
+                        // Empty content is considered valid
+                        updateButtonStates(saveButton, revertButton, content, false);
+                    }
+                } catch (e) {
+                    // Something went wrong, keep the save button disabled but enable revert if changed
+                    const content = editor.getValue();
+                    updateButtonStates(saveButton, revertButton, content, true);
+                }
+            }, 300);
+        }, 800);
+    }
+
+    // Apply dark mode if needed
+    if (isDarkMode) {
+        // Make sure the CodeMirror editor has proper dark mode styling
+        const cmElement = editor.getWrapperElement();
+        cmElement.style.backgroundColor = '#2d2d2d';
+
+        // Style the gutters
+        const gutters = document.querySelectorAll('.CodeMirror-gutters');
+        gutters.forEach(gutter => {
+            gutter.style.backgroundColor = '#2d2d2d';
+            gutter.style.borderRight = '1px solid #444';
+        });
+
+        // Force a refresh to ensure all styles are applied properly
+        editor.refresh();
+    }
+}
+
+// Handle page load
+document.addEventListener('DOMContentLoaded', function() {
+    const textarea = document.getElementById('appsContent');
+    if (textarea && textarea.value.trim() === '') {
+        textarea.placeholder = 'apps.yaml content could not be loaded';
+    }
+
+    // Initialise CodeMirror
+    initializeCodeMirror();
+
+    // Handle Revert button click
+    document.getElementById('revertButton').addEventListener('click', function() {
+        if (confirm('This will discard all your unsaved changes and reload the file from disk. Are you sure?')) {
+            // Remove saved content from localStorage
+            localStorage.removeItem('appsYamlContent');
+
+            // Reload the page to get fresh content from disk
+            window.location.reload();
+        }
+    });
+
+    // Add a direct listener to ensure the button gets enabled
+    // This is a final fallback in case other methods fail
+    setTimeout(() => {
+        const saveButton = document.getElementById('saveButton');
+        const revertButton = document.getElementById('revertButton');
+
+        if (editor) {
+            // Force a final validation check
+            try {
+                const content = editor.getValue();
+                const hasChanged = content !== window.originalContent;
+
+                // Check YAML validity
+                let isValid = true;
+                if (content && content.trim()) {
+                    try {
+                        jsyaml.load(content, { schema: CUSTOM_SCHEMA });
+                    } catch (e) {
+                        isValid = false;
+                        console.log('YAML validation error in DOMContentLoaded final check:', e.message);
+                    }
+                }
+
+                // Update buttons states consistently
+                updateButtonStates(saveButton, revertButton, content, !isValid);
+
+            } catch (e) {
+                // We already know there's an error, but we won't disable the button here
+                // as that should be handled by the lint event
+            }
+
+            // Manual override for debugging: add a global function to force-enable the button
+            window.enableSaveButton = function() {
+                const saveButton = document.getElementById('saveButton');
+                const revertButton = document.getElementById('revertButton');
+                if (saveButton) {
+                    // Force enable the save button for debugging purposes by treating content as changed and valid
+                    const content = editor ? editor.getValue() : '';
+                    updateButtonStates(saveButton, revertButton, content, false);
+                }
+            };
+        }
+    }, 2000); // Wait longer for everything to initialise
+
+    // Add a listener for dark mode toggle
+    window.addEventListener('storage', function(e) {
+        if (e.key === 'darkMode') {
+            if (editor) {
+                const isDarkMode = localStorage.getItem('darkMode') === 'true';
+                editor.setOption('theme', isDarkMode ? 'monokai' : 'default');
+
+                // Update the editor's wrapper element styling
+                const cmElement = editor.getWrapperElement();
+
+                if (isDarkMode) {
+                    cmElement.style.backgroundColor = '#2d2d2d';
+
+                    // Style the gutters
+                    const gutters = document.querySelectorAll('.CodeMirror-gutters');
+                    gutters.forEach(gutter => {
+                        gutter.style.backgroundColor = '#2d2d2d';
+                        gutter.style.borderRight = '1px solid #444';
+                    });
+
+                    // Re-style any lint tooltips that might be open
+                    const tooltips = document.querySelectorAll('.CodeMirror-lint-tooltip');
+                    tooltips.forEach(tooltip => {
+                        tooltip.style.backgroundColor = '#2d2d2d';
+                        tooltip.style.color = '#f0f0f0';
+                        tooltip.style.borderColor = '#444';
+                    });
+                } else {
+                    cmElement.style.backgroundColor = '#ffffff';
+
+                    // Style the gutters
+                    const gutters = document.querySelectorAll('.CodeMirror-gutters');
+                    gutters.forEach(gutter => {
+                        gutter.style.backgroundColor = '#f8f8f8';
+                        gutter.style.borderRight = '1px solid #ddd';
+                    });
+
+                    // Re-style any lint tooltips that might be open
+                    const tooltips = document.querySelectorAll('.CodeMirror-lint-tooltip');
+                    tooltips.forEach(tooltip => {
+                        tooltip.style.backgroundColor = '#ffffff';
+                        tooltip.style.color = '#333';
+                        tooltip.style.borderColor = '#ccc';
+                    });
+                }
+
+                // Re-run the linter
+                editor.performLint();
+
+                // Force a refresh to ensure all styles are applied properly
+                editor.refresh();
+            }
+        }
+    });
+});
+</script>
+"""
+    return text
+
+
+def get_plan_css():
+    text = """<body>
+    <style>
+    /* CSS Variables for colors */
+    :root {
+        --bg-default: #FFFFFF;
+        --bg-table: #FFFFFF;
+        --text-default: #000000;
+        --text-muted: #666666;
+        --border-color: #ddd;
+    }
+
+    body.dark-mode {
+        --bg-default: #1e1e1e;
+        --bg-table: #2d2d2d;
+        --text-default: #FFFFFF;
+        --text-muted: #cccccc;
+        --border-color: #444;
+    }
+
+    /* Table styling for dark mode */
+    body {
+        background-color: var(--bg-default);
+        color: var(--text-default);
+    }
+
+    table {
+        background-color: var(--bg-table);
+        color: var(--text-default);
+        border-collapse: collapse;
+    }
+
+    table td, table th {
+        border: 1px solid var(--border-color);
+        color: var(--text-default);
+    }
+
+    /* Ensure text is pure white in dark mode */
+    body.dark-mode table td,
+    body.dark-mode table th {
+        color: #FFFFFF !important;
+    }
+
+    /* Timestamp styling for dark mode */
+    body.dark-mode #planTimestamp {
+        color: #aaaaaa;
+    }
+
+    .dropdown {
+        position: relative;
+        display: inline-block;
+    }
+
+    .dropdown-content {
+        display: none;
+        position: absolute;
+        background-color: #f9f9f9;
+        min-width: 220px;
+        box-shadow: 0px 8px 16px 0px rgba(0,0,0,0.2);
+        z-index: 2001;
+        border-radius: 4px;
+        padding: 12px;
+        box-sizing: border-box;
+    }
+
+    .dropdown-content a {
+        color: black;
+        padding: 10px 12px;
+        text-decoration: none;
+        display: block;
+        cursor: pointer;
+        border-radius: 3px;
+        margin: 4px 0;
+    }
+
+    .dropdown-content a:hover {
+        background-color: #f1f1f1;
+    }
+
+    .dropdown-content label {
+        display: block;
+        margin-bottom: 6px;
+        font-weight: 500;
+        color: #333;
+        font-size: 13px;
+    }
+
+    .clickable-time-cell {
+        cursor: pointer;
+        position: relative;
+        transition: background-color 0.2s;
+        z-index: 1;
+    }
+
+    /* Boost z-index for cell with open dropdown */
+    .clickable-time-cell:has(.dropdown-content[style*="display: block"]) {
+        z-index: 2000;
+    }
+
+    .clickable-state-cell {
+        cursor: pointer;
+        position: relative;
+        transition: background-color 0.2s;
+        z-index: 1;
+    }
+
+    .clickable-state-cell:has(.dropdown-content[style*="display: block"]) {
+        z-index: 2000;
+    }
+
+    .clickable-state-cell:hover {
+        filter: brightness(0.9);
+    }
+
+    .clickable-state-cell:focus-visible {
+        outline: 2px solid #2196F3;
+        outline-offset: -2px;
+    }
+
+    body.dark-mode .clickable-state-cell:hover {
+        filter: brightness(1.2);
+    }
+
+    .reason-text {
+        font-size: 13px;
+        line-height: 1.4;
+        color: #333;
+        max-width: 260px;
+    }
+
+    body.dark-mode .reason-text {
+        color: #eee;
+    }
+
+    .clickable-time-cell:hover {
+        filter: brightness(0.9);
+    }
+
+    body.dark-mode .clickable-time-cell:hover {
+        filter: brightness(1.2);
+    }
+
+    /* Dark mode styles */
+    body.dark-mode .dropdown-content {
+        background-color: #333;
+        box-shadow: 0px 8px 16px 0px rgba(0,0,0,0.5);
+    }
+
+    body.dark-mode .dropdown-content a {
+        color: #e0e0e0;
+    }
+
+    body.dark-mode .dropdown-content a:hover {
+        background-color: #444;
+    }
+
+    body.dark-mode .dropdown-content label {
+        color: #e0e0e0;
+    }
+
+    /* ============================
+   Override cell styling
+   ============================ */
+
+    /* Generic fallback */
+    .override-active {
+        position: relative;
+        background-color: #FFC0CB !important; /* Light pink */
+    }
+    body.dark-mode .override-active {
+        background-color: #93264c !important; /* Dark pink */
+    }
+
+    /* Manual Charge */
+    .override-charge {
+        position: relative;
+        background-color: #3AEE85 !important; /* Green (same as charging) */
+    }
+    body.dark-mode .override-charge {
+        background-color: #247e59 !important;
+    }
+
+    /* Manual Export */
+    .override-export {
+        position: relative;
+        background-color: #FFFF00 !important; /* Bright yellow */
+    }
+    body.dark-mode .override-export {
+        background-color: #999900 !important;
+    }
+
+    /* Manual Demand */
+    .override-demand {
+        position: relative;
+        background-color: #F18261 !important; /* Red-orange (high demand) */
+    }
+    body.dark-mode .override-demand {
+        background-color: #7e2e1f !important;
+    }
+
+    /* Manual Freeze Charge (improved visibility) */
+    .override-freeze-charge {
+        position: relative;
+        background-color: #C0C0C0 !important; /* Medium gray for light mode */
+    }
+    body.dark-mode .override-freeze-charge {
+        background-color: #888888 !important; /* Lighter gray for dark mode */
+    }
+
+    /* Manual Freeze Export */
+    .override-freeze-export {
+        position: relative;
+        background-color: #AAAAAA !important; /* Darker gray */
+    }
+    body.dark-mode .override-freeze-export {
+        background-color: #444444 !important;
+    }
+
+    /* Rate input field styles */
+    .dropdown-content input[type="number"] {
+        background-color: #fff;
+        color: #333;
+        border: 1px solid #ccc;
+        width: 100%;
+        padding: 8px 10px;
+        border-radius: 4px;
+        box-sizing: border-box;
+        font-size: 14px;
+        margin-bottom: 8px;
+    }
+
+    .dropdown-content input[type="number"]:focus {
+        outline: none;
+        border-color: #4CAF50;
+        box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.2);
+    }
+
+    .dropdown-content button {
+        background-color: #4CAF50;
+        color: white;
+        border: none;
+        cursor: pointer;
+        width: 100%;{
+        padding: 12px;
+    }
+
+    body.dark-mode .dropdown-content input[type="number"] {
+        background-color: #444;
+        color: #e0e0e0;
+        border-color: #666;
+    }
+
+    body.dark-mode .dropdown-content input[type="number"]:focus {
+        border-color: #4CAF50;
+        box-shadow: 0 0 0 2px rgba(76, 175, 80, 0.3);
+    }
+
+    body.dark-mode .dropdown-content button {
+        background-color: #4CAF50;
+        color: white !important;
+    }
+
+    body.dark-mode .dropdown-content button:hover {
+        background-color: #45a049;
+        color: white !important;
+    }
+
+    body.dark-mode .dropdown-content button:active {
+        background-color: #3d8b40 and button */
+    body.dark-mode .dropdown-content input[type="number"] {
+        background-color: #444;
+        color: #e0e0e0;
+        border-color: #666;
+    }
+
+    body.dark-mode .dropdown-content input[type="number"]:focus {
+        border-color: #4CAF50;
+    }
+
+    body.dark-mode .dropdown-content button {
+        background-color: #4CAF50;
+        color: white !important;
+    }
+
+    body.dark-mode .dropdown-content button:hover {
+        background-color: #45a049;
+        color: white !important;
+    }
+
+    /* Dark mode styles for labels and text in dropdown */
+    body.dark-mode .dropdown-content label {
+        color: #e0e0e0 !important;
+    }
+
+    body.dark-mode .dropdown-content div {
+        color: #e0e0e0 !important;
+    }
+    </style>
+
+    <script>
+    // Function to darken a hex color for dark mode
+    function darkenColor(hex, factor = 0.4) {
+        // Remove # if present
+        hex = hex.replace('#', '');
+
+        // Parse RGB
+        const r = parseInt(hex.substring(0, 2), 16);
+        const g = parseInt(hex.substring(2, 4), 16);
+        const b = parseInt(hex.substring(4, 6), 16);
+
+        // Darken by reducing brightness
+        const newR = Math.round(r * factor);
+        const newG = Math.round(g * factor);
+        const newB = Math.round(b * factor);
+
+        // Convert back to hex
+        return '#' + [newR, newG, newB].map(x => {
+            const hex = x.toString(16);
+            return hex.length === 1 ? '0' + hex : hex;
+        }).join('');
+    }
+
+    // Check if a color is white or very light (close to white)
+    function isWhiteColor(hex) {
+        // Remove # if present
+        hex = hex.replace('#', '').toUpperCase();
+
+        // Check if it's white or very close to white
+        return hex === 'FFFFFF' || hex === 'FFF';
+    }
+
+    // Check if dark mode is active
+    function isDarkMode() {
+        return document.body.classList.contains('dark-mode');
+    }
+
+    // Apply colors to table cells based on mode
+    function updateTableColors() {
+        const cells = document.querySelectorAll('td[bgcolor]');
+        const darkMode = isDarkMode();
+
+        cells.forEach(cell => {
+            // Skip cells with override classes - they have their own dark mode CSS
+            if (cell.classList.contains('override-charge') ||
+                cell.classList.contains('override-export') ||
+                cell.classList.contains('override-freeze-charge') ||
+                cell.classList.contains('override-freeze-export') ||
+                cell.classList.contains('override-demand') ||
+                cell.classList.contains('override-active')) {
+                return;
+            }
+
+            const bgColor = cell.getAttribute('bgcolor');
+            if (bgColor) {
+                if (darkMode) {
+                    // Convert white to black, darken other colors
+                    if (isWhiteColor(bgColor)) {
+                        cell.style.backgroundColor = '#1e1e1e';
+                    } else {
+                        cell.style.backgroundColor = darkenColor(bgColor);
+                    }
+                } else {
+                    // Keep original color in light mode
+                    cell.style.backgroundColor = bgColor;
+                }
+            }
+        });
+    }
+
+    // Watch for dark mode changes on body element
+    const bodyObserver = new MutationObserver((mutations) => {
+        mutations.forEach((mutation) => {
+            if (mutation.type === 'attributes' && mutation.attributeName === 'class') {
+                updateTableColors();
+            }
+        });
+    });
+    bodyObserver.observe(document.body, { attributes: true });
+
+    // Apply colors on initial load
+    document.addEventListener('DOMContentLoaded', updateTableColors);
+    if (document.readyState !== 'loading') {
+        updateTableColors();
+    }
+
+    // Close all dropdown menus
+    function closeDropdowns() {
+        var dropdowns = document.getElementsByClassName("dropdown-content");
+        for (var i = 0; i < dropdowns.length; i++) {
+            if (dropdowns[i].style.display === "block") {
+                dropdowns[i].style.display = "none";
+            }
+        }
+    }
+
+    // Toggle dropdown menu
+    function toggleForceDropdown(id) {
+        closeDropdowns();
+        var dropdown = document.getElementById(id);
+        if (!dropdown) {
+            // dropdownId is assigned by a counter that increments across the whole table render
+            // and gets baked into the cell's onclick string; if that string is now stale relative
+            // to the current DOM (e.g. after a plan refresh reassigned different ids), this would
+            // otherwise throw here and silently abort the click with no visible effect at all -
+            // indistinguishable from the cell just not responding (batpred#4474 follow-up). Log
+            // instead of throwing so a real cause leaves a trace even without DevTools handy.
+            console.warn("toggleForceDropdown: no element found for id", id);
+            return;
+        }
+        if (dropdown.style.display === "block") {
+            dropdown.style.display = "none";
+        } else {
+            dropdown.style.display = "block";
+        }
+    }
+
+    // Function to show error message as a modal popup
+    function showErrorMessage(message) {
+        // Create modal overlay
+        const overlay = document.createElement('div');
+        overlay.style.position = 'fixed';
+        overlay.style.top = '0';
+        overlay.style.left = '0';
+        overlay.style.width = '100%';
+        overlay.style.height = '100%';
+        overlay.style.backgroundColor = 'rgba(0, 0, 0, 0.5)';
+        overlay.style.zIndex = '9999';
+        overlay.style.display = 'flex';
+        overlay.style.justifyContent = 'center';
+        overlay.style.alignItems = 'center';
+
+        // Create modal dialog
+        const modal = document.createElement('div');
+        modal.style.backgroundColor = 'white';
+        modal.style.padding = '30px';
+        modal.style.borderRadius = '8px';
+        modal.style.maxWidth = '500px';
+        modal.style.width = '90%';
+        modal.style.boxShadow = '0 4px 20px rgba(0, 0, 0, 0.3)';
+        modal.style.position = 'relative';
+
+        // Create error icon and message container
+        const content = document.createElement('div');
+        content.style.marginBottom = '20px';
+        content.innerHTML = '<div style="color: #f44336; font-size: 48px; text-align: center; margin-bottom: 15px;">⚠</div>' +
+                           '<div style="color: #333; font-size: 16px; line-height: 1.5; text-align: center;"><strong>Error</strong><br>' + message + '</div>';
+
+        // Create dismiss button
+        const button = document.createElement('button');
+        button.textContent = 'Dismiss';
+        button.style.width = '100%';
+        button.style.padding = '12px';
+        button.style.backgroundColor = '#f44336';
+        button.style.color = 'white';
+        button.style.border = 'none';
+        button.style.borderRadius = '4px';
+        button.style.fontSize = '16px';
+        button.style.cursor = 'pointer';
+        button.style.fontWeight = 'bold';
+        button.onmouseover = function() { this.style.backgroundColor = '#d32f2f'; };
+        button.onmouseout = function() { this.style.backgroundColor = '#f44336'; };
+        button.onclick = function() { overlay.remove(); };
+
+        // Allow clicking overlay to close
+        overlay.onclick = function(e) { if (e.target === overlay) overlay.remove(); };
+
+        // Assemble modal
+        modal.appendChild(content);
+        modal.appendChild(button);
+        overlay.appendChild(modal);
+        document.body.appendChild(overlay);
+    }
+
+    // Handle rate override option function
+    function handleRateOverride(time, type, dropdownId, clear) {
+        // Get the rate value from the input field (unless clearing)
+        let rate = null;
+        if (!clear && dropdownId) {
+            const inputElement = document.getElementById('rate_' + dropdownId);
+            if (inputElement) {
+                rate = inputElement.value;
+            }
+        } else if (clear) {
+            // When clearing, we need to find the actual stored rate for this time
+            const minutesFromMidnight = getMinutesFromTimeString(time);
+            const overrideList = type === 'import' ? window.overridesData.manual_import_rates : window.overridesData.manual_export_rates;
+            const override = overrideList.find(r => r.minutes === minutesFromMidnight);
+            if (override) {
+                rate = override.rate;
+            } else {
+                rate = 0; // Fallback if not found
+            }
+        }
+
+        // Construct the action string the server expects
+        let action;
+        if (clear) {
+            action = type === 'import' ? 'Clear Import' : 'Clear Export';
+        } else {
+            action = type === 'import' ? 'Set Import' : 'Set Export';
+        }
+
+        // Create a form data object to send the override parameters
+        const formData = new FormData();
+        formData.append('time', time);
+        formData.append('rate', rate || '0');
+        formData.append('action', action);
+
+        // Send the override request to the server
+        fetch('./rate_override', {
+            method: 'POST',
+            body: formData
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                // Show success message
+                const messageElement = document.createElement('div');
+                if (clear) {
+                    messageElement.textContent = `Manual rate cleared for ${time}`;
+                } else {
+                    messageElement.textContent = `Rate set to ${rate}p/kWh for ${time}`;
+                }
+                messageElement.style.position = 'fixed';
+                messageElement.style.top = '65px';
+                messageElement.style.right = '10px';
+                messageElement.style.padding = '10px';
+                messageElement.style.backgroundColor = '#4CAF50';
+                messageElement.style.color = 'white';
+                messageElement.style.borderRadius = '4px';
+                messageElement.style.zIndex = '1000';
+                document.body.appendChild(messageElement);
+
+                // Auto-remove message after 3 seconds
+                setTimeout(() => {
+                    messageElement.style.opacity = '0';
+                    messageElement.style.transition = 'opacity 0.5s';
+                    setTimeout(() => messageElement.remove(), 500);
+                }, 3000);
+
+                // Reload the page to show the updated plan
+                setTimeout(() => location.reload(), 1000);
+            } else {
+                showErrorMessage(data.message || 'Unknown error');
+            }
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            showErrorMessage(error.message || 'Unknown error');
+        });
+        // Close dropdown after selection
+        closeDropdowns();
+
+    }
+
+    // Handle load override option function
+    function handleLoadOverride(time, dropdownId, clear) {
+        // Get the adjustment value from the input field (unless clearing)
+        let adjustment = null;
+        if (!clear && dropdownId) {
+            const inputElement = document.getElementById('load_' + dropdownId);
+            if (inputElement) {
+                adjustment = inputElement.value;
+            }
+        } else if (clear) {
+            // When clearing, we need to find the actual stored adjustment for this time
+            const minutesFromMidnight = getMinutesFromTimeString(time);
+            const override = window.overridesData.manual_load_adjust.find(r => r.minutes === minutesFromMidnight);
+            if (override) {
+                adjustment = override.adjustment;
+            } else {
+                adjustment = 0; // Fallback if not found
+            }
+        }
+
+        // Construct the action string the server expects
+        const action = clear ? 'Clear Load' : 'Set Load';
+
+        // Create a form data object to send the override parameters
+        const formData = new FormData();
+        formData.append('time', time);
+        formData.append('rate', adjustment || '0');
+        formData.append('action', action);
+        // Send the override request to the server
+        fetch('./rate_override', {
+            method: 'POST',
+            body: formData
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                // Show success message
+                const messageElement = document.createElement('div');
+                if (clear) {
+                    messageElement.textContent = `Manual load adjustment cleared for ${time}`;
+                } else {
+                    messageElement.textContent = `Load adjustment set to ${adjustment} for ${time}`;
+                }
+                messageElement.style.position = 'fixed';
+                messageElement.style.top = '65px';
+                messageElement.style.right = '10px';
+                messageElement.style.padding = '10px';
+                messageElement.style.backgroundColor = '#4CAF50';
+                messageElement.style.color = 'white';
+                messageElement.style.borderRadius = '4px';
+                messageElement.style.zIndex = '1000';
+                document.body.appendChild(messageElement);
+
+                // Auto-remove message after 3 seconds
+                setTimeout(() => {
+                    messageElement.style.opacity = '0';
+                    messageElement.style.transition = 'opacity 0.5s';
+                    setTimeout(() => messageElement.remove(), 500);
+                }, 3000);
+
+                // Reload the page to show the updated plan
+                setTimeout(() => location.reload(), 1000);
+            } else {
+                showErrorMessage(data.message || 'Unknown error');
+            }
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            showErrorMessage(error.message || 'Unknown error');
+        });
+        // Close dropdown after selection
+        closeDropdowns();
+
+    }
+
+
+    // Handle option selection
+    function handleTimeOverride(time, action) {
+
+        // Create a form data object to send the override parameters
+        const formData = new FormData();
+        formData.append('time', time);
+        formData.append('action', action);
+
+        // Send the override request to the server
+        fetch('./plan_override', {
+            method: 'POST',
+            body: formData
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                // Show success message
+                const messageElement = document.createElement('div');
+                messageElement.textContent = `${action} override set for ${time}`;
+                messageElement.style.position = 'fixed';
+                messageElement.style.top = '65px';
+                messageElement.style.right = '10px';
+                messageElement.style.padding = '10px';
+                messageElement.style.backgroundColor = '#4CAF50';
+                messageElement.style.color = 'white';
+                messageElement.style.borderRadius = '4px';
+                messageElement.style.zIndex = '1000';
+                document.body.appendChild(messageElement);
+
+                // Auto-remove message after 3 seconds
+                setTimeout(() => {
+                    messageElement.style.opacity = '0';
+                    messageElement.style.transition = 'opacity 0.5s';
+                    setTimeout(() => messageElement.remove(), 500);
+                }, 3000);
+
+                // Reload the page to show the updated plan
+                setTimeout(() => location.reload(), 1000);
+            } else {
+                showErrorMessage(data.message || 'Unknown error');
+            }
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            showErrorMessage(error.message);
+        });
+
+        // Close dropdown after selection
+        closeDropdowns();
+    }
+
+    // Handle SOC override (isMax selects the manual_soc_max ceiling instead of the manual_soc floor)
+    function handleSocOverride(time, dropdownId, isClear, isMax) {
+        const inputPrefix = isMax ? 'socmax_' : 'soc_';
+        const overrideKey = isMax ? 'manual_soc_max' : 'manual_soc';
+
+        // Get the SOC value from the input field (unless clearing)
+        let value = null;
+        if (!isClear && dropdownId) {
+            const inputElement = document.getElementById(inputPrefix + dropdownId);
+            if (inputElement) {
+                value = inputElement.value;
+            }
+        } else if (isClear) {
+            // When clearing, we need to find the actual stored SOC for this time
+            const minutesFromMidnight = getMinutesFromTimeString(time);
+            const override = window.overridesData[overrideKey].find(r => r.minutes === minutesFromMidnight);
+            if (override) {
+                value = override.target;
+            } else {
+                value = 0; // Fallback if not found
+            }
+        }
+
+        // Construct the action string the server expects
+        const action = isMax ? (isClear ? 'Clear SOC Max' : 'Set SOC Max') : (isClear ? 'Clear SOC' : 'Set SOC');
+
+        // Create a form data object to send the override parameters
+        const formData = new FormData();
+        formData.append('time', time);
+        formData.append('action', action);
+        formData.append('rate', value || '0');
+
+        // Send the override request to the server
+        fetch('./rate_override', {
+            method: 'POST',
+            body: formData
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                // Show success message
+                const messageElement = document.createElement('div');
+                const label = isMax ? 'SOC max' : 'SOC';
+                if (isClear) {
+                    messageElement.textContent = `${label} override cleared for ${time}`;
+                } else {
+                    messageElement.textContent = `${label} target set to ${value}% for ${time}`;
+                }
+                messageElement.style.position = 'fixed';
+                messageElement.style.top = '65px';
+                messageElement.style.right = '10px';
+                messageElement.style.padding = '10px';
+                messageElement.style.backgroundColor = '#4CAF50';
+                messageElement.style.color = 'white';
+                messageElement.style.borderRadius = '4px';
+                messageElement.style.zIndex = '1000';
+                document.body.appendChild(messageElement);
+
+                // Auto-remove message after 3 seconds
+                setTimeout(() => {
+                    messageElement.style.opacity = '0';
+                    messageElement.style.transition = 'opacity 0.5s';
+                    setTimeout(() => messageElement.remove(), 500);
+                }, 3000);
+
+                // Reload the page to show the updated plan
+                setTimeout(() => location.reload(), 1000);
+            } else {
+                showErrorMessage(data.message || 'Unknown error');
+            }
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            showErrorMessage(error.message);
+        });
+
+        // Close dropdown after selection
+        closeDropdowns();
+    }
+
+    // Close dropdowns when clicking outside
+    document.addEventListener("click", function(event) {
+        if (!event.target.matches('.clickable-time-cell') && !event.target.matches('.clickable-state-cell') && !event.target.closest('.dropdown-content')) {
+            closeDropdowns();
+        }
+    });
+    </script>
+    """
+    return text
+
+
+def get_plan_renderer_js():
+    """
+    JavaScript renderer for client-side plan table generation from JSON data
+    Includes timestamp-based change detection, 5-second polling, error handling, and stale data warnings
+    """
+    text = """
+    <script>
+    // State variables
+    let currentView = 'plan';
+    let newestDataTimestamp = null;  // Track the newest data timestamp we've seen
+    let updateIntervalId = null;
+    let dropdownCounter = 0;
+
+    // Load debug toggle state from sessionStorage
+    function loadDebugState() {
+        const debugToggle = document.getElementById('debugToggle');
+        if (debugToggle) {
+            const savedState = sessionStorage.getItem('planDebugToggle');
+            debugToggle.checked = savedState === 'true';
+        }
+    }
+
+    // Save debug toggle state to sessionStorage
+    function saveDebugState() {
+        const debugToggle = document.getElementById('debugToggle');
+        if (debugToggle) {
+            sessionStorage.setItem('planDebugToggle', debugToggle.checked);
+        }
+    }
+
+    // Map rate adjust type to HTML symbol (matches output.py adjust_symbol)
+    function getAdjustSymbol(adjustType) {
+        if (!adjustType) return '';
+        switch (adjustType) {
+            case 'offset': return '? &#8518;';
+            case 'future': return '? &#x2696;';
+            case 'user': return '&#61;';
+            case 'manual': return '&#8526;';
+            case 'increment': return '&#177;';
+            case 'saving': return '&dollar;';
+            default: return '?';
+        }
+    }
+
+    // Render plan table from JSON data
+    // Find the retained debug-history snapshot for a plan row's timestamp, or null if none
+    // qualifies. window.debugHistoryData is a small array ({id, timestamp, steps_back}) fetched
+    // separately (see fetchAndRenderPlan) - matched here by wall-clock time rather than threaded
+    // through the plan JSON itself, since the History/Yesterday plan is a reconstruction (fed
+    // yesterday's real PV/load through the same renderer as the live plan) and has no inherent
+    // relationship to when a snapshot happened to be captured; only the row's own real timestamp
+    // does.
+    //
+    // Snapshots are captured server-side with their timestamp floored to the plan's own slot grid
+    // (self.midnight_utc + N * plan_interval_minutes, see predbat.py's _capture_debug_history) -
+    // the same anchor and step output.py uses to build each row's own row.time - so a snapshot's
+    // timestamp is either an exact match for one row or it isn't a match at all. That also gives
+    // each snapshot at most one owning row for free: two rows can never both claim the same
+    // snapshot, since row times a plan_interval_minutes apart can never both equal the same
+    // floored capture instant.
+    const DEBUG_SNAPSHOT_MATCH_TOLERANCE_MS = 1000; // guards only against sub-second formatting noise
+    function findNearestDebugSnapshot(rowTimeStr) {
+        if (!rowTimeStr || !window.debugHistoryData || !window.debugHistoryData.length) {
+            return null;
+        }
+        const rowTime = new Date(rowTimeStr).getTime();
+        if (isNaN(rowTime)) {
+            return null;
+        }
+        for (const snap of window.debugHistoryData) {
+            const snapTime = new Date(snap.timestamp).getTime();
+            if (isNaN(snapTime)) { continue; }
+            if (Math.abs(rowTime - snapTime) <= DEBUG_SNAPSHOT_MATCH_TOLERANCE_MS) {
+                return snap;
+            }
+        }
+        return null;
+    }
+
+    function renderPlanTable(jsonData, overrides, showDebug, editable, showHistoryLinks) {
+        try {
+            if (!jsonData || !jsonData.rows) {
+                return '<p style="color:red;">No plan data available</p>';
+            }
+
+            // Store plan midnight reference so getMinutesFromTimeString can compute
+            // absolute minutes for next-day slots (e.g., tomorrow 00:00 = 1440 min,
+            // not 0 which is what a plain hours*60+minutes calculation would return).
+            window.planMidnightRef = jsonData.time || null;
+
+            // Reason templates come from the dataset being rendered, not from window.planData -
+            // the History/Yesterday views publish their own copy alongside their own rows.
+            const reasonTemplates = jsonData.reason_templates;
+
+            let html = '<table>';
+            const cellStyle = 'style="padding: 4px;"';
+
+            // Short explanations for each plan-table column header, condensed from the full
+            // descriptions in predbat-plan-card.md - keep these brief, a hover tooltip is not
+            // the place for the doc page's colour-coding detail.
+            const currencyMinor = jsonData.currency_symbols?.[1] ?? 'p';
+            const COLUMN_HEADER_HELP = {
+                time: 'Predbat plans in slots (30 minutes by default) aligned to rate change times.',
+                import: `The import rate for this slot, in ${currencyMinor} per kWh. Bold if a charge is planned this slot.`,
+                export: `The export rate for this slot, in ${currencyMinor} per kWh. Bold if a discharge/export is planned this slot.`,
+                state: "What the battery is doing this slot - hover a state cell for the specific reason.",
+                limit: 'The battery SoC Predbat is planning to reach by the end of this slot.',
+                pv: 'Predicted solar generation for this slot, from the Solcast forecast.',
+                load: 'Predicted house electricity consumption for this slot, from historical data.',
+                clip: "Solar energy predicted to be lost - the inverter can't handle all the PV generated, or an export limit is set.",
+                xload: 'Extra load added externally via load_forecast settings (e.g. PredAI, PredHeat).',
+                car: 'Predicted car charging energy for this slot.',
+                iboost: 'Energy planned for the solar diverter (iBoost, MyEnergi Eddi, etc) this slot.',
+                soc: 'Estimated battery state of charge at the start of this slot.',
+                cost: 'Estimated cost (or saving) for this slot.',
+                total: 'Running total cost for today so far, at the start of this slot.',
+                co2_rate: 'Estimated carbon intensity of the grid at the start of this slot.',
+                co2_total: 'Estimated cumulative carbon footprint at the start of this slot.',
+            };
+
+            function th(key, innerHtml, extraAttrs) {
+                const helpText = COLUMN_HEADER_HELP[key];
+                const titleAttr = helpText ? ` title="${escapeAttr(helpText)}"` : '';
+                const attrs = extraAttrs ? ` ${extraAttrs.trim()}` : '';
+                return `<th${attrs}${titleAttr}><b>${innerHtml}</b></th>`;
+            }
+
+            // Render header
+            html += '<tr>';
+            html += th('time', 'Time');
+            html += showDebug ? th('import', `Import ${currencyMinor} (w/loss)`) : th('import', `Import ${currencyMinor}`);
+            html += showDebug ? th('export', `Export ${currencyMinor} (w/loss)`) : th('export', `Export ${currencyMinor}`);
+            html += th('state', 'State', ' colspan="2"');
+            html += th('limit', 'Limit %');
+            html += showDebug ? th('pv', 'PV kWh (10%)') : th('pv', 'PV kWh');
+            html += showDebug ? th('load', 'Load kWh (10%)') : th('load', 'Load kWh');
+            if (showDebug) {
+                html += th('clip', 'Clip kWh');
+            }
+            if (showDebug && jsonData.rows.some(r => r.extra_load !== undefined)) {
+                html += th('xload', 'XLoad kWh');
+            }
+            if (jsonData.num_cars > 0) {
+                html += th('car', 'Car kWh');
+            }
+            if (jsonData.iboost_enable) {
+                html += th('iboost', 'iBoost kWh');
+            }
+            html += th('soc', 'SoC %');
+            html += th('cost', 'Cost');
+            html += th('total', 'Total');
+            if (jsonData.carbon_enable) {
+                html += th('co2_rate', 'CO2 g/kWh');
+                html += th('co2_total', 'CO2 kg');
+            }
+            if (showHistoryLinks) {
+                html += '<th><b>Debug</b></th>';
+            }
+            html += '</tr>';
+
+            // Render rows
+            for (let i = 0; i < jsonData.rows.length; i++) {
+                const row = jsonData.rows[i];
+                html += '<tr style="color:black">';
+
+                // Time cell with dropdown (if editable)
+                const timeDisplay = formatTimeDisplay(row.time);
+                if (editable) {
+                    html += renderTimeCell(row.time, timeDisplay, overrides, row.slot_minute);
+                } else {
+                    html += `<td id=time bgcolor=#FFFFFF>${timeDisplay}</td>`;
+                }
+
+                // Import rate - formatted bold if in charge window, italic with symbol if estimated.
+                // 'manual' is excluded here when editable: renderRateCell() below already shows its
+                // own override marker (and the only functioning Clear control) for that case, driven
+                // by a separately-computed isOverride check. Baking this marker in too stacks a
+                // second, visually identical glyph from a source the Clear button doesn't know about
+                // - if the two ever disagree, you get a marker with no working Clear behind it
+                // (batpred#4474). Non-'manual' adjust types (offset/future/user/increment/saving)
+                // aren't part of that clickable-override mechanism, so they keep their marker as-is.
+                const importBold = row.state && (row.state === 'Chrg' || row.state === 'HoldChrg' || row.state === 'FrzChrg');
+                let importText = row.import_rate.toFixed(2);
+                if (showDebug && row.import_rate_adjusted !== undefined) {
+                    importText += ` (${row.import_rate_adjusted.toFixed(2)})`;
+                }
+                const importAdjustType = (editable && row.import_rate_adjust_type === 'manual') ? null : row.import_rate_adjust_type;
+                const importAdjust = importAdjustType ? ` ${getAdjustSymbol(importAdjustType)}` : '';
+                if (importAdjustType) {
+                    importText = `<i>${importText}${importAdjust}</i>`;
+                }
+                if (importBold) {
+                    importText = `<b>${importText}</b>`;
+                }
+                if (editable) {
+                    html += renderRateCell(row.import_rate, row.rate_color_import, 'import', row.time, timeDisplay, overrides, importText, row.slot_minute);
+                } else if (row.rate_split) {
+                    // Car's own rate has diverged from the house rate - not necessarily an IOG cap
+                    // (any car window with its own average can diverge, e.g. combined dynamic-rate
+                    // windows) - split the cell, house on the left, car on the right, own tooltip each.
+                    const houseTitle = escapeAttr(`House rate: ${row.import_rate.toFixed(2)}${currencyMinor}/kWh`);
+                    const carTitle = escapeAttr(`Car rate: ${row.car_rate.toFixed(2)}${currencyMinor}/kWh (differs from house rate)`);
+                    html += `<td id=import data-minute="${row.slot_minute}" data-rate="${row.import_rate}" style="padding:0;">`;
+                    html += `<div style="display:flex;">`;
+                    html += `<div style="flex:1;padding:4px;background-color:${row.rate_color_import || '#FFFFFF'};" title="${houseTitle}">${importText}</div>`;
+                    html += `<div style="flex:1;padding:4px;background-color:${row.car_rate_color || '#FFFFFF'};" title="${carTitle}">${row.car_rate.toFixed(2)}</div>`;
+                    html += `</div></td>`;
+                } else {
+                    html += `<td id=import ${cellStyle} bgcolor=${row.rate_color_import || '#FFFFFF'}>${importText}</td>`;
+                }
+
+                // Export rate - italic with symbol if estimated (see import rate comment above for
+                // why 'manual' is excluded in editable mode)
+                let exportText = row.export_rate.toFixed(2);
+                if (showDebug && row.export_rate_adjusted !== undefined) {
+                    exportText += ` (${row.export_rate_adjusted.toFixed(2)})`;
+                }
+                const exportAdjustType = (editable && row.export_rate_adjust_type === 'manual') ? null : row.export_rate_adjust_type;
+                const exportAdjust = exportAdjustType ? ` ${getAdjustSymbol(exportAdjustType)}` : '';
+                if (exportAdjustType) {
+                    exportText = `<i>${exportText}${exportAdjust}</i>`;
+                }
+                if (editable) {
+                    html += renderRateCell(row.export_rate, row.rate_color_export, 'export', row.time, timeDisplay, overrides, exportText, row.slot_minute);
+                } else {
+                    html += `<td id=export ${cellStyle} bgcolor=${row.rate_color_export || '#FFFFFF'}>${exportText}</td>`;
+                }
+
+                // State cells (with rowspan and split handling)
+                if (!row.skip_state_cell) {
+                    if (editable) {
+                        html += renderStateCell(row, timeDisplay, overrides, reasonTemplates);
+                    } else {
+                        const rowspanAttr = row.rowspan_state > 0 ? ` rowspan="${row.rowspan_state}"` : '';
+                        const colspanAttr = row.split ? '' : ' colspan=2';
+                        const titleAttr = reasonTitleAttr(row, reasonTemplates);
+                        html += `<td${colspanAttr}${rowspanAttr} ${cellStyle} bgcolor=${row.state_color || '#FFFFFF'}${titleAttr}>${row.state_text || ''}</td>`;
+
+                        // Second state cell if split - same combined reason text as the first half
+                        if (row.split && row.state2_text) {
+                            html += `<td${rowspanAttr} ${cellStyle} bgcolor=${row.state2_color || '#FFFFFF'}${titleAttr}>${row.state2_text}</td>`;
+                        }
+                    }
+                }
+
+                // Limit cell (with rowspan handling)
+                if (!row.skip_limit_cell) {
+                    const rowspanAttr = row.rowspan_limit > 0 ? ` rowspan="${row.rowspan_limit}"` : '';
+                    html += `<td${rowspanAttr} bgcolor=#FFFFFF> ${row.show_limit || ''}</td>`;
+                }
+
+                // PV forecast (with 10% value in brackets if debug mode)
+                let pvText = row.pv_forecast == 0 ? '&#9866;' : row.pv_forecast;
+                if (showDebug && row.pv_forecast10 > 0) {
+                    pvText += ` (${row.pv_forecast10})`;
+                }
+                if (row.pv_forecast >= 0.1) {
+                    pvText += '&#9728;';
+                }
+                html += `<td id=pv bgcolor=${row.pv_color || '#FFFFFF'}>${pvText}</td>`;
+
+                // Load forecast (with 10% value in brackets if debug mode)
+                if (editable) {
+                    html += renderLoadCell(row.time, timeDisplay, row.load_forecast, row.load_forecast10, row.load_color, showDebug, overrides, jsonData.manual_load_value !== undefined ? jsonData.manual_load_value : 0.5, row.slot_minute);
+                } else {
+                    let loadText = row.load_forecast !== undefined ? row.load_forecast : '';
+                    if (showDebug && row.load_forecast10 > 0) {
+                        loadText += ` (${row.load_forecast10})`;
+                    }
+                    html += `<td id=load bgcolor=${row.load_color || '#FFFFFF'}>${loadText}</td>`;
+                }
+
+                // Clipped (only if debug)
+                if (showDebug) {
+                    const clippedVal = row.clipped == 0 ? '&#9866;' : row.clipped;
+                    html += `<td id=clip bgcolor=${row.clipped_color || '#FFFFFF'}>${clippedVal}</td>`;
+                }
+
+                // XLoad (extra load) - only if debug and extra_load exists
+                if (showDebug && row.extra_load !== undefined) {
+                    const xloadVal = row.extra_load || '&#9866;';
+                    html += `<td id=extra bgcolor=${row.extra_color || '#FFFFFF'}>${xloadVal}</td>`;
+                }
+
+                // Car charging (conditional)
+                if (jsonData.num_cars > 0) {
+                    // A slot dynamic load cancelled (car not charging) still shows its kWh, with a "?"
+                    const carCancelled = row.car_charging_cancelled > 0 ? `${row.car_charging_cancelled}?` : '';
+                    const carVal = row.car_charging > 0 ? (carCancelled ? `${row.car_charging} +${carCancelled}` : row.car_charging) : (carCancelled || '&#9866;');
+                    html += `<td id=car bgcolor=${row.car_color || '#FFFFFF'}>${carVal}</td>`;
+                }
+
+                // iBoost (conditional)
+                if (jsonData.iboost_enable) {
+                    const iboostVal = row.iboost || '&#9866;';
+                    html += `<td bgcolor=${row.iboost_color || '#FFFFFF'}>${iboostVal}</td>`;
+                }
+
+                // SOC
+                const socSym = row.soc_sym || (row.soc_change > 0 ? '&nearr;' : (row.soc_change < 0 ? '&searr;' : '&rarr;'));
+                if (editable) {
+                    html += renderSocCell(row.time, timeDisplay, row.soc_percent, row.soc_color, socSym, overrides, row.slot_minute);
+                } else {
+                    html += `<td id=soc bgcolor=${row.soc_color || '#FFFFFF'}>${row.soc_percent}${socSym}</td>`;
+                }
+
+                // Cost change
+                const costChange = row.cost_change || 0;
+                let costStr = '';
+                if (costChange >= 0.005) {
+                    costStr = `+${Math.round(costChange * 100)} ${jsonData.currency_symbols[1]} &nearr;`;
+                } else if (costChange <= -0.005) {
+                    costStr = `-${Math.round(Math.abs(costChange) * 100)} ${jsonData.currency_symbols[1]} &searr;`;
+                } else {
+                    costStr = '&rarr;';
+                }
+                html += `<td id=cost bgcolor=${row.cost_color || '#FFFFFF'}>${costStr}</td>`;
+
+                // Total cost
+                const totalCost = row.total_cost ? `${jsonData.currency_symbols[0]}${row.total_cost.toFixed(2)}` : '';
+                html += `<td id=total_cost bgcolor=#FFFFFF>${totalCost}</td>`;
+
+                // Carbon (conditional)
+                if (jsonData.carbon_enable) {
+                    html += `<td id=carbon bgcolor=${row.carbon_intensity_color || '#FFFFFF'}>${row.carbon_intensity || ''}</td>`;
+                    html += `<td id=total_carbon bgcolor=${row.carbon_color || '#FFFFFF'}>${row.total_carbon || ''}</td>`;
+                }
+
+                // Debug history snapshot link (History/Yesterday view only)
+                if (showHistoryLinks) {
+                    const snap = findNearestDebugSnapshot(row.time);
+                    if (snap) {
+                        const snapWhen = new Date(snap.timestamp);
+                        const snapLabel = isNaN(snapWhen.getTime()) ? snap.id : snapWhen.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+                        html += `<td bgcolor=#FFFFFF><a href="./debug_history_download?id=${encodeURIComponent(snap.id)}">&#8681; ${snapLabel}</a></td>`;
+                    } else {
+                        html += '<td bgcolor=#FFFFFF></td>';
+                    }
+                }
+
+                html += '</tr>';
+            }
+
+            // Render totals row if available
+            if (jsonData.totals) {
+                const totals = jsonData.totals;
+                html += '<tr style="color:black">';
+
+                // Empty cells for Time, Import, Export, State (colspan 2), Limit %
+                html += '<td></td><td></td><td></td><td></td><td></td><td></td>';
+
+                // PV forecast total
+                html += `<td bgcolor=#FFFFFF><b>${totals.pv_forecast || ''}</b></td>`;
+
+                // Load forecast total
+                html += `<td bgcolor=#FFFFFF><b>${totals.load_forecast || ''}</b></td>`;
+
+                // Clipped (if debug)
+                if (showDebug && totals.clipped !== undefined) {
+                    html += `<td bgcolor=#FFFFFF><b>${totals.clipped}</b></td>`;
+                }
+
+                // XLoad (if debug and exists)
+                if (showDebug && totals.extra_load !== undefined) {
+                    html += `<td bgcolor=#FFFFFF><b>${totals.extra_load}</b></td>`;
+                }
+
+                // Car charging (if enabled)
+                if (jsonData.num_cars > 0 && totals.car_charging !== undefined) {
+                    html += `<td bgcolor=#FFFFFF><b>${totals.car_charging}</b></td>`;
+                }
+
+                // iBoost (if enabled)
+                if (jsonData.iboost_enable && totals.iboost !== undefined) {
+                    const iboostVal = totals.iboost == 0 ? '&#9866;' : totals.iboost;
+                    html += `<td bgcolor=#FFFFFF><b>${iboostVal}</b></td>`;
+                }
+
+                // SOC percent
+                html += `<td bgcolor=#FFFFFF><b>${totals.soc_percent || ''}</b></td>`;
+
+                // Empty cell for SOC change
+                html += '<td></td>';
+
+                // Total cost
+                const totalCostStr = totals.total_cost >= 0 ?
+                    `${jsonData.currency_symbols[0]}${totals.total_cost}` :
+                    `-${jsonData.currency_symbols[0]}${Math.abs(totals.total_cost).toFixed(2)}`;
+                html += `<td bgcolor=#FFFFFF><b>${totalCostStr}</b></td>`;
+
+                // Carbon (if enabled)
+                if (jsonData.carbon_enable) {
+                    html += '<td></td>'; // Empty cell for carbon intensity
+                    html += `<td bgcolor=#FFFFFF><b>${totals.total_carbon || ''}</b></td>`;
+                }
+
+                // Empty cell for the Debug history column
+                if (showHistoryLinks) {
+                    html += '<td></td>';
+                }
+
+                html += '</tr>';
+            }
+
+            html += '</table>';
+            return html;
+        } catch (error) {
+            console.error('Error rendering plan:', error);
+            return `<p style="color:red;">Error rendering plan: ${error.message}</p>`;
+        }
+    }
+
+    // Render time cell (simple, with subtle override-based highlighting; main state highlighting is in the state column)
+    function renderTimeCell(timeStr, timeDisplay, overrides, slotMinute) {
+        const dropdownId = `dropdown_${dropdownCounter++}`;
+        const minutesFromMidnight = slotMinute !== undefined ? slotMinute : getMinutesFromTimeString(timeStr);
+
+        const manualTimes = overrides.manual_charge_times.concat(
+            overrides.manual_export_times,
+            overrides.manual_freeze_charge_times,
+            overrides.manual_freeze_export_times,
+            overrides.manual_demand_times
+        );
+
+        // Determine highlight color based on override type
+        let bgColor = '#FFFFFF';
+        let overrideClass = '';
+
+        if (overrides.manual_charge_times.includes(minutesFromMidnight)) {
+            bgColor = '#D0F0D0';  // Light green hint
+            overrideClass = 'override-charge';
+        } else if (overrides.manual_export_times.includes(minutesFromMidnight)) {
+            bgColor = '#FFFFE0';  // Light yellow hint
+            overrideClass = 'override-export';
+        } else if (overrides.manual_demand_times.includes(minutesFromMidnight)) {
+            bgColor = '#FFE0E0';  // Light red hint
+            overrideClass = 'override-demand';
+        } else if (overrides.manual_freeze_charge_times.includes(minutesFromMidnight)) {
+            bgColor = '#E8E8E8';  // Light gray hint
+            overrideClass = 'override-freeze-charge';
+        } else if (overrides.manual_freeze_export_times.includes(minutesFromMidnight)) {
+            bgColor = '#D8D8D8';  // Darker gray hint
+            overrideClass = 'override-freeze-export';
+        }
+
+        let html = `<td bgcolor=${bgColor} onclick="toggleForceDropdown('${dropdownId}')" class="clickable-time-cell ${overrideClass}">`;
+        html += timeDisplay;
+        html += '<div class="dropdown">';
+        html += `<div id="${dropdownId}" class="dropdown-content">`;
+
+        // Add dropdown options
+        if (manualTimes.includes(minutesFromMidnight)) {
+            html += `<a onclick="handleTimeOverride('${timeDisplay}', 'Clear')">Clear</a>`;
+        }
+        if (!overrides.manual_demand_times.includes(minutesFromMidnight)) {
+            html += `<a onclick="handleTimeOverride('${timeDisplay}', 'Manual Demand')">Manual Demand</a>`;
+        }
+        if (!overrides.manual_charge_times.includes(minutesFromMidnight)) {
+            html += `<a onclick="handleTimeOverride('${timeDisplay}', 'Manual Charge')">Manual Charge</a>`;
+        }
+        if (!overrides.manual_export_times.includes(minutesFromMidnight)) {
+            html += `<a onclick="handleTimeOverride('${timeDisplay}', 'Manual Export')">Manual Export</a>`;
+        }
+        if (!overrides.manual_freeze_charge_times.includes(minutesFromMidnight)) {
+            html += `<a onclick="handleTimeOverride('${timeDisplay}', 'Manual Freeze Charge')">Manual Freeze Charge</a>`;
+        }
+        if (!overrides.manual_freeze_export_times.includes(minutesFromMidnight)) {
+            html += `<a onclick="handleTimeOverride('${timeDisplay}', 'Manual Freeze Export')">Manual Freeze Export</a>`;
+        }
+
+        html += '</div></div></td>';
+        return html;
+    }
+
+    // Escape text for safe use inside an HTML attribute (e.g. title="...")
+    function escapeAttr(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML.replace(/"/g, '&quot;');
+    }
+
+    // Render a row's "reasons" (list of {code, params}) into a single sentence, filling in
+    // each entry's template (looked up from the shared reason_templates table, published once
+    // per response rather than duplicating the rendered sentence on every row) with its params.
+    function renderReasonText(reasons, templates) {
+        if (!reasons || !templates) {
+            return '';
+        }
+        const rendered = reasons.map(function (entry) {
+            const template = templates[entry.code];
+            if (!template) {
+                return '';
+            }
+            return template.replace(/\\{(\\w+)\\}/g, function (match, key) {
+                return entry.params && entry.params[key] !== undefined ? entry.params[key] : match;
+            });
+        });
+        // A split cell's first half is always a demand_before_export_* or hold_for_car_before_export code paired with the export
+        // reason as its second half - prefix "Then" (no comma) so the two read as one narrative
+        // instead of two disconnected sentences. Length is >= 2 rather than == 2 because a history
+        // slot that held more than one state appends a mixed_slot_states note after the pair, and
+        // that must not cost the narrative its "Then".
+        if (reasons.length >= 2 && rendered[0] && rendered[1] && typeof reasons[0].code === 'string' && (reasons[0].code.indexOf('demand_before_export_') === 0 || reasons[0].code === 'hold_for_car_before_export')) {
+            rendered[1] = 'Then ' + rendered[1].charAt(0).toLowerCase() + rendered[1].slice(1);
+        }
+        return rendered.filter(Boolean).join(' ');
+    }
+
+    // Build the ` title="..."` tooltip attribute for a row's state cell, or '' when the row
+    // has no reasons. Shared by both the editable (renderStateCell) and read-only state-cell
+    // paths so the History/Yesterday views get the same tooltips as the plan view.
+    function reasonTitleAttr(row, templates) {
+        const reasonText = renderReasonText(row.reasons, templates);
+        return reasonText ? ` title="${escapeAttr(reasonText)}"` : '';
+    }
+
+    // Render state cell without dropdown (dropdown moved to time column)
+    function renderStateCell(row, timeDisplay, overrides, templates) {
+        const cellStyle = 'style="padding: 4px;"';
+        const timeStr = row.time;
+        const minutesFromMidnight = row.slot_minute !== undefined ? row.slot_minute : getMinutesFromTimeString(timeStr);
+
+        // Determine background color based on override type (prioritize manual overrides over default state color)
+        let bgColor = row.state_color || '#FFFFFF';
+        let overrideClass = '';
+
+        if (overrides.manual_charge_times.includes(minutesFromMidnight)) {
+            bgColor = '#3AEE85';
+            overrideClass = 'override-charge';
+        } else if (overrides.manual_export_times.includes(minutesFromMidnight)) {
+            bgColor = '#FFFF00';
+            overrideClass = 'override-export';
+        } else if (overrides.manual_demand_times.includes(minutesFromMidnight)) {
+            bgColor = '#F18261';
+            overrideClass = 'override-demand';
+        } else if (overrides.manual_freeze_charge_times.includes(minutesFromMidnight)) {
+            bgColor = '#C0C0C0';
+            overrideClass = 'override-freeze-charge';
+        } else if (overrides.manual_freeze_export_times.includes(minutesFromMidnight)) {
+            bgColor = '#AAAAAA';
+            overrideClass = 'override-freeze-export';
+        }
+
+        const rowspanAttr = row.rowspan_state > 0 ? ` rowspan="${row.rowspan_state}"` : '';
+        const colspanAttr = row.split ? '' : ' colspan=2';
+        // reasonText is needed raw (not just as a title= attribute) for reasonCellAttrs() below,
+        // which also uses it for the tap/focus panel content - templates comes from the dataset
+        // being rendered (jsonData.reason_templates), not window.planData, so History/Yesterday
+        // views look up against their own template table rather than the plan view's.
+        const reasonText = renderReasonText(row.reasons, templates);
+        // Keep both title= (free instant hover for desktop/mouse) and the tap/focus panel below
+        // (for touch and keyboard, neither of which can trigger a hover state at all) - the two
+        // never fire together in practice, since a touch interaction can't trigger :hover/title
+        // in the first place, so there's nothing to reconcile between them.
+        const titleAttr = reasonText ? ` title="${escapeAttr(reasonText)}"` : '';
+
+        function reasonCellAttrs(extraClass) {
+            if (!reasonText) {
+                return { clickAttrs: extraClass ? ` class="${extraClass}"` : '', panel: '' };
+            }
+            const dropdownId = `reasonDropdown_${dropdownCounter++}`;
+            const classAttr = `clickable-state-cell${extraClass ? ' ' + extraClass : ''}`;
+            // tabindex + onkeydown make this reachable and operable by keyboard, not just tap -
+            // a bare onclick on a <td> (the existing pattern used for time/rate cell dropdowns)
+            // is mouse/touch-only, since <td> isn't focusable by default.
+            const keydown = `if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleForceDropdown('${dropdownId}')}`;
+            return {
+                clickAttrs: ` onclick="toggleForceDropdown('${dropdownId}')" onkeydown="${keydown}" tabindex="0" role="button" aria-label="Why this slot" class="${classAttr}"`,
+                panel: `<div class="dropdown"><div id="${dropdownId}" class="dropdown-content"><div class="reason-text">${escapeAttr(reasonText)}</div></div></div>`,
+            };
+        }
+
+        const first = reasonCellAttrs(overrideClass);
+        let html = `<td${colspanAttr}${rowspanAttr} ${cellStyle} bgcolor=${bgColor}${first.clickAttrs}${titleAttr}>`;
+        html += row.state_text || '';
+        html += first.panel;
+        html += '</td>';
+
+        // Second state cell if split - same combined reason text as the first half, since
+        // row.reasons is a single list covering both halves of a split (e.g. charging and
+        // freeze-exporting in the same slot), not two separately-attributed sentences.
+        if (row.split && row.state2_text) {
+            const second = reasonCellAttrs('');
+            html += `<td${rowspanAttr} ${cellStyle} bgcolor=${row.state2_color || '#FFFFFF'}${second.clickAttrs}${titleAttr}>${row.state2_text}${second.panel}</td>`;
+        }
+
+        return html;
+    }
+
+    // Render rate cell with dropdown for manual rate overrides
+    function renderRateCell(rate, bgColor, type, timeStr, timeDisplay, overrides, displayText, slotMinute) {
+        const cellStyle = 'style="padding: 4px;"';
+        const dropdownId = `dropdown_${dropdownCounter++}`;
+        const minutesFromMidnight = slotMinute !== undefined ? slotMinute : getMinutesFromTimeString(timeStr);
+        const overrideList = type === 'import' ? overrides.manual_import_rates : overrides.manual_export_rates;
+        const override = overrideList.find(r => r.minutes === minutesFromMidnight);
+        const isOverride = override !== undefined;
+
+        // Use provided displayText if available, otherwise format rate
+        const rateDisplay = displayText !== undefined ? displayText : rate.toFixed(2);
+
+        // Use the actual stored override rate for the input field if one exists
+        const inputValue = parseFloat((isOverride ? override.rate : rate).toFixed(1));
+
+        let html = `<td id=${type} data-minute="${minutesFromMidnight}" data-rate="${rate}" ${cellStyle} bgcolor=${bgColor} onclick="toggleForceDropdown('${dropdownId}')" class="clickable-time-cell">`;
+        html += `${rateDisplay}${isOverride ? ' &#8526;' : ''}`;
+        html += '<div class="dropdown">';
+        html += `<div id="${dropdownId}" class="dropdown-content">`;
+        html += `<label>Override ${type} rate:</label>`;
+        html += `<input type="number" id="rate_${dropdownId}" value="${inputValue}" step="0.1">`;
+        html += `<button onclick="handleRateOverride('${timeDisplay}', '${type}', '${dropdownId}')">Set Override</button>`;
+        if (isOverride) {
+            html += `<a onclick="handleRateOverride('${timeDisplay}', '${type}', null, true)">Clear</a>`;
+        }
+        html += '</div></div></td>';
+        return html;
+    }
+
+    // Render load cell with dropdown for load adjustments
+    function renderLoadCell(timeStr, timeDisplay, loadValue, loadValue10, bgColor, showDebug, overrides, manualLoadValue, slotMinute) {
+        const dropdownId = `dropdown_${dropdownCounter++}`;
+        const minutesFromMidnight = slotMinute !== undefined ? slotMinute : getMinutesFromTimeString(timeStr);
+        const isOverride = overrides.manual_load_adjust.some(r => r.minutes === minutesFromMidnight);
+
+        // Add 10% value in brackets if debug mode
+        let displayValue = loadValue;
+        if (showDebug && loadValue10 > 0) {
+            displayValue += ` (${loadValue10})`;
+        }
+
+        const defaultLoadValue = manualLoadValue !== undefined ? manualLoadValue : 0.5;
+        let html = `<td id=load data-minute="${minutesFromMidnight}" bgcolor=${bgColor} onclick="toggleForceDropdown('${dropdownId}')" class="clickable-time-cell">`;
+        html += `${displayValue}${isOverride ? ' &#8526;' : ''}`;
+        html += '<div class="dropdown">';
+        html += `<div id="${dropdownId}" class="dropdown-content">`;
+        html += '<label>Adjust load (kWh):</label>';
+        html += `<input type="number" id="load_${dropdownId}" value="${defaultLoadValue}" step="0.1">`;
+        html += `<button onclick="handleLoadOverride('${timeDisplay}', '${dropdownId}')">Set Adjustment</button>`;
+        if (isOverride) {
+            html += `<a onclick="handleLoadOverride('${timeDisplay}', null, true)">Clear</a>`;
+        }
+        html += '</div></div></td>';
+        return html;
+    }
+
+    // Render SOC cell with dropdown for manual SOC targets (minimum floor and maximum ceiling)
+    function renderSocCell(timeStr, timeDisplay, socValue, bgColor, socSym, overrides, slotMinute) {
+        const dropdownId = `dropdown_${dropdownCounter++}`;
+        const minutesFromMidnight = slotMinute !== undefined ? slotMinute : getMinutesFromTimeString(timeStr);
+        const isOverride = overrides.manual_soc.some(r => r.minutes === minutesFromMidnight);
+        const isOverrideMax = overrides.manual_soc_max.some(r => r.minutes === minutesFromMidnight);
+
+        let html = `<td id=soc data-minute="${minutesFromMidnight}" bgcolor=${bgColor} onclick="toggleForceDropdown('${dropdownId}')" class="clickable-time-cell">`;
+        html += `${socValue}${socSym}${isOverride ? ' &#8526;' : ''}${isOverrideMax ? ' &#11015;' : ''}`;
+        html += '<div class="dropdown">';
+        html += `<div id="${dropdownId}" class="dropdown-content">`;
+        html += '<label>Minimum SOC (%):</label>';
+        html += `<input type="number" id="soc_${dropdownId}" value="${socValue}" step="1" min="0" max="100">`;
+        html += `<button onclick="handleSocOverride('${timeDisplay}', '${dropdownId}')">Set Target</button>`;
+        if (isOverride) {
+            html += `<a onclick="handleSocOverride('${timeDisplay}', null, true)">Clear</a>`;
+        }
+        html += '<label>Maximum SOC (%):</label>';
+        html += `<input type="number" id="socmax_${dropdownId}" value="${socValue}" step="1" min="0" max="100">`;
+        html += `<button onclick="handleSocOverride('${timeDisplay}', '${dropdownId}', false, true)">Set Max</button>`;
+        if (isOverrideMax) {
+            html += `<a onclick="handleSocOverride('${timeDisplay}', null, true, true)">Clear</a>`;
+        }
+        html += '</div></div></td>';
+        return html;
+    }
+
+    // Utility: Extract the timezone offset in minutes from an ISO timestamp string.
+    // Handles both +HHMM and +HH:MM formats produced by Python strftime and isoformat().
+    function getTimezoneOffsetMinutes(isoTimestamp) {
+        const match = isoTimestamp.match(/([+-])(\\d{2}):?(\\d{2})$/);
+        if (!match) return 0;
+        const sign = match[1] === '+' ? 1 : -1;
+        return sign * (parseInt(match[2]) * 60 + parseInt(match[3]));
+    }
+
+    // Utility: Format ISO timestamp to short display format (e.g., "Fri 15:45")
+    // Uses the timezone offset embedded in the ISO string so the displayed time
+    // matches Predbat's configured timezone regardless of the browser's local timezone.
+    function formatTimeDisplay(isoTimestamp) {
+        try {
+            const date = new Date(isoTimestamp);
+            const offsetMinutes = getTimezoneOffsetMinutes(isoTimestamp);
+            // Shift UTC time by the Predbat timezone offset, then read as UTC
+            const adjDate = new Date(date.getTime() + offsetMinutes * 60000);
+            const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+            const dayName = days[adjDate.getUTCDay()];
+            const hours = adjDate.getUTCHours().toString().padStart(2, '0');
+            const minutes = adjDate.getUTCMinutes().toString().padStart(2, '0');
+            return `${dayName} ${hours}:${minutes}`;
+        } catch (e) {
+            return isoTimestamp; // Fallback to original if parsing fails
+        }
+    }
+
+    // Utility: Convert time string to minutes from midnight
+    function getMinutesFromTimeString(timeStr) {
+        try {
+            // Try to parse as ISO timestamp first
+            const date = new Date(timeStr);
+            if (!isNaN(date.getTime())) {
+                // Use the plan midnight reference to compute absolute minutes so that
+                // next-day slots (e.g., tomorrow 00:00) return 1440 not 0.
+                // This makes the value comparable to the override times lists which
+                // are stored as minutes-from-today's-midnight (can exceed 1439).
+                if (window.planMidnightRef) {
+                    const midnight = new Date(window.planMidnightRef);
+                    return Math.round((date - midnight) / 60000);
+                }
+                // Fallback: use timezone offset from the ISO string itself
+                const offsetMinutes = getTimezoneOffsetMinutes(timeStr);
+                const adjDate = new Date(date.getTime() + offsetMinutes * 60000);
+                return adjDate.getUTCHours() * 60 + adjDate.getUTCMinutes();
+            }
+            // Fallback to "Day HH:MM" format parsing
+            const parts = timeStr.split(' ');
+            if (parts.length < 2) return 0;
+            const timeParts = parts[1].split(':');
+            if (timeParts.length < 2) return 0;
+            return parseInt(timeParts[0]) * 60 + parseInt(timeParts[1]);
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    // Format timestamp to readable format
+    // Uses the timezone offset embedded in the ISO string so the displayed time
+    // matches Predbat's configured timezone regardless of the browser's local timezone.
+    function formatTimestamp(isoTimestamp) {
+        if (!isoTimestamp) return '';
+        try {
+            const date = new Date(isoTimestamp);
+            const offsetMinutes = getTimezoneOffsetMinutes(isoTimestamp);
+            // Shift UTC time by the Predbat timezone offset, then read as UTC
+            const adjDate = new Date(date.getTime() + offsetMinutes * 60000);
+            const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+            const day = adjDate.getUTCDate();
+            const month = months[adjDate.getUTCMonth()];
+            const year = adjDate.getUTCFullYear();
+            const hours = String(adjDate.getUTCHours()).padStart(2, '0');
+            const minutes = String(adjDate.getUTCMinutes()).padStart(2, '0');
+            const seconds = String(adjDate.getUTCSeconds()).padStart(2, '0');
+            return `Updated: ${day} ${month} ${year} ${hours}:${minutes}:${seconds}`;
+        } catch (e) {
+            return '';
+        }
+    }
+
+    // Adjust timestamp size based on window width
+    function adjustTimestampSize() {
+        const timestampElement = document.getElementById('planTimestamp');
+        if (!timestampElement) return;
+
+        const width = window.innerWidth;
+
+        if (width <= 600) {
+            timestampElement.style.fontSize = '10px';
+            timestampElement.style.marginLeft = '6px';
+        } else if (width <= 900) {
+            timestampElement.style.fontSize = '11px';
+            timestampElement.style.marginLeft = '10px';
+        } else if (width <= 1200) {
+            timestampElement.style.fontSize = '12px';
+            timestampElement.style.marginLeft = '12px';
+        } else {
+            timestampElement.style.fontSize = '13px';
+            timestampElement.style.marginLeft = '16px';
+        }
+    }
+
+    // Adjust all font sizes based on window width for responsive layout
+    function adjustResponsiveSizes() {
+        const width = window.innerWidth;
+
+        // Adjust timestamp
+        adjustTimestampSize();
+
+        // Adjust table fonts
+        const tables = document.querySelectorAll('table');
+        const buttons = document.querySelectorAll('.view-button');
+        const debugLabel = document.getElementById('debugToggleLabel');
+
+        if (width <= 600) {
+            // Very small screens
+            tables.forEach(table => {
+                table.style.fontSize = '10px';
+                const cells = table.querySelectorAll('td, th');
+                cells.forEach(cell => cell.style.padding = '2px');
+            });
+            buttons.forEach(btn => btn.style.fontSize = '11px');
+            if (debugLabel) debugLabel.style.fontSize = '11px';
+        } else if (width <= 900) {
+            // Small screens
+            tables.forEach(table => {
+                table.style.fontSize = '11px';
+                const cells = table.querySelectorAll('td, th');
+                cells.forEach(cell => cell.style.padding = '3px');
+            });
+            buttons.forEach(btn => btn.style.fontSize = '12px');
+            if (debugLabel) debugLabel.style.fontSize = '12px';
+        } else if (width <= 1200) {
+            // Medium screens
+            tables.forEach(table => {
+                table.style.fontSize = '13px';
+                const cells = table.querySelectorAll('td, th');
+                cells.forEach(cell => cell.style.padding = '4px');
+            });
+            buttons.forEach(btn => btn.style.fontSize = '13px');
+            if (debugLabel) debugLabel.style.fontSize = '13px';
+        } else {
+            // Large screens - reset to default
+            tables.forEach(table => {
+                table.style.fontSize = '';
+                const cells = table.querySelectorAll('td, th');
+                cells.forEach(cell => cell.style.padding = '');
+            });
+            buttons.forEach(btn => btn.style.fontSize = '14px');
+            if (debugLabel) debugLabel.style.fontSize = '';
+        }
+    }
+
+    // Update timestamp display
+    function updateTimestampDisplay() {
+        const data = currentViewData();
+        const timestamp = data ? data.timestamp : null;
+
+        const timestampElement = document.getElementById('planTimestamp');
+        if (timestampElement) {
+            timestampElement.textContent = formatTimestamp(timestamp);
+            adjustResponsiveSizes();
+        }
+    }
+
+    // Fetch the rolling debug-history snapshot index (small: at most a few dozen tiny
+    // entries) into window.debugHistoryData for the History/Yesterday view's Debug
+    // column. Called on initial load and whenever the user switches to that view,
+    // rather than on every 5s plan poll (fetchAndRenderPlan) - the underlying data only
+    // changes on an hours-long capture interval, so polling it that often would just be
+    // wasted requests for something that only matters while the Yesterday view is open.
+    async function loadDebugHistoryData() {
+        try {
+            const response = await fetch('./debug_history_list');
+            if (response.ok) {
+                window.debugHistoryData = await response.json();
+            }
+        } catch (error) {
+            console.error('Error fetching debug history list:', error);
+        }
+    }
+
+    // Switch between plan views
+    function switchView(view) {
+        currentView = view;
+        if (view === 'yesterday') {
+            loadDebugHistoryData().then(refreshPlan);
+        }
+
+        // Update button styling
+        document.querySelectorAll('.view-button').forEach(btn => {
+            if (btn.dataset.view === view) {
+                btn.style.backgroundColor = '#4CAF50';
+                btn.style.color = 'white';
+            } else {
+                btn.style.backgroundColor = '#f0f0f0';
+                btn.style.color = 'black';
+            }
+        });
+
+        // Show/hide debug toggle based on view
+        const debugToggleLabel = document.getElementById('debugToggleLabel');
+        if (debugToggleLabel) {
+            if (view === 'plan') {
+                debugToggleLabel.style.display = 'block';
+            } else {
+                debugToggleLabel.style.display = 'none';
+            }
+        }
+
+        // Update timestamp display
+        updateTimestampDisplay();
+
+        // Render the selected view
+        refreshPlan();
+    }
+
+    // Refresh plan display
+    function refreshPlan() {
+        const container = document.getElementById('planContainer');
+        const debugToggle = document.getElementById('debugToggle');
+        // Only allow debug mode for the plan view
+        const showDebug = (currentView === 'plan' && debugToggle) ? debugToggle.checked : false;
+
+        const data = currentViewData();
+        const overrides = currentView === 'plan' ? (window.overridesData || {}) : {};
+
+        if (!data) {
+            if (currentView === 'plan') {
+                container.innerHTML = '<h2>Plan data is loading, please wait...</h2>';
+            } else {
+                // The yesterday/baseline views are only produced once calculate_yesterday() has run,
+                // which it can't do without the recorded history of predbat.cost_today - say so rather
+                // than sitting on a loading message that will never go away
+                container.innerHTML = '<h2>No data for this view yet</h2>' +
+                    '<p>This view is computed from what actually happened, on the first plan update after Predbat starts ' +
+                    'and again as each plan slot ends, so it should fill in within a few minutes.</p>' +
+                    '<p>If it never fills in, Predbat could not read the history of <b>predbat.cost_today</b> ' +
+                    'from Home Assistant. Check that the Home Assistant recorder is storing the Predbat entities ' +
+                    '(see the recorder notes in the FAQ) and look for <i>Calculate yesterday</i> warnings in the Predbat log.</p>';
+            }
+            // A warning raised for another view does not apply to this one
+            checkStaleness(null);
+            return;
+        }
+
+        // Check for stale data
+        checkStaleness(data);
+
+        // Render table
+        const editable = (currentView === 'plan');
+        // Debug-history download links only make sense on the History/Yesterday view -
+        // its rows are entirely in the past, unlike the live Plan view which is mostly
+        // future predictions with no corresponding capture.
+        const showHistoryLinks = (currentView === 'yesterday');
+        container.innerHTML = renderPlanTable(data, overrides, showDebug, editable, showHistoryLinks);
+
+        // Apply dark mode colors if needed
+        updateTableColors();
+
+        // Apply responsive sizing
+        adjustResponsiveSizes();
+    }
+
+    // How old a view's data may get before it is reported stale, when the data does not say. Each dataset
+    // carries refresh_minutes, the longest Predbat should take to republish it (the plan once per re-plan,
+    // the history views once per completed plan slot), and is stale a run (5 minutes) after that.
+    const STALE_MINUTES_DEFAULT = {plan: 15, yesterday: 60, baseline: 60};
+
+    // The data the current view shows
+    function currentViewData() {
+        return currentView === 'plan' ? window.planData : (currentView === 'yesterday' ? window.yesterdayData : window.baselineData);
+    }
+
+    // Show the stale warning when the view's data is older than it should be; with no data, hide it
+    function checkStaleness(data) {
+        const staleWarning = document.getElementById('staleWarning');
+        if (!staleWarning) return;
+        if (!data || !data.timestamp) {
+            staleWarning.style.display = 'none';
+            return;
+        }
+
+        // Never under 15 minutes, the limit before views had their own: a slow run or plan_random_delay can push a
+        // 5-minute re-plan past 10 minutes without anything being wrong
+        const limitMinutes = data.refresh_minutes ? Math.max(data.refresh_minutes + 5, 15) : (STALE_MINUTES_DEFAULT[currentView] || 15);
+        const ageMs = new Date() - new Date(data.timestamp);
+        if (ageMs > limitMinutes * 60000) {
+            staleWarning.textContent = '\u26A0\uFE0F Plan data is stale (last updated over ' + limitMinutes + ' minutes ago)';
+            staleWarning.style.display = 'block';
+        } else {
+            staleWarning.style.display = 'none';
+        }
+    }
+
+    // Fetch and render plan data
+    async function fetchAndRenderPlan() {
+        try {
+            // Build query string with newest data timestamp for conditional fetch
+            const params = new URLSearchParams();
+            if (newestDataTimestamp) {
+                params.append('newest_timestamp', newestDataTimestamp);
+            }
+            if (window.overridesHash) {
+                params.append('overrides_hash', window.overridesHash);
+            }
+
+            const url = './api/plan_data' + (params.toString() ? '?' + params.toString() : '');
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error(`HTTP error ${response.status}`);
+            }
+
+            const data = await response.json();
+
+            // Check if server says data is unchanged
+            if (data.unchanged === true) {
+                // Data hasn't changed, no need to update
+                // Still check staleness, against the data the current view shows
+                checkStaleness(currentViewData());
+
+                // Hide error message
+                const errorDiv = document.getElementById('planError');
+                if (errorDiv) {
+                    errorDiv.style.display = 'none';
+                }
+                return; // Exit early, no updates needed
+            }
+
+            // We received new data - update everything and re-render
+            window.planData = data.plan;
+            window.yesterdayData = data.yesterday;
+            window.baselineData = data.baseline;
+            window.overridesData = data.overrides;
+            window.overridesHash = data.overrides_hash;
+
+            // Update newestDataTimestamp to the newest timestamp from the data we just received
+            const timestamps = [];
+            if (data.plan && data.plan.timestamp) timestamps.push(data.plan.timestamp);
+            if (data.yesterday && data.yesterday.timestamp) timestamps.push(data.yesterday.timestamp);
+            if (data.baseline && data.baseline.timestamp) timestamps.push(data.baseline.timestamp);
+            if (timestamps.length > 0) {
+                newestDataTimestamp = timestamps.reduce((a, b) => a > b ? a : b);
+            }
+
+            // Hide error message on successful fetch
+            const errorDiv = document.getElementById('planError');
+            if (errorDiv) {
+                errorDiv.style.display = 'none';
+            }
+
+            // Update timestamp display with new data
+            updateTimestampDisplay();
+
+            // Always re-render when we receive new data
+            refreshPlan();
+        } catch (error) {
+            console.error('Error fetching plan data:', error);
+            const errorDiv = document.getElementById('planError');
+            if (errorDiv) {
+                errorDiv.textContent = `Error fetching plan data: ${error.message}`;
+                errorDiv.style.display = 'block';
+            }
+        }
+    }
+
+    // Start automatic updates
+    function startPlanUpdates() {
+        // Load debug state
+        loadDebugState();
+
+        // Initial render
+        refreshPlan();
+
+        // Fetch the debug-history snapshot index once up front too, in case the page
+        // loads with currentView already set to 'yesterday' (e.g. restored state).
+        if (currentView === 'yesterday') {
+            loadDebugHistoryData().then(refreshPlan);
+        }
+
+        // Set up polling every 5 seconds
+        if (updateIntervalId) {
+            clearInterval(updateIntervalId);
+        }
+        updateIntervalId = setInterval(fetchAndRenderPlan, 5000);
+    }
+
+    // Stop automatic updates
+    function stopPlanUpdates() {
+        if (updateIntervalId) {
+            clearInterval(updateIntervalId);
+            updateIntervalId = null;
+        }
+    }
+
+    // Handle debug toggle change
+    function onDebugToggleChange() {
+        saveDebugState();
+        refreshPlan();
+    }
+    </script>
+    """
+    return text
+
+
+def get_header_html(title, calculating, default_page, arg_errors, THIS_VERSION, battery_status_icon, refresh=0, codemirror=False, chat_enabled=False):
+    """
+    Return the HTML header for a page
+    """
+
+    text = '<!doctype html><html><head><meta charset="utf-8"><title>{}</title>'.format(title)
+    text += '<link rel="icon" type="image/svg+xml" href="./images/bat_logo.svg">'
+    text += '<link rel="icon" type="image/png" href="./images/bat_logo_light.png">'
+
+    text += """
+<script>
+// Apply dark mode immediately before CSS is parsed to prevent flash of white
+// Falls back to the OS/browser prefers-color-scheme setting when the user hasn't made an explicit choice (batpred#4800)
+function getDarkModePreference() {
+    const storedDarkMode = localStorage.getItem('darkMode');
+    if (storedDarkMode !== null) {
+        return storedDarkMode === 'true';
+    }
+    return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+}
+if (getDarkModePreference()) {
+    document.documentElement.classList.add('dark-mode');
+    document.addEventListener('DOMContentLoaded', function() {
+        if (document.body) {
+            document.body.classList.add('dark-mode');
+        }
+    });
+}
+</script>
+<style>
+    /* Paint the correct background before the external font/chart resources below (which block
+       rendering while they load) have a chance to delay the full stylesheet - otherwise a slow or
+       uncached CDN fetch leaves the page showing its default white background until they resolve,
+       flashing bright white on every page load/refresh even with dark mode enabled (batpred#2256). */
+    html { background-color: #ffffff; }
+    html.dark-mode { background-color: #121212; }
+    body { background-color: #ffffff; color: #333; }
+    html.dark-mode body { background-color: #121212; color: #e0e0e0; }
+</style>
+<link href="https://cdn.jsdelivr.net/npm/@mdi/font@7.4.47/css/materialdesignicons.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
+<style>
+    body, html {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        border: 2px solid #ffffff;
+    }
+    html.dark-mode, html.dark-mode body {
+        border-color: #121212;
+    }
+    body {
+        font-family: Arial, sans-serif;
+        text-align: left;
+        margin: 5px;
+        background-color: #ffffff;
+        color: #333;
+    }
+    html.dark-mode body {
+        background-color: #121212;
+        color: #e0e0e0;
+    }
+    h1 {
+        color: #4CAF50;
+    }
+    h2 {
+        color: #4CAF50;
+        display: inline
+    }
+    p {
+        white-space: nowrap;
+    }
+    table {
+        padding: 1px;
+        border: 2px solid green;
+        border-spacing: 2px;
+        background-clip: padding-box;
+    }
+    th,
+    td {
+        text-align: left;
+        padding: 5px;
+        vertical-align: top;
+    }
+    th {
+        background-color: #4CAF50;
+        color: white;
+    }
+    .default, .cfg_default {
+        background-color: #ffffff;
+    }
+    .modified, .cfg_modified {
+        background-color: #ffcccc;
+    }
+
+    /* Apply dark mode to html element as well for earlier styling */
+    html.dark-mode,
+    body.dark-mode {
+        background-color: #121212;
+        color: #e0e0e0;
+        border: 2px solid #121212;
+    }
+    body.dark-mode table {
+        border-color: #333;
+    }
+    body.dark-mode th {
+        background-color: #333;
+        color: #e0e0e0;
+    }
+    body.dark-mode .default,
+    body.dark-mode .cfg_default {
+        background-color: #121212;
+    }
+    body.dark-mode .modified,
+    body.dark-mode .cfg_modified {
+        background-color: #662222;
+    }
+    /* Dark mode link styles */
+    body.dark-mode a {
+        color: #8cb4ff;
+    }
+    body.dark-mode a:visited {
+        color: #c58cff;
+    }
+    body.dark-mode a:hover {
+        color: #afd2ff;
+    }
+    /* Dark mode chart styles */
+    body.dark-mode .apexcharts-legend-text {
+        color: #ffffff !important;
+    }
+    body.dark-mode .apexcharts-title-text {
+        fill: #ffffff !important;
+    }
+    body.dark-mode .apexcharts-xaxis-label,
+    body.dark-mode .apexcharts-yaxis-label {
+        fill: #e0e0e0 !important;
+    }
+    /* Dark mode tooltip styles */
+    body.dark-mode .apexcharts-tooltip {
+        background: #333 !important;
+        color: #e0e0e0 !important;
+        border: 1px solid #555 !important;
+    }
+    body.dark-mode .apexcharts-tooltip-title {
+        background: #444 !important;
+        color: #e0e0e0 !important;
+        border-bottom: 1px solid #555 !important;
+    }
+    body.dark-mode .apexcharts-tooltip-series-group {
+        border-bottom: 1px solid #555 !important;
+    }
+    body.dark-mode .apexcharts-tooltip-text {
+        color: #e0e0e0 !important;
+    }
+    body.dark-mode .apexcharts-tooltip-text-y-value,
+    body.dark-mode .apexcharts-tooltip-text-goals-value,
+    body.dark-mode .apexcharts-tooltip-text-z-value {
+        color: #e0e0e0 !important;
+    }
+    body.dark-mode .apexcharts-tooltip-marker {
+        box-shadow: 0 0 0 1px #444 !important;
+    }
+    body.dark-mode .apexcharts-tooltip-text-label {
+        color: #afd2ff !important;
+    }
+    body.dark-mode .apexcharts-xaxistooltip,
+    body.dark-mode .apexcharts-yaxistooltip {
+        background: #333 !important;
+        color: #e0e0e0 !important;
+        border: 1px solid #555 !important;
+    }
+    body.dark-mode .apexcharts-xaxistooltip-text,
+    body.dark-mode .apexcharts-yaxistooltip-text {
+        color: #e0e0e0 !important;
+    }
+
+    /* Dark mode styles for restart button */
+    body.dark-mode button {
+        background-color: #cc3333 !important;
+        color: #e0e0e0 !important;
+    }
+
+    body.dark-mode button:hover {
+        background-color: #aa2222 !important;
+    }
+
+    /* Dashboard form controls styling */
+    .dashboard-select {
+        border: 1px solid #ccc;
+        padding: 2px 4px;
+        border-radius: 3px;
+        background-color: #fff;
+        color: #333;
+        font-size: 14px;
+    }
+
+    /* Toggle switch styles */
+    .toggle-switch {
+        position: relative;
+        display: inline-block;
+        width: 60px;
+        height: 24px;
+        background-color: #ccc;
+        border-radius: 12px;
+        cursor: pointer;
+        transition: background-color 0.3s;
+        border: none;
+        outline: none;
+        margin-right: 5px;
+        vertical-align: middle;
+    }
+
+    .toggle-switch.active {
+        background-color: #f44336;
+    }
+
+    .toggle-switch::before {
+        content: '';
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 20px;
+        height: 20px;
+        background-color: white;
+        border-radius: 50%;
+        transition: transform 0.3s;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+    }
+
+    .toggle-switch.active::before {
+        transform: translateX(36px);
+    }
+
+    .toggle-switch:hover {
+        opacity: 0.8;
+    }
+
+    /* Dark mode form controls */
+    body.dark-mode .dashboard-select {
+        background-color: #444;
+        color: #e0e0e0;
+        border-color: #666;
+    }
+
+    body.dark-mode .dashboard-select:focus {
+        border-color: #4CAF50;
+    }
+
+    /* Dark mode toggle switch styles */
+    body.dark-mode .toggle-switch {
+        background-color: #555 !important;
+    }
+
+    body.dark-mode .toggle-switch.active {
+        background-color: #f44336 !important;
+    }
+
+    body.dark-mode .toggle-switch::before {
+        background-color: #e0e0e0;
+    }
+
+    .menu-bar {
+        background-color: #ffffff;
+        overflow-x: auto; /* Enable horizontal scrolling */
+        white-space: nowrap; /* Prevent menu items from wrapping */
+        display: flex;
+        align-items: center;
+        border-bottom: 1px solid #ddd;
+        -webkit-overflow-scrolling: touch; /* Smooth scrolling on iOS */
+        scrollbar-width: thin; /* Firefox */
+        scrollbar-color: #4CAF50 #f0f0f0; /* Firefox */
+        position: fixed; /* Change from sticky to fixed */
+        top: 0; /* Stick to the top */
+        left: 0; /* Ensure it starts from the left edge */
+        right: 0; /* Ensure it extends to the right edge */
+        width: 100%; /* Make sure it spans the full width */
+        z-index: 1000; /* Ensure it's above other content */
+        box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1); /* Add subtle shadow for visual separation */
+    }
+
+    /* Add padding to body to prevent content from hiding under fixed header */
+    body {
+        padding-top: 65px; /* Increased padding to account for the fixed menu height */
+    }
+
+    .battery-wrapper {
+        display: flex;
+        align-items: center;
+        margin-left: 10px;
+    }
+
+    /* Flying bat animation */
+    @keyframes flyAcross {
+        0% {
+            left: 10px;
+            top: 30px;
+            transform: translateY(0) scale(1.5);
+        }
+        25% {
+            left: 25%;
+            top: 65%;
+            transform: translateY(0) scale(2.0) rotate(45deg);
+        }
+        50% {
+            left: 50%;
+            top: 30px;
+            transform: translateY(0) scale(1.5) rotate(-45deg);
+        }
+        75% {
+            left: 75%;
+            top: 65%;
+            transform: translateY(0) scale(2.0) rotate(45deg);
+        }
+        100% {
+            left: 100%;
+            top: 30px;
+            transform: translateY(0) scale(1.5);
+        }
+    }
+
+    .flying-bat {
+        position: fixed;
+        z-index: 9999;
+        width: 60px;
+        height: 60px;
+        background-size: contain;
+        background-repeat: no-repeat;
+        background-position: center;
+        pointer-events: none;
+        animation: flyAcross 3s linear forwards;
+    }
+
+</style>
+<script>
+// Check and apply the saved dark mode preference on page load
+window.onload = function() {
+    applyDarkMode();
+};
+function applyDarkMode() {
+    const darkModeEnabled = getDarkModePreference();
+    if (darkModeEnabled) {
+        document.body.classList.add('dark-mode');
+        document.documentElement.classList.add('dark-mode');
+    }
+    else {
+        document.body.classList.remove('dark-mode');
+        document.documentElement.classList.remove('dark-mode');
+    }
+
+    // Update logo image source based on dark mode
+    const logoImage = document.getElementById('logo-image');
+    if (logoImage) {
+        if (darkModeEnabled) {
+            logoImage.src = logoImage.getAttribute('data-dark-src');
+        } else {
+            logoImage.src = logoImage.getAttribute('data-light-src');
+        }
+    }
+};
+
+// Re-apply if the OS/browser theme changes while no explicit preference is stored (batpred#4800)
+if (window.matchMedia) {
+    const darkModeMediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+    const handleDarkModePreferenceChange = function() {
+        if (localStorage.getItem('darkMode') === null) {
+            applyDarkMode();
+        }
+    };
+    // Safari < 14 and Chrome < 39 only implement the older, deprecated addListener() method
+    if (darkModeMediaQuery.addEventListener) {
+        darkModeMediaQuery.addEventListener('change', handleDarkModePreferenceChange);
+    } else if (darkModeMediaQuery.addListener) {
+        darkModeMediaQuery.addListener(handleDarkModePreferenceChange);
+    }
+}
+
+function toggleDarkMode() {
+    const isDarkMode = document.body.classList.toggle('dark-mode');
+    localStorage.setItem('darkMode', isDarkMode);
+    // Force reload to apply dark mode styles
+    location.reload();
+}
+
+function flyBat() {
+    // Remove any existing flying bats
+    document.querySelectorAll('.flying-bat').forEach(bat => bat.remove());
+
+    // Create a new bat element
+    const bat = document.createElement('div');
+    bat.className = 'flying-bat';
+
+    // Get the appropriate bat image based on dark/light mode
+    const isDarkMode = document.body.classList.contains('dark-mode');
+    const batImage = isDarkMode
+        ? './images/bat_logo_dark.png'
+        : './images/bat_logo_light.png';
+
+    bat.style.backgroundImage = `url('${batImage}')`;
+
+    // Add to document
+    document.body.appendChild(bat);
+
+    // Remove after animation completes
+    setTimeout(() => {
+        bat.remove();
+    }, 4100);  // Slightly longer than the animation duration
+}
+
+function restartPredbat() {
+    if (confirm('Are you sure you want to restart Predbat?')) {
+        fetch('./restart', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            }
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                alert('Restart initiated. Predbat will restart shortly.');
+                // Reload the page after a short delay to show the restart status
+                setTimeout(() => {
+                    window.location.reload();
+                }, 2000);
+            } else {
+                alert('Error initiating restart: ' + (data.message || 'Unknown error'));
+            }
+        })
+        .catch(error => {
+            console.error('Error:', error);
+            alert('Error initiating restart: ' + error.message);
+        });
+    }
+}
+
+function downloadLiveApps() {
+    if (confirm(`Download apps.yaml with real credentials?\\n\\nOK = full unmasked file\\nCancel = masked file (credentials redacted)`)) {
+        window.location.href = './debug_apps_live?masked=0';
+    } else {
+        window.location.href = './debug_apps_live?masked=1';
+    }
+}
+
+function downloadFileApps() {
+    if (confirm(`Download apps.yaml with real credentials?\\n\\nOK = full unmasked file\\nCancel = masked file (credentials redacted)`)) {
+        window.location.href = './debug_apps?masked=0';
+    } else {
+        window.location.href = './debug_apps?masked=1';
+    }
+}
+
+function toggleSwitch(element, fieldName) {
+    // Toggle the active class
+    element.classList.toggle('active');
+
+    // Determine the new value
+    const isActive = element.classList.contains('active');
+    const newValue = isActive ? 'on' : 'off';
+
+    // Find the associated form and hidden input
+    const form = element.closest('form');
+    if (form) {
+        // Create or update the hidden input for the value
+        let hiddenInput = form.querySelector('input[name="' + fieldName + '"]');
+        if (!hiddenInput) {
+            hiddenInput = document.createElement('input');
+            hiddenInput.type = 'hidden';
+            hiddenInput.name = fieldName;
+            form.appendChild(hiddenInput);
+        }
+        hiddenInput.value = newValue;
+
+        // If saveFilterValue function exists (config page), call it
+        if (typeof saveFilterValue === 'function') {
+            saveFilterValue();
+        }
+
+        // Submit the form
+        form.submit();
+    }
+}
+</script>
+"""
+    if refresh:
+        text += '<meta http-equiv="refresh" content="{}" >'.format(refresh)
+
+    if codemirror:
+        text += """
+    <!-- CodeMirror Library -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.9/codemirror.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.9/codemirror.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.9/mode/yaml/yaml.min.js"></script>
+
+    <!-- CodeMirror Theme -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.9/theme/monokai.min.css">
+
+    <!-- YAML Validation and Linting -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.9/addon/lint/lint.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.9/addon/lint/yaml-lint.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.9/addon/lint/lint.min.css">
+    </head>"""
+    text += "</head><body>"
+    text += get_menu_html(calculating, default_page, arg_errors, THIS_VERSION, battery_status_icon, chat_enabled)
+    return text
+
+
+def get_menu_html(calculating, default_page, arg_errors, THIS_VERSION, battery_status_icon, chat_enabled=False):
+    """
+    Return the Predbat Menu page as HTML
+    """
+    text = ""
+    # Check if there are configuration errors
+    config_warning = ""
+    if arg_errors:
+        config_warning = '<span style="color: #ffcc00; margin-left: 5px;">&#9888;</span>'
+
+    # Define status icon based on calculating state
+    status_icon = ""
+    if calculating:
+        status_icon = '<span class="mdi mdi-autorenew mdi-spin calculating-icon" style="color: #4CAF50; font-size: 24px; margin-left: 10px; margin-right: 10px;" title="Calculation in progress..."></span>'
+    else:
+        status_icon = '<span class="mdi mdi-check-circle idle-icon" style="color: #4CAF50; font-size: 24px; margin-left: 10px; margin-right: 10px;" title="System idle"></span>'
+
+    text += (
+        """
+<style>
+.menu-bar {
+background-color: #ffffff;
+overflow-x: auto; /* Enable horizontal scrolling */
+white-space: nowrap; /* Prevent menu items from wrapping */
+display: flex;
+align-items: center;
+border-bottom: 1px solid #ddd;
+-webkit-overflow-scrolling: touch; /* Smooth scrolling on iOS */
+scrollbar-width: thin; /* Firefox */
+scrollbar-color: #4CAF50 #f0f0f0; /* Firefox */
+position: fixed; /* Change from sticky to fixed */
+top: 0; /* Stick to the top */
+left: 0; /* Ensure it starts from the left edge */
+right: 0; /* Ensure it extends to the right edge */
+width: 100%; /* Make sure it spans the full width */
+z-index: 1000; /* Ensure it's above other content */
+box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1); /* Add subtle shadow for visual separation */
+}
+
+/* Add padding to body to prevent content from hiding under fixed header */
+body {
+padding-top: 65px; /* Increased padding to account for the fixed menu height */
+}
+
+.menu-bar .logo {
+display: flex;
+align-items: center;
+padding: 0 16px;
+min-width: fit-content; /* Prevent logo from shrinking */
+}
+
+.menu-bar .logo img {
+height: 40px;
+margin-right: 10px;
+}
+
+.menu-bar .logo-text {
+font-size: 24px;
+font-weight: bold;
+color: #333;
+white-space: nowrap;
+}
+
+.menu-bar a {
+color: #333;
+text-align: center;
+padding: 14px 16px;
+text-decoration: none;
+font-size: 16px;
+display: flex;
+align-items: center;
+white-space: nowrap;
+flex-shrink: 0; /* Prevent items from shrinking */
+}
+
+
+
+.menu-bar a:hover {
+background-color: #f0f0f0;
+color: #4CAF50;
+}
+
+.menu-bar a.active {
+background-color: #4CAF50;
+color: white;
+}
+
+.dark-mode-toggle {
+margin-left: auto;
+padding: 14px 16px;
+flex-shrink: 0; /* Prevent from shrinking */
+}
+
+.dark-mode-toggle button {
+background-color: #f0f0f0;
+color: #333;
+border: 1px solid #ddd;
+padding: 8px 12px;
+border-radius: 4px;
+cursor: pointer;
+white-space: nowrap;
+}
+
+.dark-mode-toggle button:hover {
+background-color: #e0e0e0;
+}
+
+/* Dark mode menu styles */
+body.dark-mode .menu-bar {
+background-color: #1e1e1e;
+border-bottom: 1px solid #333;
+scrollbar-color: #4CAF50 #333; /* Firefox */
+}
+
+body.dark-mode .menu-bar::-webkit-scrollbar-track {
+background: #333;
+}
+
+body.dark-mode .menu-bar .logo-text {
+color: white;
+}
+
+body.dark-mode .menu-bar a {
+color: white;
+}
+
+body.dark-mode .menu-bar a:hover {
+background-color: #2c652f;
+color: white;
+}
+
+body.dark-mode .menu-bar a.active {
+background-color: #4CAF50;
+color: white;
+}
+
+body.dark-mode .calculating-icon {
+color: #6CFF72 !important;
+}
+
+body.dark-mode .idle-icon {
+color: #6CFF72 !important;
+}
+
+body.dark-mode .dark-mode-toggle button {
+background-color: #444;
+color: #e0e0e0;
+border-color: #555;
+}
+
+body.dark-mode .dark-mode-toggle button:hover {
+background-color: #666;
+}
+
+/* Advanced sub-menu. The popup is a sibling of the menu bar, not a child, and is position: fixed and
+   placed under its toggle by positionMenuDropdown(): the bar scrolls horizontally and is itself fixed,
+   and WebKit clips a fixed child of such an element, so inside it the popup opened invisibly on iOS. */
+.menu-dropdown {
+display: flex;
+flex-shrink: 0;
+}
+
+.menu-dropdown-toggle {
+background: none;
+border: none;
+color: #333;
+padding: 14px 16px;
+font-size: 16px;
+font-family: inherit;
+cursor: pointer;
+white-space: nowrap;
+}
+
+.menu-dropdown-toggle:hover {
+background-color: #f0f0f0;
+color: #4CAF50;
+}
+
+.menu-dropdown-toggle.active {
+background-color: #4CAF50;
+color: white;
+}
+
+.menu-dropdown-content {
+display: none;
+position: fixed;
+flex-direction: column;
+min-width: 180px;
+background-color: #ffffff;
+border: 1px solid #ddd;
+box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+z-index: 1001;
+}
+
+.menu-dropdown-content.open {
+display: flex;
+}
+
+.menu-dropdown-content a {
+color: #333;
+padding: 14px 16px;
+text-decoration: none;
+font-size: 16px;
+display: flex;
+align-items: center;
+white-space: nowrap;
+}
+
+.menu-dropdown-content a:hover {
+background-color: #f0f0f0;
+color: #4CAF50;
+}
+
+.menu-dropdown-content a.active {
+background-color: #4CAF50;
+color: white;
+}
+
+body.dark-mode .menu-dropdown-content a {
+color: white;
+}
+
+body.dark-mode .menu-dropdown-content a:hover {
+background-color: #2c652f;
+color: white;
+}
+
+body.dark-mode .menu-dropdown-content a.active {
+background-color: #4CAF50;
+color: white;
+}
+
+/* !important because the shared dark-mode rule paints every button red with !important */
+body.dark-mode .menu-dropdown-toggle {
+background-color: transparent !important;
+color: white !important;
+}
+
+body.dark-mode .menu-dropdown-toggle:hover {
+background-color: #2c652f !important;
+color: white !important;
+}
+
+body.dark-mode .menu-dropdown-toggle.active {
+background-color: #4CAF50 !important;
+color: white !important;
+}
+
+body.dark-mode .menu-dropdown-content {
+background-color: #1e1e1e;
+border-color: #333;
+}
+</style>
+
+<script>
+// Add viewport meta tag if it doesn't exist
+if (!document.querySelector('meta[name="viewport"]')) {
+const meta = document.createElement('meta');
+meta.name = 'viewport';
+meta.content = 'width=device-width, initial-scale=1, maximum-scale=1';
+document.head.appendChild(meta);
+}
+
+// Store the active menu item in session storage
+function storeActiveMenuItem(path) {
+localStorage.setItem('activeMenuItem', path);
+}
+
+// Open or close a menu-bar sub-menu (its popup is a sibling of the bar, see the CSS)
+function toggleMenuDropdown(event, contentId) {
+event.stopPropagation();
+const content = document.getElementById(contentId);
+if (!content) {
+    return;
+}
+const opening = !content.classList.contains('open');
+closeMenuDropdowns();
+if (opening) {
+    content.classList.add('open');
+    positionMenuDropdowns();
+}
+}
+
+// Place each open popup under its toggle
+function positionMenuDropdowns() {
+document.querySelectorAll('.menu-dropdown-content.open').forEach(content => {
+    const toggle = document.querySelector('.menu-dropdown-toggle[data-menu="' + content.id + '"]');
+    if (!toggle) {
+        return;
+    }
+    const rect = toggle.getBoundingClientRect();
+    content.style.top = rect.bottom + 'px';
+    content.style.left = Math.max(0, Math.min(rect.left, window.innerWidth - content.offsetWidth)) + 'px';
+});
+}
+
+function closeMenuDropdowns() {
+document.querySelectorAll('.menu-dropdown-content.open').forEach(content => content.classList.remove('open'));
+}
+
+// A click anywhere else closes an open sub-menu. Scrolling the bar or resizing only moves it: on a
+// phone a tap right after a swipe, or the address bar hiding, fires those events just after it opens.
+document.addEventListener('click', function(event) {
+if (!event.target.closest('.menu-dropdown, .menu-dropdown-content')) {
+    closeMenuDropdowns();
+}
+});
+window.addEventListener('resize', positionMenuDropdowns);
+document.addEventListener('DOMContentLoaded', function() {
+const menuBar = document.querySelector('.menu-bar');
+if (menuBar) {
+    menuBar.addEventListener('scroll', positionMenuDropdowns);
+}
+});
+
+// Function to set the active menu item
+function setActiveMenuItem() {
+// Get all menu links
+const menuLinks = document.querySelectorAll('.menu-bar a, .menu-dropdown-content a');
+
+// Get current page path from window location
+let currentPath = window.location.pathname;
+
+// Handle paths with trailing slash
+if (currentPath.endsWith('/')) {
+    currentPath = currentPath.slice(0, -1);
+}
+
+// Default page from server if nothing else matches
+const defaultPage = '"""
+        + default_page
+        + """';
+
+// First try to get the active page from session storage (in case of resize or direct navigation)
+const storedActivePage = localStorage.getItem('activeMenuItem');
+
+let currentPage = currentPath;
+
+// If the current page is the root, check if we have a stored page
+if (currentPath === '' || currentPath === '/') {
+    if (storedActivePage) {
+        currentPage = storedActivePage;
+    } else {
+        currentPage = defaultPage;
+    }
+} else {
+    // Store the current page for future reference
+    localStorage.setItem('activeMenuItem', currentPage);
+}
+
+let activeFound = false;
+
+// Remove active class from all links
+menuLinks.forEach(link => {
+    link.classList.remove('active');
+
+    // Check if this link's href matches the current page
+    const linkPath = new URL(link.href).pathname;
+
+    // Ensure we're comparing cleanly
+    const cleanLinkPath = linkPath.endsWith('/') ? linkPath.slice(0, -1) : linkPath;
+    const cleanCurrentPage = currentPage.endsWith('/') ? currentPage.slice(0, -1) : currentPage;
+
+    // Match either the exact path or paths with a leading ./
+    // (since server-side our paths often have ./ prefix)
+    if (cleanCurrentPage === cleanLinkPath ||
+        cleanLinkPath.endsWith(cleanCurrentPage) ||
+        cleanCurrentPage.endsWith(cleanLinkPath)) {
+        link.classList.add('active');
+        activeFound = true;
+    }
+});
+
+// Second pass: a sub-page belongs to its parent menu entry.
+// Some pages are sub-pages of a menu item and have no entry of their own - /annual_view
+// and /annual_compare both live under the ./annual tab. Without this they matched
+// nothing and fell through to the default below, which highlighted Dashboard while the
+// user was plainly on another tab.
+//
+// Only runs when the first pass found no exact match, so a page that DOES have its own
+// entry can never be captured by a shorter one - /apps_editor keeps its own highlight
+// rather than lighting up /apps. The longest matching prefix wins for the same reason.
+if (!activeFound && menuLinks.length > 0) {
+    let bestLink = null;
+    let bestLength = 0;
+    menuLinks.forEach(link => {
+        const linkPath = new URL(link.href).pathname;
+        const cleanLinkPath = linkPath.endsWith('/') ? linkPath.slice(0, -1) : linkPath;
+        const cleanCurrentPage = currentPage.endsWith('/') ? currentPage.slice(0, -1) : currentPage;
+        // Require a separator so /annual matches /annual_view but /app never matches
+        // /apps - a bare prefix would capture unrelated pages that merely start alike.
+        if (cleanLinkPath.length > bestLength &&
+            (cleanCurrentPage.startsWith(cleanLinkPath + '_') || cleanCurrentPage.startsWith(cleanLinkPath + '/'))) {
+            bestLink = link;
+            bestLength = cleanLinkPath.length;
+        }
+    });
+    if (bestLink) {
+        bestLink.classList.add('active');
+        activeFound = true;
+    }
+}
+
+// If no active item was found, set default
+if (!activeFound && menuLinks.length > 0) {
+    const defaultLink = menuLinks[0]; // Set first menu item as default
+    defaultLink.classList.add('active');
+    storeActiveMenuItem(new URL(defaultLink.href).pathname);
+}
+
+// A page inside a sub-menu lights up the sub-menu's toggle too - its own link is hidden until opened
+document.querySelectorAll('.menu-dropdown-toggle[data-menu]').forEach(toggle => {
+    const content = document.getElementById(toggle.dataset.menu);
+    toggle.classList.toggle('active', !!(content && content.querySelector('a.active')));
+});
+
+// Scroll active item into view (a sub-menu page has no link in the bar, so its lit toggle stands in)
+const activeItem = document.querySelector('.menu-bar a.active, .menu-bar .menu-dropdown-toggle.active');
+if (activeItem) {
+    // Scroll with a slight offset to make it more visible
+    const menuBar = document.querySelector('.menu-bar');
+    const activeItemLeft = activeItem.offsetLeft;
+    const menuBarWidth = menuBar.clientWidth;
+    menuBar.scrollLeft = activeItemLeft - menuBarWidth / 2 + activeItem.clientWidth / 2;
+}
+}
+
+// Live status update functionality
+let statusUpdateInterval = null;
+
+function updateLiveStatus() {
+    fetch('./api/status')
+        .then(response => response.json())
+        .then(data => {
+            // Update calculating/idle icon
+            const statusIcon = document.getElementById('status-icon');
+            if (statusIcon) {
+                if (data.calculating) {
+                    statusIcon.innerHTML = '<span class="mdi mdi-autorenew mdi-spin calculating-icon" style="color: #4CAF50; font-size: 24px; margin-left: 10px; margin-right: 10px;" title="Calculation in progress..."></span>';
+                } else {
+                    statusIcon.innerHTML = '<span class="mdi mdi-check-circle idle-icon" style="color: #4CAF50; font-size: 24px; margin-left: 10px; margin-right: 10px;" title="System idle"></span>';
+                }
+            }
+
+            // Update battery status
+            const batteryStatus = document.getElementById('battery-status');
+            if (batteryStatus && data.battery_html) {
+                batteryStatus.innerHTML = data.battery_html;
+            }
+        })
+        .catch(error => {
+            console.error('Error updating status:', error);
+        });
+}
+
+function startStatusUpdates() {
+    // Initial update
+    updateLiveStatus();
+    // Update every 5 seconds
+    statusUpdateInterval = setInterval(updateLiveStatus, 5000);
+}
+
+function stopStatusUpdates() {
+    if (statusUpdateInterval) {
+        clearInterval(statusUpdateInterval);
+        statusUpdateInterval = null;
+    }
+}
+
+// Initialise menu on page load
+document.addEventListener("DOMContentLoaded", function() {
+setActiveMenuItem();
+startStatusUpdates();
+
+// For each menu item, add click handler to set it as active
+const menuLinks = document.querySelectorAll('.menu-bar a, .menu-dropdown-content a');
+menuLinks.forEach(link => {
+    link.addEventListener('click', function(e) {
+        // Don't override external links (like Docs)
+        if (!this.href.includes(window.location.hostname)) {
+            return;
+        }
+
+        // Remove active class from all links
+        menuLinks.forEach(l => l.classList.remove('active'));
+
+        // Add active class to clicked link
+        this.classList.add('active');
+
+        // Store the clicked menu item path
+        storeActiveMenuItem(new URL(this.href).pathname);
+    });
+});
+});
+
+// Additional window.onload handler for other functionality
+const originalOnLoad = window.onload;
+window.onload = function() {
+// Call the original onload function if it exists
+if (typeof originalOnLoad === 'function') {
+    originalOnLoad();
+}
+applyDarkMode();
+};
+
+// Handle window resize without losing active menu item
+window.addEventListener('resize', function() {
+// Don't reload the page, just make sure the active menu item is visible
+setTimeout(function() {
+    const activeItem = document.querySelector('.menu-bar a.active, .menu-bar .menu-dropdown-toggle.active');
+    if (activeItem) {
+        const menuBar = document.querySelector('.menu-bar');
+        const activeItemLeft = activeItem.offsetLeft;
+        const menuBarWidth = menuBar.clientWidth;
+        menuBar.scrollLeft = activeItemLeft - menuBarWidth / 2 + activeItem.clientWidth / 2;
+    }
+}, 100);
+});
+</script>
+
+<div class="menu-bar">
+<div class="logo">
+    <img id="logo-image"
+            src="./images/bat_logo_light.png"
+            data-light-src="./images/bat_logo_light.png"
+            data-dark-src="./images/bat_logo_dark.png"
+            alt="Predbat Logo"
+            onclick="flyBat()"
+            style="cursor: pointer;"
+    >
+    <span id="status-icon">"""
+        + status_icon
+        + """</span>
+    <div class="battery-wrapper" id="battery-status">
+        """
+        + battery_status_icon
+        + """
+    </div>
+</div>
+<a href='./dash'>Dash</a>
+<a href='./metrics_dashboard'>Metrics</a>
+<a href='./plan'>Plan</a>
+<a href='./charts'>Charts</a>
+<a href='./entity'>Entities</a>
+<a href='./compare'>Compare</a>
+<a href='./annual'>WhatIf</a>
+"""
+        + ("<a href='./chat'>Chat</a>\n" if chat_enabled else "")
+        + """<a href='./log'>Log</a>
+<div class="menu-dropdown">
+<button class="menu-dropdown-toggle" type="button" data-menu="settings-menu" onclick="toggleMenuDropdown(event, 'settings-menu')">Settings"""
+        + config_warning
+        + """ &#9662;</button>
+</div>
+<div class="menu-dropdown">
+<button class="menu-dropdown-toggle" type="button" data-menu="advanced-menu" onclick="toggleMenuDropdown(event, 'advanced-menu')">Advanced &#9662;</button>
+</div>
+<a href='https://springfall2008.github.io/batpred/'>Docs</a>
+<div class="dark-mode-toggle">
+    """
+        + THIS_VERSION
+        + """
+    <button onclick="toggleDarkMode()">Toggle Dark Mode</button>
+</div>
+</div>
+<!-- Sub-menu popups sit outside .menu-bar on purpose: WebKit clips a position: fixed child of the fixed, scrolling bar -->
+<div class="menu-dropdown-content" id="settings-menu">
+<a href='./apps'>Apps"""
+        + config_warning
+        + """</a>
+<a href='./config'>Config</a>
+<a href='./components'>Components</a>
+<a href='./apps_editor'>Editor</a>
+</div>
+<div class="menu-dropdown-content" id="advanced-menu">
+<a href='./discovery'>Discovery</a>
+<a href='./browse'>Browse</a>
+<a href='./internals'>Internals</a>
+<a href='./kraken_key'>Kraken API Key</a>
+</div>
+"""
+    )
+    return text
+
+
+def get_browse_css():
+    """
+    Return CSS styles for the browse page
+    """
+    return """
+<style>
+.breadcrumb-container {
+    margin-bottom: 20px;
+    border-bottom: 1px solid #ddd;
+    padding-bottom: 10px;
+}
+
+.breadcrumb {
+    margin-top: 10px;
+    font-size: 14px;
+}
+
+.breadcrumb-item {
+    color: #4CAF50;
+    text-decoration: none;
+    padding: 2px 4px;
+    border-radius: 3px;
+}
+
+.breadcrumb-item:hover {
+    background-color: #f0f0f0;
+    text-decoration: underline;
+}
+
+.file-list {
+    margin-top: 10px;
+}
+
+.files-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+}
+
+.files-table th {
+    background-color: #4CAF50;
+    color: white;
+    padding: 10px;
+    text-align: left;
+    border-bottom: 2px solid #45a049;
+}
+
+.files-table td {
+    padding: 8px 10px;
+    border-bottom: 1px solid #ddd;
+    vertical-align: middle;
+}
+
+.files-table tr:hover {
+    background-color: #f5f5f5;
+}
+
+.files-table a {
+    color: #333;
+    text-decoration: none;
+    display: flex;
+    align-items: center;
+}
+
+.files-table a:hover {
+    color: #4CAF50;
+    text-decoration: underline;
+}
+
+.files-table .mdi {
+    margin-right: 8px;
+    font-size: 18px;
+}
+
+.parent-dir .mdi {
+    color: #666;
+}
+
+.directory .mdi {
+    color: #2196F3;
+}
+
+.file .mdi {
+    color: #666;
+}
+
+.file-viewer {
+    margin-top: 20px;
+}
+
+.file-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 15px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #ddd;
+}
+
+.file-actions {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+
+.download-button {
+    background-color: #2196F3;
+    color: white;
+    padding: 8px 16px;
+    text-decoration: none;
+    border-radius: 4px;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.download-button:hover {
+    background-color: #0b7dda;
+}
+
+.download-button .mdi {
+    font-size: 16px;
+}
+
+.back-button {
+    background-color: #4CAF50;
+    color: white;
+    padding: 8px 16px;
+    text-decoration: none;
+    border-radius: 4px;
+    font-size: 14px;
+}
+
+.back-button:hover {
+    background-color: #45a049;
+}
+
+.code-content {
+    background-color: #f8f8f8;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    padding: 15px;
+    overflow-x: auto;
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+    font-size: 14px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    max-height: 70vh;
+    overflow-y: auto;
+}
+
+.error {
+    background-color: #f8d7da;
+    color: #721c24;
+    border: 1px solid #f5c6cb;
+    border-radius: 4px;
+    padding: 12px;
+    margin: 10px 0;
+}
+
+/* Dark mode styles */
+body.dark-mode .breadcrumb-container {
+    border-bottom-color: #333;
+}
+
+body.dark-mode .breadcrumb-item:hover {
+    background-color: #333;
+}
+
+body.dark-mode .files-table th {
+    background-color: #333;
+    color: #e0e0e0;
+    border-bottom-color: #444;
+}
+
+body.dark-mode .files-table td {
+    border-bottom-color: #333;
+}
+
+body.dark-mode .files-table tr:hover {
+    background-color: #222;
+}
+
+body.dark-mode .files-table a {
+    color: #e0e0e0;
+}
+
+body.dark-mode .files-table a:hover {
+    color: #4CAF50;
+}
+
+body.dark-mode .file-header {
+    border-bottom-color: #333;
+}
+
+body.dark-mode .code-content {
+    background-color: #1e1e1e;
+    border-color: #333;
+    color: #e0e0e0;
+}
+
+body.dark-mode .error {
+    background-color: #3c2124;
+    color: #f5b5c4;
+    border-color: #662c34;
+}
+
+body.dark-mode .back-button {
+    background-color: #333;
+    color: #e0e0e0;
+    border: 1px solid #555;
+}
+
+body.dark-mode .back-button:hover {
+    background-color: #444;
+    color: #fff;
+}
+
+body.dark-mode .download-button {
+    background-color: #1976D2;
+    color: #e0e0e0;
+    border: 1px solid #1565C0;
+}
+
+body.dark-mode .download-button:hover {
+    background-color: #1565C0;
+    color: #fff;
+}
+</style>
+    """
+
+
+def get_kraken_key_page_html():
+    """
+    Return the body of the Kraken API key generator page: a short how-to, the token form and its script.
+
+    The script posts to ./api/kraken_key and renders every value with textContent, never innerHTML.
+    """
+    return """
+<style>
+.kraken-key { max-width: 820px; }
+.kraken-key p, .kraken-key label { white-space: normal; } /* the shared header sets p { white-space: nowrap } */
+.kraken-key ol { padding-left: 20px; }
+.kraken-key li { margin-bottom: 4px; }
+.kraken-key textarea { width: 100%; min-height: 90px; font-family: monospace; font-size: 13px; box-sizing: border-box; }
+.kraken-key select, .kraken-key button { font-size: 15px; padding: 6px 12px; margin: 8px 8px 8px 0; }
+.kraken-key code, .kraken-key pre { background-color: #f4f4f4; border-radius: 4px; padding: 2px 4px; }
+.kraken-key pre { padding: 8px; white-space: pre-wrap; word-break: break-all; }
+.kraken-key-note { color: #666; font-size: 14px; }
+.kraken-key-result { margin-top: 16px; padding: 12px; border-radius: 6px; border: 1px solid #ddd; }
+.kraken-key-result:empty { display: none; }
+.kraken-key-warning { border-color: #f0ad4e; background-color: #fff8e6; }
+.kraken-key-error { border-color: #f44336; background-color: #fdecea; }
+.kraken-key-success { border-color: #4CAF50; background-color: #edf7ed; }
+.kraken-key-value { width: 100%; font-family: monospace; font-size: 14px; padding: 6px; box-sizing: border-box; }
+body.dark-mode .kraken-key code, body.dark-mode .kraken-key pre { background-color: #2a2a2a; }
+body.dark-mode .kraken-key-note { color: #aaa; }
+body.dark-mode .kraken-key-result { border-color: #444; }
+body.dark-mode .kraken-key-warning { background-color: #3a2f12; }
+body.dark-mode .kraken-key-error { background-color: #3a1a1a; }
+body.dark-mode .kraken-key-success { background-color: #1a3320; }
+body.dark-mode .kraken-key textarea, body.dark-mode .kraken-key-value { background-color: #2a2a2a; color: #e0e0e0; border-color: #555; }
+</style>
+
+<div class="kraken-key">
+<h2>Kraken API key generator</h2>
+<p>Creates an API key for an E.ON Next or EDF account, for <code>kraken_auth_method: api_key</code> in <code>apps.yaml</code>.
+You need the sign-in token your browser sends to Kraken:</p>
+<ol>
+<li>Sign in to your E.ON Next (or EDF) online account in a desktop browser.</li>
+<li>Press <b>F12</b> to open the developer tools and choose the <b>Network</b> tab.</li>
+<li>Refresh the page, type <code>graphql</code> in the filter box and click one of the requests.</li>
+<li>Under <b>Request Headers</b>, copy the value of <b>Authorization</b> (a long string starting <code>eyJ</code>) and paste it below.</li>
+</ol>
+<p class="kraken-key-note">The token expires after a short time, so use it straight away. Predbat sends it only to your supplier's Kraken API and does not keep the token or the key.</p>
+
+<label for="kraken-key-provider">Supplier</label>
+<select id="kraken-key-provider">
+<option value="eon">E.ON Next</option>
+<option value="edf">EDF</option>
+</select>
+<textarea id="kraken-key-token" placeholder="eyJ..." autocomplete="off" spellcheck="false"></textarea>
+<button type="button" id="kraken-key-check" onclick="krakenKeyCheck()">Check account</button>
+
+<div id="kraken-key-result" class="kraken-key-result"></div>
+</div>
+
+<script>
+function krakenKeyEl(tag, text, className) {
+    const el = document.createElement(tag);
+    if (text !== undefined && text !== null) el.textContent = text;
+    if (className) el.className = className;
+    return el;
+}
+
+function krakenKeyResult(kind) {
+    const box = document.getElementById('kraken-key-result');
+    box.className = 'kraken-key-result' + (kind ? ' kraken-key-' + kind : '');
+    box.replaceChildren();
+    return box;
+}
+
+async function krakenKeyPost(action) {
+    const body = {
+        provider: document.getElementById('kraken-key-provider').value,
+        token: document.getElementById('kraken-key-token').value,
+        action: action
+    };
+    try {
+        const response = await fetch('./api/kraken_key', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+            cache: 'no-store'
+        });
+        return await response.json();
+    } catch (e) {
+        return {status: 'error', error: 'Could not reach Predbat: ' + e};
+    }
+}
+
+function krakenKeyBusy(busy) {
+    document.querySelectorAll('.kraken-key button').forEach(b => b.disabled = busy);
+}
+
+async function krakenKeyCheck() {
+    krakenKeyBusy(true);
+    krakenKeyResult().appendChild(krakenKeyEl('p', 'Checking...'));
+    const result = await krakenKeyPost('check');
+    krakenKeyBusy(false);
+    krakenKeyRender(result);
+}
+
+async function krakenKeyGenerate() {
+    krakenKeyBusy(true);
+    krakenKeyResult().appendChild(krakenKeyEl('p', 'Generating...'));
+    const result = await krakenKeyPost('generate');
+    krakenKeyBusy(false);
+    krakenKeyRender(result);
+}
+
+function krakenKeyRender(result) {
+    if (result.status === 'none') {
+        const box = krakenKeyResult();
+        box.appendChild(krakenKeyEl('p', 'This account has no API key yet.'));
+        const button = krakenKeyEl('button', 'Generate key');
+        button.type = 'button';
+        button.onclick = krakenKeyGenerate;
+        box.appendChild(button);
+    } else if (result.status === 'existing') {
+        const box = krakenKeyResult('warning');
+        const p = krakenKeyEl('p', 'This account already has an API key: ');
+        p.appendChild(krakenKeyEl('code', result.masked));
+        box.appendChild(p);
+        box.appendChild(krakenKeyEl('p', 'Kraken never shows an existing key in full, so the only way to get one is to generate a new key. That replaces the old key: anything else using it (another app, or another copy of Predbat) will stop working until you give it the new one.'));
+        krakenKeyConfirmGenerate(box, 'I understand the old key will stop working', 'Generate new key');
+    } else if (result.status === 'unknown') {
+        // Kraken answered without saying whether a key exists, so treat it like an existing key
+        const box = krakenKeyResult('warning');
+        box.appendChild(krakenKeyEl('p', 'Predbat could not tell whether this account already has an API key. If it does, generating a new one replaces it: anything else using the old key (another app, or another copy of Predbat) will stop working until you give it the new one.'));
+        krakenKeyConfirmGenerate(box, 'I understand any existing key will stop working', 'Generate key');
+    } else if (result.status === 'full') {
+        krakenKeyShow(result.key, true, 'This account already has an API key and Kraken returned it in full, so nothing was changed.');
+    } else if (result.status === 'generated') {
+        krakenKeyShow(result.key, result.verified, 'A new API key has been generated.');
+    } else {
+        krakenKeyResult('error').appendChild(krakenKeyEl('p', result.error || 'Something went wrong'));
+    }
+}
+
+// A Generate button that stays disabled until the user ticks a confirmation box
+function krakenKeyConfirmGenerate(box, confirmText, buttonText) {
+    const label = krakenKeyEl('label');
+    const confirm = document.createElement('input');
+    confirm.type = 'checkbox';
+    label.appendChild(confirm);
+    label.appendChild(document.createTextNode(' ' + confirmText));
+    box.appendChild(label);
+    box.appendChild(document.createElement('br'));
+    const button = krakenKeyEl('button', buttonText);
+    button.type = 'button';
+    button.disabled = true;
+    confirm.onchange = () => { button.disabled = !confirm.checked; };
+    button.onclick = krakenKeyGenerate;
+    box.appendChild(button);
+}
+
+function krakenKeyShow(key, verified, heading) {
+    // The token is no longer needed once the key is on screen
+    document.getElementById('kraken-key-token').value = '';
+    const provider = document.getElementById('kraken-key-provider').value;
+    const box = krakenKeyResult(verified ? 'success' : 'warning');
+    box.appendChild(krakenKeyEl('p', heading + ' This is the only time Predbat shows it, so copy it now.'));
+    if (!verified) {
+        box.appendChild(krakenKeyEl('p', 'Signing in with the new key did not work straight away. It may take a minute to become active; if Predbat still cannot sign in with it, generate another - you will need a fresh token from your browser, as this one has been cleared.'));
+    }
+    const input = krakenKeyEl('input', null, 'kraken-key-value');
+    input.type = 'text';
+    input.readOnly = true;
+    input.value = key;
+    box.appendChild(input);
+    const copy = krakenKeyEl('button', 'Copy key');
+    copy.type = 'button';
+    copy.onclick = () => krakenKeyCopy(input, copy);
+    box.appendChild(copy);
+    box.appendChild(krakenKeyEl('p', 'Add to apps.yaml:'));
+    box.appendChild(krakenKeyEl('pre', 'kraken_provider: ' + provider + '\\nkraken_account_id: A-12345678  # your account number, from your bill\\nkraken_auth_method: api_key\\nkraken_key: !secret kraken_key'));
+    box.appendChild(krakenKeyEl('p', 'And to secrets.yaml:'));
+    box.appendChild(krakenKeyEl('pre', 'kraken_key: ' + key));
+}
+
+function krakenKeyCopy(input, button) {
+    const done = () => { button.textContent = 'Copied'; };
+    // Copying can be refused (clipboard permission, an older browser): select the key so the user
+    // can copy it by hand, since it is only shown this once
+    const failed = () => { input.select(); button.textContent = 'Copy failed - press Ctrl+C (Cmd+C on a Mac)'; };
+    if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(input.value).then(done).catch(failed);
+    } else {
+        input.select();
+        try {
+            if (document.execCommand('copy')) { done(); } else { failed(); }
+        } catch (e) {
+            failed();
+        }
+    }
+}
+</script>
+"""
+
+
+def get_internals_css():
+    """
+    Return CSS styles for the internals page
+    """
+    return """
+<style>
+.internals-container {
+    margin: 20px;
+    font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+}
+
+.threads-section {
+    margin-bottom: 30px;
+    padding: 15px;
+    background-color: #f8f9fa;
+    border-radius: 5px;
+    border: 1px solid #ddd;
+}
+
+.threads-section h3 {
+    margin-top: 0;
+    margin-bottom: 15px;
+    color: #333;
+}
+
+.threads-container {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.thread-item {
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+}
+
+.thread-header {
+    padding: 10px 15px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background-color: #fff;
+    transition: background-color 0.2s;
+}
+
+.thread-header:hover {
+    background-color: #f0f0f0;
+}
+
+.thread-name {
+    font-weight: bold;
+    color: #2196F3;
+    flex: 0 0 200px;
+}
+
+.thread-id {
+    color: #666;
+    font-size: 0.9em;
+    flex: 0 0 150px;
+}
+
+.thread-status {
+    color: #4CAF50;
+    font-size: 0.9em;
+}
+
+.thread-stack {
+    max-height: 500px;
+    overflow-y: auto;
+    background-color: #fafafa;
+    border-top: 1px solid #ddd;
+}
+
+.thread-stack.collapsed {
+    display: none;
+}
+
+.thread-stack.expanded {
+    display: block;
+}
+
+.stack-frames {
+    padding: 10px;
+}
+
+.stack-frame {
+    padding: 8px 10px;
+    margin-bottom: 5px;
+    background: white;
+    border-left: 3px solid #2196F3;
+    font-family: 'Courier New', monospace;
+    font-size: 0.85em;
+}
+
+.frame-number {
+    display: inline-block;
+    width: 40px;
+    color: #999;
+    font-weight: bold;
+}
+
+.frame-file {
+    color: #FF9800;
+    margin-right: 10px;
+}
+
+.frame-function {
+    color: #9C27B0;
+}
+
+.frame-code {
+    margin-top: 5px;
+    padding: 5px 10px;
+    background-color: #f5f5f5;
+    border-left: 2px solid #ddd;
+    color: #333;
+    margin-left: 40px;
+}
+
+.asyncio-tasks {
+    margin-top: 15px;
+    padding: 10px;
+    background-color: #e3f2fd;
+    border-left: 3px solid #2196F3;
+}
+
+.asyncio-tasks h4 {
+    margin: 0 0 10px 0;
+    color: #1976D2;
+    font-size: 0.9em;
+}
+
+.asyncio-task {
+    margin-bottom: 10px;
+    padding: 8px;
+    background: white;
+    border-radius: 3px;
+    border: 1px solid #90CAF9;
+}
+
+.task-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 5px;
+}
+
+.task-name {
+    font-weight: bold;
+    color: #1976D2;
+}
+
+.task-state {
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 0.85em;
+    background-color: #4CAF50;
+    color: white;
+}
+
+.task-stack {
+    margin-top: 8px;
+    padding-left: 10px;
+}
+
+.tree-section {
+    margin-bottom: 30px;
+    padding: 15px;
+    background-color: #f8f9fa;
+    border-radius: 5px;
+    border: 1px solid #ddd;
+}
+
+.tree-section h3 {
+    margin-top: 0;
+    margin-bottom: 15px;
+    color: #333;
+}
+
+.tree-container {
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    padding: 10px;
+}
+
+.tree-view {
+    margin-top: 20px;
+}
+
+.tree-node {
+    margin-left: 0;
+    list-style: none;
+    padding: 0;
+}
+
+.tree-item {
+    padding: 4px 8px;
+    margin: 2px 0;
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    border-radius: 3px;
+}
+
+.tree-item:hover {
+    background-color: #f0f0f0;
+}
+
+.tree-item .expand-icon {
+    width: 20px;
+    display: inline-block;
+    cursor: pointer;
+    font-weight: bold;
+    color: #666;
+    text-align: center;
+}
+
+.tree-item .expand-icon.expandable {
+    color: #4CAF50;
+}
+
+.tree-item .refresh-icon {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 2px 6px;
+    font-size: 14px;
+    color: #007bff;
+    background-color: rgba(0, 123, 255, 0.1);
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.tree-item .refresh-icon:hover {
+    background-color: rgba(0, 123, 255, 0.2);
+    transform: rotate(180deg);
+}
+
+.tree-item .download-icon {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 2px 6px;
+    font-size: 14px;
+    color: #28a745;
+    text-decoration: none;
+    border-radius: 3px;
+    background-color: rgba(40, 167, 69, 0.1);
+    transition: all 0.2s;
+}
+
+.tree-item .download-icon:hover {
+    background-color: rgba(40, 167, 69, 0.2);
+    transform: scale(1.1);
+}
+
+.tree-item .key {
+    font-weight: bold;
+    color: #2196F3;
+    margin-right: 8px;
+}
+
+.tree-item .type {
+    color: #999;
+    font-size: 0.9em;
+    margin-right: 8px;
+}
+
+.tree-item .value {
+    color: #333;
+    word-break: break-all;
+}
+
+.tree-item .value.string {
+    color: #4CAF50;
+}
+
+.tree-item .value.number {
+    color: #FF9800;
+}
+
+.tree-item .value.boolean {
+    color: #9C27B0;
+}
+
+.tree-item .value.none {
+    color: #999;
+    font-style: italic;
+}
+
+.tree-children {
+    margin-left: 20px;
+    border-left: 1px solid #ddd;
+    padding-left: 10px;
+    display: none;
+}
+
+.tree-children.expanded {
+    display: block;
+}
+
+.loading {
+    color: #999;
+    font-style: italic;
+}
+
+.error {
+    background-color: #f8d7da;
+    color: #721c24;
+    border: 1px solid #f5c6cb;
+    border-radius: 4px;
+    padding: 12px;
+    margin: 10px 0;
+}
+
+.breadcrumb-container {
+    margin-bottom: 20px;
+    border-bottom: 1px solid #ddd;
+    padding-bottom: 10px;
+}
+
+.breadcrumb {
+    margin-top: 10px;
+    font-size: 14px;
+    color: #666;
+}
+
+/* Dark mode styles */
+body.dark-mode .threads-section {
+    background-color: #2a2a2a;
+    border-color: #444;
+}
+
+body.dark-mode .threads-section h3 {
+    color: #e0e0e0;
+}
+
+body.dark-mode .thread-item {
+    background: #1e1e1e;
+    border-color: #444;
+}
+
+body.dark-mode .thread-header {
+    background-color: #1e1e1e;
+}
+
+body.dark-mode .thread-header:hover {
+    background-color: #333;
+}
+
+body.dark-mode .thread-name {
+    color: #64B5F6;
+}
+
+body.dark-mode .thread-id {
+    color: #999;
+}
+
+body.dark-mode .thread-status {
+    color: #81C784;
+}
+
+body.dark-mode .thread-stack {
+    background-color: #252525;
+    border-top-color: #444;
+}
+
+body.dark-mode .stack-frame {
+    background: #2a2a2a;
+    border-left-color: #64B5F6;
+}
+
+body.dark-mode .frame-file {
+    color: #FFB74D;
+}
+
+body.dark-mode .frame-function {
+    color: #BA68C8;
+}
+
+body.dark-mode .frame-code {
+    background-color: #1a1a1a;
+    border-left-color: #444;
+    color: #e0e0e0;
+}
+
+body.dark-mode .asyncio-tasks {
+    background-color: #1a2332;
+    border-left-color: #64B5F6;
+}
+
+body.dark-mode .asyncio-tasks h4 {
+    color: #64B5F6;
+}
+
+body.dark-mode .asyncio-task {
+    background: #2a2a2a;
+    border-color: #64B5F6;
+}
+
+body.dark-mode .task-name {
+    color: #64B5F6;
+}
+
+body.dark-mode .tree-section {
+    background-color: #2a2a2a;
+    border-color: #444;
+}
+
+body.dark-mode .tree-section h3 {
+    color: #e0e0e0;
+}
+
+body.dark-mode .tree-container {
+    background: #1e1e1e;
+    border-color: #444;
+}
+
+body.dark-mode .tree-item:hover {
+    background-color: #333;
+}
+
+body.dark-mode .tree-item .key {
+    color: #64B5F6;
+}
+
+body.dark-mode .tree-item .type {
+    color: #999;
+}
+
+body.dark-mode .tree-item .value {
+    color: #e0e0e0;
+}
+
+body.dark-mode .tree-item .value.string {
+    color: #81C784;
+}
+
+body.dark-mode .tree-item .value.number {
+    color: #FFB74D;
+}
+
+body.dark-mode .tree-item .value.boolean {
+    color: #BA68C8;
+}
+
+body.dark-mode .tree-item .refresh-icon {
+    color: #64B5F6;
+    background-color: rgba(100, 181, 246, 0.15);
+}
+
+body.dark-mode .tree-item .refresh-icon:hover {
+    background-color: rgba(100, 181, 246, 0.25);
+}
+
+body.dark-mode .tree-item .download-icon {
+    color: #4CAF50;
+    background-color: rgba(76, 175, 80, 0.15);
+}
+
+body.dark-mode .tree-item .download-icon:hover {
+    background-color: rgba(76, 175, 80, 0.25);
+}
+
+body.dark-mode .tree-children {
+    border-left-color: #444;
+}
+
+body.dark-mode .breadcrumb-container {
+    border-bottom-color: #333;
+}
+
+body.dark-mode .error {
+    background-color: #3c2124;
+    color: #f5b5c4;
+    border-color: #662c34;
+}
+</style>
+    """
+
+
+def get_internals_js():
+    """
+    Return JavaScript for the internals page
+    """
+    return """
+<script>
+async function toggleThreadStack(headerElement) {
+    const stackContainer = headerElement.nextElementSibling;
+    const expandIcon = headerElement.querySelector('.expand-icon');
+
+    if (!stackContainer || !stackContainer.classList.contains('thread-stack')) {
+        return;
+    }
+
+    if (stackContainer.classList.contains('expanded')) {
+        // Collapse
+        stackContainer.classList.remove('expanded');
+        stackContainer.classList.add('collapsed');
+        expandIcon.textContent = '+';
+    } else {
+        // Expand
+        stackContainer.classList.remove('collapsed');
+        stackContainer.classList.add('expanded');
+        expandIcon.textContent = '−';
+    }
+}
+
+async function toggleNode(element, path) {
+    const childrenContainer = element.nextElementSibling;
+    const expandIcon = element.querySelector('.expand-icon');
+
+    if (!childrenContainer || !childrenContainer.classList.contains('tree-children')) {
+        return;
+    }
+
+    if (childrenContainer.classList.contains('expanded')) {
+        // Collapse
+        childrenContainer.classList.remove('expanded');
+        expandIcon.textContent = '+';
+    } else {
+        // Expand
+        if (childrenContainer.children.length === 0) {
+            // Load children if not already loaded
+            childrenContainer.innerHTML = '<div class="loading">Loading...</div>';
+
+            try {
+                const response = await fetch(`./api/internals?path=${encodeURIComponent(path)}`);
+                const data = await response.json();
+
+                if (data.success) {
+                    childrenContainer.innerHTML = '';
+                    renderTreeNodes(childrenContainer, data.members, path);
+                } else {
+                    childrenContainer.innerHTML = `<div class="error">${data.error}</div>`;
+                }
+            } catch (error) {
+                childrenContainer.innerHTML = `<div class="error">Error loading: ${error.message}</div>`;
+            }
+        }
+
+        childrenContainer.classList.add('expanded');
+        expandIcon.textContent = '−';
+    }
+}
+
+async function refreshNode(buttonElement, path) {
+    // Find the parent tree-item
+    const treeItem = buttonElement.closest('.tree-item');
+    if (!treeItem) return;
+
+    // Find the children container
+    const childrenContainer = treeItem.nextElementSibling;
+    if (!childrenContainer || !childrenContainer.classList.contains('tree-children')) return;
+
+    // Only refresh if already expanded
+    if (!childrenContainer.classList.contains('expanded')) return;
+
+    // Show loading state
+    childrenContainer.innerHTML = '<div class="loading">Refreshing...</div>';
+
+    try {
+        const response = await fetch(`./api/internals?path=${encodeURIComponent(path)}`);
+        const data = await response.json();
+
+        if (data.success) {
+            childrenContainer.innerHTML = '';
+            renderTreeNodes(childrenContainer, data.members, path);
+        } else {
+            childrenContainer.innerHTML = `<div class="error">${data.error}</div>`;
+        }
+    } catch (error) {
+        childrenContainer.innerHTML = `<div class="error">Error refreshing: ${error.message}</div>`;
+    }
+}
+
+function renderTreeNodes(container, members, basePath) {
+    members.forEach(member => {
+        const itemDiv = document.createElement('div');
+        itemDiv.className = 'tree-item';
+
+        // Use the path provided by the server
+        const path = member.path || (basePath ? `${basePath}.${member.key}` : member.key);
+
+        // Add tooltip showing full path
+        itemDiv.title = path;
+
+        let expandIcon = '';
+        let refreshButton = '';
+        let downloadButton = '';
+        if (member.expandable) {
+            expandIcon = `<span class="expand-icon expandable">+</span>`;
+            // Add refresh button for expandable items
+            const safePathJs = path.replace(/'/g, "\\'");
+            refreshButton = `<button class="refresh-icon" title="Refresh this node" onclick="event.stopPropagation(); refreshNode(this, '${safePathJs}')">🔄</button>`;
+            // Add download button for expandable items
+            const safePathUrl = encodeURIComponent(path);
+            downloadButton = `<a href="./api/internals/download?path=${safePathUrl}" class="download-icon" title="Download as YAML" onclick="event.stopPropagation()">⬇</a>`;
+            itemDiv.onclick = function() { toggleNode(this, path); };
+        } else {
+            expandIcon = `<span class="expand-icon"></span>`;
+        }
+
+        let valueHtml = '';
+        if (!member.expandable && member.value !== undefined) {
+            let valueClass = 'value';
+            if (member.type === 'str') {
+                valueClass += ' string';
+                valueHtml = `<span class="${valueClass}">"${escapeHtml(member.value)}"</span>`;
+            } else if (member.type === 'int' || member.type === 'float') {
+                valueClass += ' number';
+                valueHtml = `<span class="${valueClass}">${member.value}</span>`;
+            } else if (member.type === 'bool') {
+                valueClass += ' boolean';
+                valueHtml = `<span class="${valueClass}">${member.value}</span>`;
+            } else if (member.type === 'NoneType') {
+                valueClass += ' none';
+                valueHtml = `<span class="${valueClass}">None</span>`;
+            } else {
+                valueHtml = `<span class="${valueClass}">${escapeHtml(String(member.value))}</span>`;
+            }
+        }
+
+        itemDiv.innerHTML = `
+            ${expandIcon}
+            ${refreshButton}
+            ${downloadButton}
+            <span class="key">${escapeHtml(member.key)}</span>
+            <span class="type">&lt;${member.type}${member.size !== undefined ? ': ' + member.size + ' items' : ''}&gt;</span>
+            ${valueHtml}
+        `;
+
+        container.appendChild(itemDiv);
+
+        if (member.expandable) {
+            const childrenDiv = document.createElement('div');
+            childrenDiv.className = 'tree-children';
+            container.appendChild(childrenDiv);
+        }
+    });
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+</script>
+    """

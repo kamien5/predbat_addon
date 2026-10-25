@@ -19,6 +19,15 @@ WORKDIR /app_data
 COPY rootfs /
 # COPY ingress.conf /etc/nginx/http.d/
 
+# Pinned Predbat v9.5.0 code (vendored from springfall2008/batpred @ 0cfceaaa, see VENDOR.txt).
+# The build fails if any vendored file does not match MANIFEST.sha256.
+COPY vendor /opt/predbat/vendor
+COPY MANIFEST.sha256 VENDOR.txt /opt/predbat/
+RUN cd /opt/predbat/vendor \
+    && sha256sum --strict -c --quiet ../MANIFEST.sha256 \
+    && test "$(find . -type f | wc -l)" -eq "$(wc -l < ../MANIFEST.sha256)" \
+    && chmod -R a-w /opt/predbat
+
 COPY requirements.txt /tmp/
 RUN pip install --break-system-packages -r /tmp/requirements.txt
 

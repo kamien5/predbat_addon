@@ -1,0 +1,8 @@
+source: https://github.com/springfall2008/batpred
+tag: v9.5.0
+commit: 0cfceaaa719b9ce3de1d10185578feffb008908b
+file_count: 114
+excluded_subdirectories: tests/ config/
+produced_by: tools/vendor_predbat.sh <clone>
+archive_command: git -C <clone> archive --format=tar 0cfceaaa719b9ce3de1d10185578feffb008908b apps/predbat | tar -x -C <tmp>
+verify: cd predbat/vendor && sha256sum -c ../MANIFEST.sha256

@@ -1,0 +1,1198 @@
+# -----------------------------------------------------------------------------
+# Predbat Home Battery System
+# Copyright Trefor Southwell 2026 - All Rights Reserved
+# This application maybe used for personal use only and not for commercial use
+# -----------------------------------------------------------------------------
+# fmt off
+# pylint: disable=consider-using-f-string
+# pylint: disable=line-too-long
+# pylint: disable=attribute-defined-outside-init
+
+
+"""Component registry and lifecycle manager.
+
+Defines COMPONENT_LIST mapping all available components to their classes (as
+"module.ClassName" paths, imported only when the component is enabled - see
+load_component_class()) and configuration requirements, and provides the Components class for
+initialising, starting, stopping, and restarting components in the correct
+phase order. Routes HA events to components based on entity prefix filtering.
+
+Each entry in a component's "args" maps a constructor keyword to the apps.yaml key that
+supplies it ("config"), plus how it is resolved ("required", "required_true", "default",
+"indirect", "config_late_resolve", "shared_config"). Mark an arg "secret": True when its
+value is a credential, so it is redacted from debug dumps, downloads and anything served
+to an AI assistant - see secret_config_names() below for what that covers and, importantly,
+what it deliberately does not.
+
+Mark an entry "inverter": True when the component is somewhere Predbat's Inverter class can
+get its inverter state and controls from. Inverter uses that (via inverter_source_active())
+to tell "a source is configured but has not answered yet" - transient, retry next cycle -
+apart from "no source is configured at all", which is a setup gap that will never resolve.
+Before the tag existed that question was asked as "givtcp_rest or ge_cloud_direct", which
+was simply the two sources that happened to have been wired up when the check was written.
+"""
+
+import importlib
+import traceback
+from datetime import datetime, timezone, timedelta
+import asyncio
+import os
+
+from coordinator import Coordinator
+
+
+def serves_inverter(component):
+    """
+    Whether a component tagged "inverter" is supplying inverter state in this configuration.
+
+    The tag says a component can; a gateway in display only mode, or a GE Cloud Direct set up for
+    the EV charger alone (inverter_source False), does not, so must not make the engine wait for it.
+    """
+    return getattr(component, "gateway_display_only", False) is not True and getattr(component, "inverter_source", True) is not False
+
+
+def load_component_class(component_info):
+    """Import a registry entry's module and return its component class.
+
+    "class" is the dotted "module.ClassName" path rather than the class itself so that a
+    component's module - and everything it imports - is only loaded once the component is
+    actually enabled. Load ML alone pulls in numpy (~13MB and a BLAS thread per core); the
+    inverter and tariff clients between them are another ~7MB that a typical install never
+    uses. Raises ImportError when the module needs a package that is not installed, which
+    is how gateway.py reports a missing protobuf.
+    """
+    module_name, _, class_name = component_info["class"].rpartition(".")
+    return getattr(importlib.import_module(module_name), class_name)
+
+
+COMPONENT_LIST = {
+    "storage": {"class": "storage.StorageComponent", "name": "Storage", "args": {}, "can_restart": True, "phase": 0},
+    "db": {
+        "class": "db_manager.DatabaseManager",
+        "name": "Database Manager",
+        "args": {
+            "db_enable": {"required_true": True, "config": "db_enable"},
+            "db_days": {"required": False, "config": "db_days", "default": 30},
+        },
+        "can_restart": False,
+        "phase": 0,
+    },
+    "ha": {
+        "class": "ha.HAInterface",
+        "name": "Home Assistant Interface",
+        "args": {
+            "ha_url": {"required": False, "config": "ha_url", "default": "http://supervisor/core"},
+            "ha_key": {"required": False, "secret": True, "config": "ha_key", "default": os.environ.get("SUPERVISOR_TOKEN", None)},
+            "db_enable": {"required": False, "config": "db_enable", "default": False},
+            "db_mirror_ha": {"required": False, "config": "db_mirror_ha", "default": False},
+            "db_primary": {"required": False, "config": "db_primary", "default": False},
+        },
+        "can_restart": False,
+        "phase": 0,
+    },
+    "ha_history": {"class": "ha.HAHistory", "name": "Home Assistant History", "args": {}, "can_restart": False, "phase": 0},
+    "web": {
+        "class": "web.WebInterface",
+        "name": "Web Interface",
+        "args": {
+            "web_port": {"required": False, "config": "web_port", "default": 5052},
+        },
+        "phase": 0,
+    },
+    "mcp": {
+        "class": "web_mcp.PredbatMCPServer",
+        "name": "MCP Server",
+        "args": {
+            "mcp_enable": {"required": True, "config": "mcp_enable", "default": False},
+            "mcp_secret": {"required": False, "secret": True, "config": "mcp_secret", "default": "predbat_mcp_secret"},
+            "mcp_port": {"required": False, "config": "mcp_port", "default": 8199},
+        },
+        "phase": 1,
+    },
+    "chat": {
+        "class": "chat.ChatAgent",
+        "name": "AI Chat Agent",
+        "can_restart": True,
+        "phase": 1,
+        # Always started, with no required arguments at all. The Chat tab configures its own
+        # providers - adding one writes apps.yaml - so the component has to be running before any
+        # provider exists, or there is nothing to configure it from. With none configured the tab
+        # shows its setup page and no turn can be sent.
+        #
+        # One argument, because the whole feature is configured by one apps.yaml block. Defaults
+        # live in chat.py beside the code that reads them rather than here, where a dozen entries
+        # said little more than their own names.
+        "args": {
+            "config": {"required": False, "config": "chat"},
+        },
+    },
+    "solar": {
+        "class": "solcast.SolarAPI",
+        "name": "Solar API",
+        "args": {
+            "solcast_host": {"required": False, "config": "solcast_host", "default": "https://api.solcast.com.au/"},
+            "solcast_api_key": {"required": False, "secret": True, "config": "solcast_api_key"},
+            "solcast_sites": {"required": False, "config": "solcast_sites"},
+            "solcast_poll_hours": {"required": False, "config": "solcast_poll_hours", "default": 8.0},
+            "forecast_solar": {"required": False, "config": "forecast_solar", "default": False},
+            "forecast_solar_max_age": {"required": False, "config": "forecast_solar_max_age", "default": 8.0},
+            "forecast_solar_open_meteo_backup": {"required": False, "config": "forecast_solar_open_meteo_backup", "default": False},
+            "forecast_solar_open_meteo_first": {"required": False, "config": "forecast_solar_open_meteo_first", "default": False},
+            "pv_forecast_today": {"required": False, "config": "pv_forecast_today"},
+            "pv_forecast_tomorrow": {"required": False, "config": "pv_forecast_tomorrow"},
+            "pv_forecast_d3": {"required": False, "config": "pv_forecast_d3"},
+            "pv_forecast_d4": {"required": False, "config": "pv_forecast_d4"},
+            "pv_scaling": {"required": False, "config": "pv_scaling", "default": 1.0},
+            "open_meteo_forecast": {"required": False, "config": "open_meteo_forecast", "default": False},
+            "open_meteo_forecast_max_age": {"required": False, "config": "open_meteo_forecast_max_age", "default": 4.0},
+        },
+        "required_or": ["solcast_api_key", "forecast_solar", "pv_forecast_today", "open_meteo_forecast"],
+        "phase": 2,  # Solar component moved to phase 2 so that any Predbat cloud components (such as GEcloud) have been started and initialised pv_today, etc
+    },
+    "gecloud": {
+        "class": "gecloud.GECloudDirect",
+        "name": "GivEnergy Cloud Direct",
+        "inverter": True,
+        "event_filter": "predbat_gecloud_",
+        "args": {
+            "ge_cloud_direct": {
+                "required": False,
+                "default": False,
+                "config": "ge_cloud_direct",
+            },
+            "evc_direct": {
+                "required": False,
+                "default": False,
+                "config": "ge_cloud_evc_direct",
+            },
+            "api_key": {
+                "required": True,
+                "secret": True,
+                "config": "ge_cloud_key",
+            },
+            "automatic": {
+                "required": False,
+                "default": False,
+                "config": "ge_cloud_automatic",
+            },
+            "automatic_evc": {
+                "required": False,
+                "default": False,
+                "config": "ge_cloud_automatic_evc",
+            },
+            "evc_control": {
+                "required": False,
+                "default": False,
+                "config": "ge_cloud_evc_control",
+            },
+            "inverter_control": {
+                "required": False,
+                "default": True,
+                "config": "ge_cloud_inverter_control",
+            },
+        },
+        # ge_cloud_direct monitors the inverter (and EV charger), ge_cloud_evc_direct the EV charger alone
+        "required_or": ["ge_cloud_direct", "evc_direct"],
+        "phase": 1,
+    },
+    "gecloud_data": {
+        "class": "gecloud.GECloudData",
+        "name": "GivEnergy Cloud Data",
+        "args": {
+            "ge_cloud_data": {
+                "required_true": True,
+                "config": "ge_cloud_data",
+            },
+            "ge_cloud_key": {
+                "required": True,
+                "secret": True,
+                "config": "ge_cloud_key",
+            },
+            "ge_cloud_serial": {
+                "config": "ge_cloud_serial",
+                "config_late_resolve": True,
+            },
+            "days_previous": {
+                "required": False,
+                "default": [7],
+                "config": "days_previous",
+                # days_previous is a global load-forecasting setting configured by virtually every
+                # installation regardless of inverter brand, so it must not count towards "did the
+                # user configure GE Cloud Data" - otherwise the missing ge_cloud_data/ge_cloud_key
+                # warning fires for everyone, not just people who tried to enable this component.
+                "shared_config": True,
+            },
+        },
+        "phase": 1,
+    },
+    "octopus": {
+        "class": "octopus.OctopusAPI",
+        "name": "Octopus Energy Direct",
+        "event_filter": "predbat_octopus_",
+        "args": {
+            "key": {
+                "required": True,
+                "secret": True,
+                "config": "octopus_api_key",
+            },
+            "account_id": {
+                "required": True,
+                "secret": True,
+                "config": "octopus_api_account",
+            },
+            "automatic": {
+                "required": False,
+                "default": True,
+                "config": "octopus_automatic",
+            },
+        },
+        "phase": 1,
+    },
+    "ohme": {
+        "class": "ohme.OhmeAPI",
+        "name": "Ohme Charger",
+        "event_filter": "predbat_ohme_",
+        "args": {
+            "email": {
+                "required": True,
+                "secret": True,
+                "config": "ohme_login",
+            },
+            "password": {
+                "required": True,
+                "secret": True,
+                "config": "ohme_password",
+            },
+            "ohme_automatic": {
+                "required": False,
+                "default": False,
+                "config": "ohme_automatic",
+            },
+            "ohme_control": {
+                "required": False,
+                "default": False,
+                "config": "ohme_control",
+            },
+            # Deliberately has no default: unset means "auto-detect from the Octopus component",
+            # which is distinct from an explicit False meaning "never use Ohme for the car slots"
+            "ohme_automatic_octopus_intelligent": {
+                "required": False,
+                "config": "ohme_automatic_octopus_intelligent",
+            },
+        },
+        "phase": 1,
+    },
+    "myenergi": {
+        "class": "myenergi.MyEnergiAPI",
+        "name": "myenergi Zappi/Eddi",
+        "event_filter": "predbat_myenergi_",
+        "args": {
+            "auth_method": {"required": False, "config": "myenergi_auth_method", "default": "direct"},
+            "hub_serial": {"required": False, "secret": True, "config": "myenergi_hub_serial"},
+            "api_key": {"required": False, "secret": True, "config": "myenergi_api_key"},
+            "key": {"required": False, "secret": True, "config": "myenergi_key"},
+            "token_expires_at": {"required": False, "config": "myenergi_token_expires_at"},
+            "token_hash": {"required": False, "secret": True, "config": "myenergi_token_hash"},
+            "automatic": {"required": False, "config": "myenergi_automatic", "default": True},
+            "automatic_zappi": {"required": False, "config": "myenergi_automatic_zappi", "default": True},
+            "automatic_eddi": {"required": False, "config": "myenergi_automatic_eddi", "default": True},
+            "enable_controls": {"required": False, "config": "myenergi_enable_controls", "default": True},
+            "poll_seconds": {"required": False, "config": "myenergi_poll_seconds", "default": 60},
+            "zappi_control": {"required": False, "config": "myenergi_zappi_control", "default": False},
+        },
+        # Gate activation on having at least one auth path — api_key is the direct
+        # transport's local hub credential, key is the cloud transport's access token.
+        # Without this the component would start for every instance since all
+        # individual args are optional to allow either auth mode.
+        # api_key is the direct transport's credential; key (the OAuth access token) and
+        # token_hash (which the refresh chain exchanges for one) are the cloud transport's.
+        # token_hash has to be listed too: a refresh-only OAuth setup carries no key, and
+        # initialize() accepts that, so gating on key alone would never construct it.
+        "required_or": ["api_key", "key", "token_hash"],
+        "phase": 1,
+        "can_restart": True,
+    },
+    "wallbox": {
+        "class": "wallbox.WallboxAPI",
+        "name": "Wallbox Charger",
+        "event_filter": "predbat_wallbox_",
+        "args": {
+            "username": {"required": True, "secret": True, "config": "wallbox_username"},
+            "password": {"required": True, "secret": True, "config": "wallbox_password"},
+            "automatic": {"required": False, "config": "wallbox_automatic", "default": True},
+            "wallbox_control": {"required": False, "config": "wallbox_control", "default": False},
+            "poll_seconds": {"required": False, "config": "wallbox_poll_seconds", "default": 120},
+        },
+        "phase": 1,
+        "can_restart": True,
+    },
+    "hypervolt": {
+        "class": "hypervolt.HypervoltAPI",
+        "name": "Hypervolt Charger",
+        "event_filter": "predbat_hypervolt_",
+        "args": {
+            "username": {"required": True, "secret": True, "config": "hypervolt_username"},
+            "password": {"required": True, "secret": True, "config": "hypervolt_password"},
+            "automatic": {"required": False, "config": "hypervolt_automatic", "default": True},
+            "hypervolt_control": {"required": False, "config": "hypervolt_control", "default": False},
+        },
+        "phase": 1,
+        "can_restart": True,
+    },
+    "fox": {
+        "class": "fox.FoxAPI",
+        "name": "Fox API",
+        "inverter": True,
+        "event_filter": "predbat_fox_",
+        "args": {
+            "key": {
+                "required": True,
+                "secret": True,
+                "config": "fox_key",
+            },
+            "automatic": {
+                "required": False,
+                "default": False,
+                "config": "fox_automatic",
+            },
+            "automatic_ignore_pv": {
+                "required": False,
+                "default": False,
+                "config": "fox_automatic_ignore_pv",
+            },
+            "inverter_sn": {
+                "required": False,
+                "config": "fox_inverter_sn",
+            },
+            "auth_method": {
+                "required": False,
+                "default": "api_key",
+                "config": "fox_auth_method",
+            },
+            "token_expires_at": {
+                "required": False,
+                "config": "fox_token_expires_at",
+            },
+            "token_hash": {
+                "required": False,
+                "secret": True,
+                "config": "fox_token_hash",
+            },
+        },
+        "phase": 1,
+    },
+    "givtcp": {
+        "class": "givtcp.GivTCPComponent",
+        "name": "GivTCP REST",
+        "inverter": True,
+        "event_filter": "predbat_givtcp_",
+        "args": {
+            "rest_urls": {
+                "required": True,
+                "config": "givtcp_rest",
+            },
+            # Defaults True, unlike the other vendors' equivalents: GivTCP's REST API reports the
+            # whole inverter, so there is nothing a user has to supply for auto-config to work, and
+            # the point of setting givtcp_rest is not to then hand-write the entity list. Set it
+            # False to keep control of apps.yaml yourself - the entities are still published.
+            "automatic": {
+                "required": False,
+                "default": True,
+                "config": "givtcp_automatic",
+            },
+        },
+        "phase": 1,
+    },
+    "deye": {
+        "class": "deye.DeyeAPI",
+        "name": "DEYE Cloud",
+        "inverter": True,
+        "event_filter": "predbat_deye_",
+        "args": {
+            "app_id": {"required": False, "secret": True, "config": "deye_app_id"},
+            "app_secret": {"required": False, "secret": True, "config": "deye_app_secret"},
+            # In oauth mode OAuthMixin assigns 'key' straight to access_token (see
+            # oauth_mixin._init_oauth). Predbat.com injects the access token as deye_key;
+            # without this entry it is dropped and DEYE rejects every call as
+            # "auth invalid token".
+            "key": {"required": False, "secret": True, "config": "deye_key"},
+            "username": {"required": False, "secret": True, "config": "deye_username"},
+            "password": {"required": False, "secret": True, "config": "deye_password"},
+            "data_center": {"required": False, "default": "eu", "config": "deye_data_center"},
+            "company_id": {"required": False, "secret": True, "config": "deye_company_id"},
+            "auth_method": {"required": False, "default": "app_credentials", "config": "deye_auth_method"},
+            "token_expires_at": {"required": False, "config": "deye_token_expires_at"},
+            "token_hash": {"required": False, "secret": True, "config": "deye_token_hash"},
+            "inverter_sn": {"required": False, "config": "deye_inverter_sn"},
+            "automatic": {"required": False, "default": False, "config": "deye_automatic"},
+            "automatic_ignore_pv": {"required": False, "default": False, "config": "deye_automatic_ignore_pv"},
+            # config/battery reports capacity in Ah, so it needs a pack voltage to become
+            # kWh. Normally derived from the BMS charge target; this is the escape hatch
+            # for a pack that does not report one.
+            "battery_nominal_voltage": {"required": False, "config": "deye_battery_nominal_voltage"},
+        },
+        # Gate activation on having at least one auth path — app credentials (app_id,
+        # self-hosted add-on) OR an injected SaaS access token (key). Without this the
+        # component would start for every instance since all individual args are
+        # optional to allow either auth mode. Gate on key, not token_hash: the hash is
+        # only a refresh dedup handle, so gating on it starts the component for an
+        # instance that has no usable token and then fails on every API call.
+        "required_or": ["app_id", "key"],
+        "phase": 1,
+    },
+    "sunsynk": {
+        "class": "sunsynk.SunsynkAPI",
+        "name": "Sunsynk Cloud",
+        "inverter": True,
+        "event_filter": "predbat_sunsynk_",
+        "args": {
+            "username": {"required": False, "secret": True, "config": "sunsynk_username"},
+            "password": {"required": False, "secret": True, "config": "sunsynk_password"},
+            # In oauth mode OAuthMixin assigns 'key' straight to access_token (see
+            # oauth_mixin._init_oauth). Predbat.com injects the access token as
+            # sunsynk_key; without this entry it is dropped and every call is rejected.
+            "key": {"required": False, "secret": True, "config": "sunsynk_key"},
+            "region": {"required": False, "default": "sunsynk", "config": "sunsynk_region"},
+            "auth_method": {"required": False, "default": "password", "config": "sunsynk_auth_method"},
+            "token_expires_at": {"required": False, "config": "sunsynk_token_expires_at"},
+            "token_hash": {"required": False, "secret": True, "config": "sunsynk_token_hash"},
+            "inverter_sn": {"required": False, "config": "sunsynk_inverter_sn"},
+            "automatic": {"required": False, "default": False, "config": "sunsynk_automatic"},
+            "automatic_ignore_pv": {"required": False, "default": False, "config": "sunsynk_automatic_ignore_pv"},
+            # On by default, matching solis_control_enable: an inverter component that does
+            # not drive the inverter is not what a user configuring it expects. Set false for
+            # monitoring only - worth doing while the inferred write format is unconfirmed
+            # against live hardware (see the VERIFY@SPIKE notes in sunsynk_const.py).
+            "control_enable": {"required": False, "default": True, "config": "sunsynk_control_enable"},
+            # Battery capacity arrives in amp-hours, so it needs a pack voltage to become
+            # kWh. Normally inferred from the BMS charge target; this is the escape hatch
+            # for a pack that does not report one.
+            "battery_nominal_voltage": {"required": False, "config": "sunsynk_battery_nominal_voltage"},
+        },
+        # Gate activation on having at least one auth path — a username (self-hosted) OR
+        # an injected SaaS access token. Without this the component would start for every
+        # instance, since all individual args are optional to allow either auth mode.
+        "required_or": ["username", "key"],
+        "phase": 1,
+    },
+    "alphaess": {
+        "class": "alphaess.AlphaESSAPI",
+        "name": "AlphaESS Cloud API",
+        "inverter": True,
+        "event_filter": "predbat_alphaess_",
+        "args": {
+            "app_id": {"required": False, "secret": True, "config": "alphaess_app_id"},
+            "app_secret": {"required": False, "secret": True, "config": "alphaess_app_secret"},
+            "inverter_sn": {"required": False, "config": "alphaess_inverter_sn"},
+            "automatic": {"required": False, "default": False, "config": "alphaess_automatic"},
+            "automatic_ignore_pv": {"required": False, "default": False, "config": "alphaess_automatic_ignore_pv"},
+            # On by default, matching sunsynk_control_enable: an inverter component that does
+            # not drive the inverter is not what a user configuring it expects. Set false for
+            # monitoring only. switch.predbat_set_read_only still gates every write.
+            "control_enable": {"required": False, "default": True, "config": "alphaess_control_enable"},
+            # The API reports no battery power limit and no pack current/voltage to derive
+            # one from, so it is estimated from poinv. This is the escape hatch for a user
+            # who knows their pack's real limit.
+            "battery_rate_max": {"required": False, "config": "alphaess_battery_rate_max"},
+            "api_delay": {"required": False, "default": 2.0, "config": "alphaess_api_delay"},
+            "min_write_interval": {"required": False, "default": 300, "config": "alphaess_min_write_interval"},
+        },
+        # Gate activation on having an AppID. Without this the component would start for
+        # every instance, since all individual args are optional.
+        "required_or": ["app_id"],
+        "phase": 1,
+        "can_restart": True,
+    },
+    "hanchu": {
+        "class": "hanchu.HanchuAPI",
+        "name": "Hanchu ESS Cloud API",
+        "inverter": True,
+        "event_filter": "predbat_hanchu_",
+        "args": {
+            # The e-mail address and password the user signs into the Hanchu phone app with. There
+            # is no developer portal and no API key: the app account IS the credential.
+            "account": {"required": False, "secret": True, "config": "hanchu_account"},
+            "password": {"required": False, "secret": True, "config": "hanchu_password"},
+            "inverter_sn": {"required": False, "config": "hanchu_inverter_sn"},
+            "automatic": {"required": False, "default": False, "config": "hanchu_automatic"},
+            "automatic_ignore_pv": {"required": False, "default": False, "config": "hanchu_automatic_ignore_pv"},
+            # On by default, matching alphaess_control_enable and sunsynk_control_enable: an
+            # inverter component that does not drive the inverter is not what a user configuring it
+            # expects. Set false for monitoring only. switch.predbat_set_read_only still gates
+            # every write.
+            "control_enable": {"required": False, "default": True, "config": "hanchu_control_enable"},
+            # The escape hatch for the one genuinely inferred behaviour in this component: nothing
+            # documents which work mode honours the timed slots, so "User-defined" is a deduction.
+            # Set false to write the windows and leave the mode exactly as the user set it.
+            "work_mode_control": {"required": False, "default": True, "config": "hanchu_work_mode_control"},
+            # The API reports no battery power limit directly - it is taken from the charge power
+            # setting's own upper bound. This is the escape hatch for a user who knows their pack's
+            # real limit.
+            "battery_rate_max": {"required": False, "config": "hanchu_battery_rate_max"},
+            # Same idea for the inverter's AC rating, which is taken from the discharge power
+            # setting's upper bound. Hanchu units come in 3.68, 5, 6 and 10 kW.
+            "inverter_limit": {"required": False, "config": "hanchu_inverter_limit"},
+            "api_delay": {"required": False, "default": 1.0, "config": "hanchu_api_delay"},
+            "min_write_interval": {"required": False, "default": 60, "config": "hanchu_min_write_interval"},
+            # Logs every API request and response. Off by default: on, it writes thousands of long
+            # lines a day per device. For a tester proving what hanchu_const.py marks INFERRED.
+            "api_debug": {"required": False, "default": True, "config": "hanchu_api_debug"},
+        },
+        # Gate activation on having an account. Without this the component would start for every
+        # instance, since all individual args are optional.
+        "required_or": ["account"],
+        "phase": 1,
+        "can_restart": True,
+    },
+    "enphase": {
+        "class": "enphase.EnphaseAPI",
+        "name": "Enphase API",
+        "inverter": True,
+        "event_filter": "predbat_enphase_",
+        "args": {
+            "username": {
+                "required": True,
+                "secret": True,
+                "config": "enphase_username",
+            },
+            "password": {
+                "required": True,
+                "secret": True,
+                "config": "enphase_password",
+            },
+            "site_id": {
+                "required": False,
+                "secret": True,
+                "config": "enphase_site_id",
+            },
+            "automatic": {
+                "required": False,
+                "default": False,
+                "config": "enphase_automatic",
+            },
+            "automatic_ignore_pv": {
+                "required": False,
+                "default": False,
+                "config": "enphase_automatic_ignore_pv",
+            },
+        },
+        "phase": 1,
+    },
+    "kraken": {
+        "class": "kraken.KrakenAPI",
+        "name": "Kraken Energy (EDF/E.ON)",
+        "event_filter": "predbat_kraken_",
+        "args": {
+            "provider": {
+                "required": True,
+                "config": "kraken_provider",
+            },
+            "account_id": {
+                "required": True,
+                "secret": True,
+                "config": "kraken_account_id",
+            },
+            "key": {
+                "required": False,
+                "secret": True,
+                "config": "kraken_key",
+            },
+            "email": {
+                "required": False,
+                "secret": True,
+                "config": "kraken_email",
+            },
+            "password": {
+                "required": False,
+                "secret": True,
+                "config": "kraken_password",
+            },
+            "auth_method": {
+                "required": False,
+                "default": "oauth",
+                "config": "kraken_auth_method",
+            },
+            "token_expires_at": {
+                "required": False,
+                "config": "kraken_token_expires_at",
+            },
+            "token_hash": {
+                "required": False,
+                "secret": True,
+                "config": "kraken_token_hash",
+            },
+            "mpan": {
+                "required": False,
+                "secret": True,
+                "config": "kraken_mpan",
+            },
+            "export_account_id": {
+                "required": False,
+                "secret": True,
+                "config": "kraken_export_account_id",
+            },
+            "export_mpan": {
+                "required": False,
+                "secret": True,
+                "config": "kraken_export_mpan",
+            },
+            "base_url": {
+                "required": False,
+                "config": "kraken_base_url",
+            },
+        },
+        "phase": 1,
+    },
+    "alert_feed": {
+        "class": "alertfeed.AlertFeed",
+        "name": "Alert Feed",
+        "event_filter": "predbat_alertfeed_",
+        "args": {
+            "alert_config": {
+                "required": True,
+                "default": {},
+                "config": "alerts",
+            },
+        },
+        "phase": 1,
+    },
+    "carbon": {
+        "class": "carbon.CarbonAPI",
+        "name": "Carbon Intensity API",
+        "args": {
+            "postcode": {"required": True, "config": "carbon_postcode"},
+            "automatic": {"required": False, "config": "carbon_automatic", "default": False},
+        },
+        "phase": 1,
+    },
+    "temperature": {
+        "class": "temperature.TemperatureAPI",
+        "name": "External Temperature API",
+        "args": {
+            "temperature_enable": {"required_true": True, "config": "temperature_enable", "default": False},
+            "temperature_latitude": {"required": False, "config": "temperature_latitude", "default": None},
+            "temperature_longitude": {"required": False, "config": "temperature_longitude", "default": None},
+            "temperature_url": {"required": False, "config": "temperature_url", "default": "https://api.open-meteo.com/v1/forecast?latitude=LATITUDE&longitude=LONGITUDE&hourly=temperature_2m&current=temperature_2m&past_days=28"},
+        },
+        "phase": 1,
+    },
+    "axle": {
+        "class": "axle.AxleAPI",
+        "name": "Axle Energy",
+        "event_filter": "predbat_axle_",
+        "args": {
+            "api_key": {"required": False, "secret": True, "config": "axle_api_key"},
+            "pence_per_kwh": {"required": False, "config": "axle_pence_per_kwh", "default": 100.0},
+            "automatic": {"required": False, "config": "axle_automatic", "default": True},
+            "managed_mode": {"required": False, "config": "axle_managed_mode", "default": False},
+            "site_id": {"required": False, "secret": True, "config": "axle_site_id"},
+            "partner_username": {"required": False, "secret": True, "config": "axle_partner_username"},
+            "partner_password": {"required": False, "secret": True, "config": "axle_partner_password"},
+            "api_base_url": {"required": False, "config": "axle_api_base_url", "default": "https://api.axle.energy"},
+        },
+        "required_or": ["api_key", "managed_mode"],
+        "phase": 1,
+    },
+    "sigenergy": {
+        "class": "sigenergy.SigenergyAPI",
+        "name": "Sigenergy Cloud API",
+        "inverter": True,
+        "event_filter": "predbat_sigenergy_",
+        "args": {
+            "system_id": {"required": True, "secret": True, "config": "sigenergy_system_id"},
+            "app_key": {"required": True, "secret": True, "config": "sigenergy_app_key"},
+            "app_secret": {"required": True, "secret": True, "config": "sigenergy_app_secret"},
+            "base_url": {"required": False, "config": "sigenergy_base_url", "default": "https://openapi-eu.sigencloud.com"},
+            "mqtt_host": {"required": False, "config": "sigenergy_mqtt_host"},
+            "ca_cert": {"required": False, "config": "sigenergy_ca_pem"},
+            "client_cert": {"required": False, "secret": True, "config": "sigenergy_client_pem"},
+            "client_key": {"required": False, "secret": True, "config": "sigenergy_client_key"},
+            "automatic": {"required": False, "config": "sigenergy_automatic", "default": False},
+            "enable_controls": {"required": False, "config": "sigenergy_enable_controls", "default": True},
+        },
+        "phase": 1,
+        "can_restart": True,
+    },
+    "teslemetry": {
+        "class": "teslemetry.TeslemetryAPI",
+        "name": "Tesla Powerwall (Teslemetry)",
+        "inverter": True,
+        "event_filter": "predbat_teslemetry_",
+        "args": {
+            "key": {"required": True, "secret": True, "config": "teslemetry_key"},
+            "site_id": {"required": False, "secret": True, "config": "teslemetry_site_id"},
+            "base_url": {"required": False, "config": "teslemetry_base_url", "default": "https://api.teslemetry.com"},
+            "automatic": {"required": False, "default": False, "config": "teslemetry_automatic"},
+            "tbc_control": {"required": False, "default": True, "config": "teslemetry_tbc_control"},
+            # No default: unset must reach the component as None ("decide from the Powerwall model"), not False
+            "hybrid": {"required": False, "config": "teslemetry_hybrid"},
+            "auth_method": {"required": False, "config": "teslemetry_auth_method", "default": "api_key"},
+            "token_expires_at": {"required": False, "config": "teslemetry_token_expires_at"},
+            "token_hash": {"required": False, "secret": True, "config": "teslemetry_token_hash"},
+        },
+        "phase": 1,
+        "can_restart": True,
+    },
+    "solax": {
+        "class": "solax.SolaxAPI",
+        "name": "SolaX Cloud API",
+        "inverter": True,
+        "event_filter": "predbat_solax_",
+        "args": {
+            "client_id": {"required": True, "secret": True, "config": "solax_client_id"},
+            "client_secret": {"required": True, "secret": True, "config": "solax_client_secret"},
+            "plant_id": {"required": False, "secret": True, "config": "solax_plant_id"},
+            "region": {"required": False, "config": "solax_region", "default": "eu"},
+            "automatic": {"required": False, "config": "solax_automatic", "default": False},
+            "enable_controls": {"required": False, "config": "solax_enable_controls", "default": True},
+            "plant_sn": {
+                "required": False,
+                "config": "solax_plant_sn",
+            },
+        },
+        "phase": 1,
+        "can_restart": True,
+    },
+    "solis": {
+        "class": "solis.SolisAPI",
+        "name": "Solis Cloud API",
+        "inverter": True,
+        "event_filter": "predbat_solis_",
+        "args": {
+            # api_key/api_secret (HMAC) OR auth_method=oauth+access_token must be supplied.
+            "api_key": {"required": False, "secret": True, "config": "solis_api_key"},
+            "api_secret": {"required": False, "secret": True, "config": "solis_api_secret"},
+            "auth_method": {"required": False, "config": "solis_auth_method", "default": "api_key"},
+            "access_token": {"required": False, "secret": True, "config": "solis_access_token"},
+            "token_expires_at": {"required": False, "config": "solis_token_expires_at"},
+            "token_hash": {"required": False, "secret": True, "config": "solis_token_hash"},
+            "inverter_sn": {"required": False, "config": "solis_inverter_sn"},
+            "automatic": {"required": False, "config": "solis_automatic", "default": False},
+            "base_url": {"required": False, "config": "solis_base_url", "default": "https://www.soliscloud.com:13333"},
+            "control_enable": {"required": False, "config": "solis_control_enable", "default": True},
+            "nominal_voltage": {"required": False, "config": "solis_nominal_voltage"},
+        },
+        # Gate activation on having at least one auth path — HMAC (api_key) OR OAuth
+        # (access_token). Without this the component would start for every instance
+        # since all individual args are optional to allow either auth mode.
+        "required_or": ["api_key", "access_token"],
+        "phase": 1,
+        "can_restart": True,
+    },
+    "load_ml": {
+        "class": "load_ml_component.LoadMLComponent",
+        "name": "ML Load Forecaster",
+        "event_filter": "predbat_load_ml_",
+        "args": {
+            "load_ml_enable": {"required_true": True, "config": "load_ml_enable", "default": False},
+            "load_ml_source": {"required": False, "config": "load_ml_source", "default": False},
+            "load_ml_max_days_history": {"required": False, "config": "load_ml_max_days_history", "default": 28},
+            "load_ml_database_days": {"required": False, "config": "load_ml_database_days", "default": 90},
+            "load_ml_retrain_interval_hours": {"required": False, "config": "load_ml_retrain_interval_hours", "default": 2},
+        },
+        "phase": 2,  # Load ML in phase 2 so that any Predbat cloud components (such as GEcloud) have been started and initialised pv_today, etc
+        "can_restart": True,
+    },
+    "gateway": {
+        "class": "gateway.GatewayMQTT",
+        "name": "PredBat Gateway",
+        "inverter": True,
+        "event_filter": "predbat_gateway_",
+        "args": {
+            "gateway_device_id": {"required": True, "secret": True, "config": "gateway_device_id"},
+            "mqtt_host": {"required": True, "config": "gateway_mqtt_host"},
+            "mqtt_port": {"required": False, "config": "gateway_mqtt_port", "default": 8883},
+            "mqtt_token": {"required": True, "secret": True, "config": "gateway_mqtt_token"},
+            "gateway_inverter_serial": {"required": False, "config": "gateway_inverter_serial", "default": None},
+            "gateway_display_enabled": {"required": False, "config": "gateway_display_enabled", "default": True},
+            "gateway_display_visibility": {"required": False, "config": "gateway_display_visibility", "default": None},
+            "gateway_display_only": {"required": False, "config": "gateway_display_only", "default": False},
+            "gateway_live_display": {"required": False, "config": "gateway_live_display", "default": False},
+            "gateway_live_display_binding": {"required": False, "config": "gateway_live_display_binding", "default": None},
+            "gateway_evc_automatic": {"required": False, "config": "gateway_evc_automatic", "default": False},
+            "gateway_evc_control": {"required": False, "config": "gateway_evc_control", "default": False},
+            "gateway_shared_ct": {"required": False, "config": "gateway_shared_ct", "default": True},
+            "gateway_integrate_power": {"required": False, "config": "gateway_integrate_power", "default": False},
+        },
+        "phase": 1,
+        "can_restart": True,
+    },
+}
+
+
+def secret_config_names():
+    """Return every apps.yaml config name the registry flags with "secret": True.
+
+    Feeds utils.is_secret_key(), so redaction covers the credentials its key-name substrings
+    cannot infer: account numbers (octopus_api_account, kraken_account_id), meter point numbers
+    (kraken_mpan), site/system/plant ids, login identifiers (deye_username, kraken_email,
+    ohme_login, myenergi_hub_serial - the digest auth username) and the id half of an
+    id/secret pair (deye_app_id, solax_client_id).
+
+    Device serial numbers are deliberately not flagged: they address hardware rather than
+    authenticate it, and they are what makes an integration bug report diagnosable - the same
+    trade-off SECRET_KEY_EXEMPT_SUFFIXES makes for token expiry times.
+    """
+    names = set()
+    for component_info in COMPONENT_LIST.values():
+        for arg_info in component_info.get("args", {}).values():
+            if isinstance(arg_info, dict) and arg_info.get("secret", False):
+                config = arg_info.get("config", None)
+                if config:
+                    names.add(str(config).lower())
+    return frozenset(names)
+
+
+class Components:
+    """Central component registry and lifecycle manager.
+
+    Initialises, starts, stops, and restarts components in correct phase
+    order. Routes HA events (select, switch, number) to components based
+    on entity prefix filtering.
+    """
+
+    def __init__(self, base):
+        """Create the registry, with an empty component set and its own discovery coordinator.
+
+        The coordinator lives here - never as a PredBat attribute - because create_debug_yaml()
+        dumps every non-excluded member of PredBat.__dict__, and the coordinator holds the raw
+        unredacted reports plus the pseudonym salt. "components" is in DEBUG_EXCLUDE_LIST (as is
+        "coordinator", defensively), so nothing under self.components is dumped automatically at
+        all; create_debug_yaml() instead adds a plain redacted dict via coordinator.catalogue().
+        """
+        self.components = {}
+        self.component_tasks = {}
+        # Why a configured component could not be loaded or constructed, by name. Such a component
+        # stays inactive (get_component() returns None so its users degrade as for a disabled one)
+        # but load_error() lets the status page and health sensor show it as an error.
+        self.component_errors = {}
+        self.base = base
+        self.log = base.log
+        self.coordinator = Coordinator(base)
+
+    def initialize(self, only=None, phase=0):
+        """Initialise components without starting them"""
+        for component_name, component_info in COMPONENT_LIST.items():
+            if only and component_name != only:
+                continue
+            if component_info.get("phase", 0) != phase:
+                continue
+
+            have_all_args = True
+            missing_config = []
+            required_or_config = []
+            self.components[component_name] = None
+            self.component_tasks[component_name] = None
+            self.component_errors.pop(component_name, None)
+
+            # Check required arguments
+            arg_dict = {}
+            for arg, arg_info in component_info["args"].items():
+                required = arg_info.get("required", False)
+                required_true = arg_info.get("required_true", False)
+                default = arg_info.get("default", None)
+                indirect = arg_info.get("indirect", False)
+                config_late_resolve = arg_info.get("config_late_resolve", False)
+                if config_late_resolve:
+                    # Defer resolution of config value until later
+                    arg_dict[arg] = arg_info["config"]
+                    continue
+                elif required_true and not self.base.get_arg(arg_info["config"], False, indirect=False):
+                    have_all_args = False
+                    missing_config.append(f"{arg_info['config']} (must be true)")
+                elif required and self.base.get_arg(arg_info["config"], None, indirect=False) is None:
+                    have_all_args = False
+                    missing_config.append(arg_info["config"])
+                else:
+                    value = self.base.get_arg(arg_info["config"], default, indirect=indirect)
+                    if value is None and default is not None:
+                        # A key present in apps.yaml but empty (a bare "teslemetry_tbc_control:") resolves
+                        # to a YAML null, and get_arg's bool branch only coerces strings - unlike its int
+                        # and float branches it has no None fallback, so the null would be passed straight
+                        # to the component and a registry "default": True would silently not apply (GH#5186).
+                        # An empty value is not a setting, so the registry default stands. Args with no
+                        # declared default keep resolving to None, which is how they signal "not set".
+                        value = default
+                    arg_dict[arg] = value
+            required_or = component_info.get("required_or", [])
+            # If required_or is set we must have at least one of the listed args
+            if required_or:
+                if not any(arg_dict.get(arg, None) for arg in required_or):
+                    have_all_args = False
+                    required_or_config = [component_info["args"][arg]["config"] for arg in required_or]
+            if have_all_args:
+                try:
+                    component_class = load_component_class(component_info)
+                    self.log(f"Initialising {component_info['name']} interface")
+                    self.components[component_name] = component_class(self.base, **arg_dict)
+                    # Overrides the class-name fallback ComponentBase.__init__ set, with the
+                    # registry key report_discovery() should file this component's reports under.
+                    self.components[component_name].component_name = component_name
+                except Exception as e:
+                    # A component that will not import (a missing package, a syntax error) or
+                    # construct must not take Predbat down with it: record why, leave it inactive
+                    # and carry on with the others. It is reported as an error, not as disabled.
+                    self.log(f"Error: Cannot initialise {component_info['name']} interface, {e}")
+                    if not isinstance(e, ImportError):
+                        self.log("Error: " + traceback.format_exc())
+                    self.component_errors[component_name] = str(e)
+                    self.components[component_name] = None
+            else:
+                configured_args = getattr(self.base, "args_from_apps_yaml", None)
+                if configured_args is None:
+                    configured_args = self.base.args
+                component_configured = any(configured_args.get(arg_info["config"]) for arg_info in component_info["args"].values() if not arg_info.get("shared_config", False))
+                if component_configured:
+                    reasons = []
+                    if missing_config:
+                        reasons.append(f"missing required configuration: {', '.join(missing_config)}")
+                    if required_or_config:
+                        reasons.append(f"needs at least one of: {', '.join(required_or_config)}")
+                    self.log(f"Warn: Skipping {component_info['name']} interface, {'; '.join(reasons)}")
+
+    def start(self, only=None, phase=0):
+        """Start all initialised components"""
+        failed = False
+        for component_name, component_info in COMPONENT_LIST.items():
+            if only and component_name != only:
+                continue
+            component = self.components.get(component_name)
+            if component:
+                if component_info.get("phase", 0) != phase:
+                    continue
+                if self.component_tasks.get(component_name, None) and self.component_tasks[component_name].is_alive():
+                    self.log(f"Info: {component_info['name']} interface already started")
+                    continue
+                elif self.component_tasks.get(component_name, None):
+                    self.log(f"Info: {component_info['name']} interface task not alive, restarting")
+                else:
+                    self.log(f"Starting {component_info['name']} interface")
+
+                # Create new task
+                self.component_tasks[component_name] = self.base.create_task(component.start(), name=f"{component_name}_component_task")
+                if not component.wait_api_started():
+                    self.log(f"Error: {component_info['name']} API failed to start")
+                    failed = True
+        return not failed
+
+    async def stop(self, only=None):
+        for component_name, _component_info in reversed(list(self.components.items())):
+            if only and component_name != only:
+                continue
+            component = self.components[component_name]
+            if component:
+                self.log(f"Stopping {component_name} interface")
+                await component.stop()
+                self.log(f"Stopped {component_name} interface")
+                self.component_tasks[component_name] = None
+                self.components[component_name] = None
+
+    async def restart(self, only):
+        """Restart components"""
+        # Check can restart
+        if not self.can_restart(only):
+            self.log(f"Warn: Restarting component {only} is not supported")
+            return
+        self.log(f"Restarting {only} component")
+        await self.stop(only=only)
+        self.log("Waiting 10 seconds before restarting component(s)")
+        await asyncio.sleep(10)
+        self.log(f"Starting component(s) {only} again")
+        self.initialize(only=only, phase=0)
+        self.initialize(only=only, phase=1)
+        self.initialize(only=only, phase=2)
+        for phase in (0, 1, 2):
+            self.start(only=only, phase=phase)
+
+    """
+    Pass through events to the appropriate component
+    """
+
+    def _entity_matches_filter(self, entity_id, event_filter):
+        """
+        Match an incoming HA event's entity_id against a COMPONENT_LIST entry's event_filter.
+
+        Every event_filter literal is written as "predbat_<component>_" for readability
+        (components.py:144 onwards), but the entities themselves are built from the user's
+        configured prefix (self.base.prefix, e.g. Fox's f"{self.prefix}_fox_..."), not the literal
+        word "predbat". Matching the literal directly meant any install with a non-default prefix
+        never matched anything, so no event from any of the 19 components ever reached its
+        handler - entity writes appeared to be accepted (the toggle press logs) but the
+        component's own state never updated, and nothing was ever sent onward to the inverter
+        (#4939). Swap the leading "predbat" for the real prefix before matching instead.
+
+        This is called for every select/switch/number service event in the whole HA instance
+        (userinterface.py's select_event/switch_event/number_event pass every entity_id through,
+        not just Predbat's own), so the match is anchored to the start of the object_id - the
+        part after the domain's "." - rather than a substring search of the whole entity_id.
+        Otherwise a short or common prefix could accidentally match an unrelated entity whose
+        object_id merely contains the same characters partway through: prefix "bat" turns the
+        filter into "bat_fox_", which an unanchored search would also match inside
+        "select.acrobat_fox_...", an entity with nothing to do with this Fox component (#4939
+        review).
+        """
+        if event_filter.startswith("predbat_"):
+            event_filter = self.base.prefix + event_filter[len("predbat") :]
+        _, _, object_id = entity_id.partition(".")
+        return object_id.startswith(event_filter)
+
+    async def select_event(self, entity_id, value):
+        for component_name, component in self.components.items():
+            event_filter = COMPONENT_LIST[component_name].get("event_filter", None)
+            if component and event_filter and self._entity_matches_filter(entity_id, event_filter):
+                await component.select_event(entity_id, value)
+
+    async def switch_event(self, entity_id, service):
+        for component_name, component in self.components.items():
+            event_filter = COMPONENT_LIST[component_name].get("event_filter", None)
+            if component and event_filter and self._entity_matches_filter(entity_id, event_filter):
+                await component.switch_event(entity_id, service)
+
+    async def number_event(self, entity_id, value):
+        for component_name, component in self.components.items():
+            event_filter = COMPONENT_LIST[component_name].get("event_filter", None)
+            if component and event_filter and self._entity_matches_filter(entity_id, event_filter):
+                await component.number_event(entity_id, value)
+
+    def is_all_alive(self):
+        """Check if a component is alive, or check if all are alive"""
+        return all(self.is_alive(name) for name in self.components.keys())
+
+    def is_active(self, name):
+        """Check if a single component is active (initialised)"""
+        if name not in self.components:
+            return False
+        return self.components[name] is not None
+
+    def load_error(self, name):
+        """Why a configured component could not be initialised, or None if it loaded (or is not configured).
+
+        Kept apart from is_alive(): a component that never loaded is inactive, so its users already
+        cope with it as they would a disabled one, and is_all_alive() must not treat it as a dead
+        process to be restarted. It is the status reporting that needs to know the difference.
+        """
+        return self.component_errors.get(name, None)
+
+    def is_alive(self, name):
+        """Check if a single component is alive"""
+        if name not in self.components:
+            return False
+        if not self.components[name]:
+            # Disabled components can be ignored
+            return True
+        # .get rather than []: a component registered outside initialize() (tests register fakes
+        # directly) has no task entry, and that should read as "not yet started", not KeyError.
+        if not self.component_tasks.get(name, None) or not self.component_tasks[name].is_alive():
+            return False
+        if not self.components[name].is_alive():
+            return False
+        last_updated_time = self.last_updated_time(name)
+        diff_time = datetime.now(timezone.utc) - last_updated_time if last_updated_time else None
+        # "is None" rather than falsy: a timedelta of exactly zero is falsy, so a component whose
+        # last success lands on the very microsecond of the check read as dead for that cycle.
+        if diff_time is None or diff_time > timedelta(minutes=60):
+            return False
+        return True
+
+    def last_updated_time(self, name):
+        """Get last successful update time for a component"""
+        if name not in self.components:
+            return None
+        if not self.components[name]:
+            return None
+        if "last_updated_time" not in dir(self.components[name]):
+            return None
+        return self.components[name].last_updated_time()
+
+    def get_active(self):
+        active_components = [name for name, comp in self.components.items() if comp]
+        return active_components
+
+    def get_component(self, name):
+        return self.components.get(name, None)
+
+    def inverter_source_active(self):
+        """
+        Whether any component marked "inverter": True in COMPONENT_LIST is initialised.
+
+        Answers "is Predbat getting its inverter state from a component at all", which is what
+        separates a source that has not answered this cycle - transient, worth retrying - from
+        no source being configured, which no amount of retrying will fix. Deliberately a fleet-wide
+        question rather than a per-inverter one: a component serves whichever inverters it
+        discovered, and Inverter only needs to know whether to keep waiting.
+        """
+        return any(COMPONENT_LIST.get(name, {}).get("inverter", False) and component and serves_inverter(component) for name, component in self.components.items())
+
+    def inverter_source_names(self):
+        """The display names of every active inverter component, for user-facing messages."""
+        return [COMPONENT_LIST[name]["name"] for name, component in self.components.items() if component and COMPONENT_LIST.get(name, {}).get("inverter", False) and serves_inverter(component)]
+
+    def inverter_source_status(self):
+        """
+        Every configured inverter component paired with whether it is currently healthy.
+
+        The name of an inverter type is not much help when nobody chose it: with inverter_type
+        absent from apps.yaml the only thing Predbat can name is the assumed GE default, which on
+        the Solis install in #4990 read as "check the GivEnergy credentials". What the user needs
+        instead is which inverter components they actually have configured and which of those is
+        failing, so a component-level fault is reported as a component-level fault.
+
+        Components that failed to construct are included even though they are inactive, and so
+        absent from inverter_source_names(): a component that never loaded is precisely the one
+        worth telling the user about.
+
+        Current health comes from is_alive() - the same test the dashboard's health reporting
+        already consumes - because count_errors is a lifetime counter that nothing resets (a
+        component that needed retries at boot and then polled cleanly for a week would otherwise
+        be reported "in error" forever), and api_started answers "did run() ever return truthy"
+        rather than "is this serving data now" - the gateway declares itself started on a
+        successful run() with no inverter args set, so it would read OK with no data ever
+        delivered. The lifetime counter is demoted to secondary detail, and only consulted when
+        the component is not currently alive: a retrying startup has counted errors and never
+        started, while api_started-but-stale reads as "not responding". getattr keeps the
+        api_started fallback working for components that predate the flag.
+        """
+        status = []
+        for name, component_info in COMPONENT_LIST.items():
+            if not component_info.get("inverter", False):
+                continue
+            load_error = self.load_error(name)
+            component = self.components.get(name, None)
+            if component and not serves_inverter(component):
+                continue
+            if load_error is not None:
+                state = "failed to start: {}".format(load_error)
+            elif not component:
+                continue
+            elif self.is_alive(name):
+                state = "OK"
+            else:
+                errors = self.get_error_count(name) or 0
+                if errors:
+                    state = "in error, {} error{} so far".format(errors, "s" if errors != 1 else "")
+                elif not getattr(component, "api_started", True):
+                    state = "still starting, no data yet"
+                else:
+                    state = "not responding"
+            status.append("{} ({})".format(component_info["name"], state))
+        return status
+
+    def get_all(self):
+        all_components = [name for name in self.components.keys()]
+        return all_components
+
+    def get_error_count(self, name):
+        """Get error count for a component"""
+        if name not in self.components:
+            return None
+        if not self.components[name]:
+            return None
+        if "get_error_count" not in dir(self.components[name]):
+            return None
+        return self.components[name].get_error_count()
+
+    def can_restart(self, name):
+        """Check if a component can be restarted"""
+        if name not in COMPONENT_LIST:
+            return False
+        return COMPONENT_LIST[name].get("can_restart", True)

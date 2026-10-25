@@ -1,0 +1,210 @@
+syntax = "proto3";
+package predbat;
+
+// Gateway Status Protocol Buffer Schema
+//
+// Schema version: 1
+// This is the canonical contract for ESP32 gateway → cloud MQTT status payloads.
+// Proto3 zero-value omission means unpopulated future fields cost nothing on the wire.
+//
+
+// Mirrors InverterType enum in types.h (values must match 1:1 for safe casting)
+enum InverterType {
+  INVERTER_TYPE_UNKNOWN         = 0;
+  INVERTER_TYPE_SOLIS_HYBRID    = 1;
+  INVERTER_TYPE_SOLIS_AC        = 2;
+  INVERTER_TYPE_SOFAR_G3        = 3;
+  INVERTER_TYPE_GROWATT_SPH     = 4;
+  INVERTER_TYPE_DEYE_SUNSYNK    = 5;
+  INVERTER_TYPE_GIVENERGY       = 6;
+  INVERTER_TYPE_GIVENERGY_EMS   = 7;
+  INVERTER_TYPE_GIVENERGY_GATEWAY = 8;
+  INVERTER_TYPE_ALPHA_ESS       = 9;
+  INVERTER_TYPE_DEMO            = 10;
+  INVERTER_TYPE_CUSTOM          = 11;
+}
+
+message BatteryStatus {
+  uint32 soc_percent     = 1;  // 0-100
+  float  voltage_v       = 2;
+  float  current_a       = 3;  // positive = charging
+  int32  power_w         = 4;  // positive = charging
+  float  temperature_c   = 5;
+  // Future: SunSpec 802-inspired fields (populated when available)
+  uint32 soh_percent     = 6;  // state of health, 0 = not available
+  uint32 cycle_count     = 7;
+  int32  capacity_wh     = 8;  // rated capacity
+  uint32 rate_max_w      = 9;  // max charge/discharge rate in W
+  uint32 depth_of_discharge_pct = 10;  // usable % 0-100 (e.g. 95 = 0.95); 0 = unknown (use 95)
+}
+
+message PvStatus {
+  int32 power_w = 1;
+}
+
+message GridStatus {
+  int32 power_w      = 1;  // positive = exporting to grid, negative = importing
+  // Future: grid quality fields
+  float voltage_v    = 2;  // 0 = not available
+  float frequency_hz = 3;
+}
+
+message LoadStatus {
+  int32 power_w = 1;  // house consumption
+}
+
+message InverterData {
+  int32  active_power_w  = 1;
+  float  temperature_c   = 2;
+  uint32 rate_max_w      = 3;  // inverter AC output power limit in W (from HR(2)); 0 = not available
+}
+
+message ControlStatus {
+  reserved 1;
+  bool   charge_enabled     = 2;
+  bool   discharge_enabled  = 3;
+  uint32 charge_rate_w      = 4;
+  uint32 discharge_rate_w   = 5;
+  uint32 reserve_soc        = 6;  // min SOC %
+  uint32 target_soc         = 7;  // charge target SOC %
+  uint32 force_power_w      = 8;
+  uint32 command_expires    = 9;  // unix timestamp
+  uint32 export_limit_w     = 10; // W — grid port max power output (HR 26); 99999 = not read (unlimited)
+  // Highest reserve % this inverter accepts — PredBat must bound its reserve
+  // target to this (GivEnergy refuses 100, see gateway issue #346). 0 = not
+  // reported (gateway firmware predating this field): assume 100.
+  uint32 reserve_soc_max    = 11;
+}
+
+message ScheduleStatus {
+  uint32 charge_start     = 1;  // HHMM format
+  uint32 charge_end       = 2;
+  uint32 discharge_start  = 3;
+  uint32 discharge_end    = 4;
+}
+
+message EmsSubInverter {
+  uint32 soc       = 1;
+  int32  battery_w = 2;
+  int32  pv_w      = 3;
+  int32  grid_w    = 4;
+  float  temp_c    = 5;
+}
+
+message EmsStatus {
+  uint32 num_inverters      = 1;
+  uint32 total_soc          = 2;
+  int32  total_charge_w     = 3;
+  int32  total_discharge_w  = 4;
+  int32  total_grid_w       = 5;
+  int32  total_pv_w         = 6;
+  int32  total_load_w       = 7;
+  repeated EmsSubInverter sub_inverters = 8;
+}
+
+// Daily energy counters (Wh, reset at midnight, populated from extended poll tier)
+message EnergyCounters {
+  uint32 pv_today_wh              = 1;
+  uint32 grid_import_today_wh     = 2;
+  uint32 grid_export_today_wh     = 3;
+  uint32 battery_charge_today_wh  = 4;
+  uint32 battery_discharge_today_wh = 5;
+  uint32 consumption_today_wh     = 6;
+}
+
+message InverterEntry {
+  InverterType   type      = 1;
+  string         serial    = 2;  // inverter serial (user-facing, from Modbus probe)
+  string         ip        = 3;
+  bool           connected = 4;
+  bool           active    = 5;
+  BatteryStatus  battery   = 6;
+  PvStatus       pv        = 7;
+  GridStatus     grid      = 8;
+  LoadStatus     load      = 9;
+  InverterData   inverter  = 10;
+  ControlStatus  control   = 11;
+  ScheduleStatus schedule  = 12;
+  EmsStatus      ems       = 13;
+  EnergyCounters energy    = 14;  // daily energy counters (populated from extended poll tier)
+  bool           managed   = 15;  // true = accepts commands, false = poll-only
+  bool           primary   = 16;  // true = PredBat should use this inverter for control/config
+  string         dongle_serial = 17;  // WiFi dongle serial (internal, used for Modbus framing)
+  string         model         = 18;  // GivEnergy model class (e.g. "All-in-One", "Hybrid HV Gen3", "AC 3ph", "Gateway") — drives AC-coupled vs hybrid handling in PredBat
+}
+
+// EV charger (OCPP 1.6) state — present only when a charge point is connected
+// to the gateway's local OCPP server. Device-level (not per-inverter).
+message EvCharger {
+  bool   connected         = 1;  // a charge point is connected via OCPP
+  bool   session_active    = 2;  // a charging transaction is in progress
+  string status            = 3;  // OCPP StatusNotification: Available/Charging/Faulted/...
+  int32  power_w           = 4;  // live charging power (Power.Active.Import)
+  uint32 session_energy_wh = 5;  // energy delivered this session
+  uint32 session_secs      = 6;  // session duration in seconds
+  uint32 current_limit_a   = 7;  // charge current limit we set (0 = unknown)
+  uint32 soc_percent       = 8;  // EV battery SoC % (MeterValues 'SoC'); 0 = not reported
+  string charge_point_id   = 9;  // OCPP charge point identity (BootNotification serial)
+  uint32 max_current_a     = 10; // charger's configured max charge current (OCPP GetConfiguration 'ChargeRate'); 0 = unknown
+  uint32 voltage_v         = 11; // live supply voltage (MeterValues 'Voltage'); 0 = not reported
+  string eco_mode          = 12; // OCPP 'EcoMode' config value (e.g. "Eco"/"Boost"); "" = not reported
+}
+
+message GatewayStatus {
+  string   device_id      = 1;
+  uint32   dongle_count   = 2;
+  string   firmware       = 3;
+  uint32   timestamp      = 4;  // unix timestamp
+  uint32   schema_version = 5;  // currently 1
+  repeated InverterEntry inverters = 6;
+  uint32   uptime_seconds   = 7;   // millis() / 1000
+  int32    wifi_rssi_dbm    = 8;   // WiFi.RSSI(), 0 if not connected
+  uint32   free_heap_bytes  = 9;   // ESP.getFreeHeap()
+  uint32   log_level        = 10;  // current setting: 0=NONE..4=DEBUG
+  string        wifi_ip    = 11;   // gateway's own LAN IP (net_localIP(), IPv4 or IPv6) — used by cloud gateway-dns
+  optional bool ev_control = 12;   // present+true = EV-control mesh leader; absent = single/non-elected
+  repeated EvCharger ev_chargers = 13;  // one entry per connected/recent EV charger
+  string wifi_ssid = 14;  // WiFi.SSID() of the currently-connected network, empty if not on WiFi
+
+  // Internal-DRAM health. free_heap_bytes (9) is ESP.getFreeHeap(), which can include
+  // PSRAM and so cannot predict the failures that actually matter: WiFi/lwIP/TLS/AsyncTCP
+  // and every task stack need byte-addressable INTERNAL DRAM specifically. A silent :80 bind failure that
+  // cost a customer two days of EV charging was invisible in field 9 but obvious in
+  // heap_internal_largest — AsyncServer::begin() needs one contiguous PCB allocation.
+  // Report all three so the fleet can be alerted on before a hub loses a service.
+  uint32 heap_internal_free     = 15;  // heap_caps_get_free_size(INTERNAL | 8BIT)
+  uint32 heap_internal_largest  = 16;  // largest contiguous block — the leading indicator
+  uint32 heap_internal_min_free = 17;  // low-water mark since boot
+
+  // Hub-side read-only flag (g_read_only), as actually enforced: write-class
+  // commands rejected and autonomous mode disabled. PredBat mirrors its own
+  // read-only mode here via the set_read_only command, but that is a two-hop
+  // mirror with no other feedback — the ack carries no value, and a hub that was
+  // offline at the transition only catches up on the 30-minute resend. Reporting
+  // the enforced state on every status makes "is this hub actually read-only?"
+  // answerable from the cloud instead of inferred. Absent on older firmware.
+  optional bool read_only = 18;
+}
+
+// Execution plan sent from PredBat cloud to gateway
+// Published to predbat/devices/{id}/schedule as protobuf
+
+message PlanEntry {
+  bool   enabled       = 1;
+  uint32 start_hour    = 2;  // 0-23 (local time, per timezone field)
+  uint32 start_minute  = 3;  // 0-59
+  uint32 end_hour      = 4;  // 0-23
+  uint32 end_minute    = 5;  // 0-59
+  uint32 mode          = 6;  // PlanMode: 0=auto, 1=charge, 2=discharge
+  uint32 power_w       = 7;  // target power
+  uint32 target_soc    = 8;  // target SOC for charge, min SOC for discharge
+  uint32 days_of_week  = 9;  // bitmask: bit 0 = Sunday, bit 6 = Saturday
+  bool   use_native    = 10; // true = write to inverter schedule registers
+}
+
+message ExecutionPlan {
+  uint32 timestamp        = 1;  // when plan was generated (unix epoch)
+  uint32 plan_version     = 2;  // monotonic, gateway skips stale plans
+  string timezone         = 3;  // POSIX TZ rule (e.g. "GMT0BST,M3.5.0/1,M10.5.0") — set by cloud, applied via setenv("TZ")
+  repeated PlanEntry entries = 4;
+}

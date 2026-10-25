@@ -1,0 +1,1854 @@
+# -----------------------------------------------------------------------------
+# Predbat Home Battery System
+# Copyright Trefor Southwell 2026 - All Rights Reserved
+# This application maybe used for personal use only and not for commercial use
+# -----------------------------------------------------------------------------
+# fmt off
+# pylint: disable=consider-using-f-string
+# pylint: disable=line-too-long
+# pylint: disable=attribute-defined-outside-init
+
+
+"""Configuration management and Home Assistant event handling.
+
+Mixin class for loading, validating, and synchronising configuration settings
+between PredBat and Home Assistant. Handles entity creation for switches,
+input_numbers, and select inputs, and routes HA events (state changes,
+service calls) to the appropriate handlers.
+"""
+
+import os
+from datetime import timedelta
+from utils import get_override_time_from_string, mask_secret_args, is_debug_excluded_key, export_limits_from_stored, export_limits_to_stored, is_secret_key, SECRET_MASK, RepeatLogGate
+import functools
+import io
+import itertools
+import json
+import yaml
+import re
+import copy
+from const import (
+    TIME_FORMAT,
+    PREDBAT_MODE_OPTIONS,
+    PREDBAT_MODE_MONITOR,
+    DEBUG_SCHEMA_VERSION,
+    MANUAL_RATE_MAX_MINUTES,
+    MANUAL_TIME_MAX_MINUTES,
+    REPEAT_FULL_LOG_SECONDS,
+)
+from config import APPS_SCHEMA, CONFIG_API_OVERRIDE
+from predbat import THIS_VERSION, THIS_VERSION_DISPLAY
+
+
+# A debug dump is several megabytes of deeply nested YAML and PyYAML's pure-Python parser spends
+# most of a replay's wall-clock on it - about 6s for a 5MB dump. CLoader pairs libyaml's C parser
+# with the very same (unsafe) Constructor that yaml.unsafe_load uses, so the Python-object tags
+# these dumps carry still load, roughly 6x faster. PyYAML is not always built with libyaml, so
+# fall back to the pure-Python loader when the C one is absent. The one difference from
+# yaml.unsafe_load is the RepeatLogGate constructor added below.
+class DebugYamlLoader(getattr(yaml, "CLoader", yaml.UnsafeLoader)):
+    """The loader read_debug_yaml() replays a debug dump with; see construct_empty_log_gate()."""
+
+
+def construct_empty_log_gate(loader, node):
+    """
+    Load any RepeatLogGate in a debug dump as a new, empty gate, without constructing what was dumped.
+
+    From v9.3.8 until #5569, io_slot_log_gate went into every dump that had logged an Intelligent slot
+    list. Its history is keyed by tuples, which the dump wrote as YAML sequences, and a
+    sequence cannot be a dict key on the way back in ("found unhashable key"), so those dumps would
+    not load at all. A replay has no use for which log lines were already written, and that gate
+    always used REPEAT_FULL_LOG_SECONDS, so nothing under the node is read.
+    """
+    return RepeatLogGate(REPEAT_FULL_LOG_SECONDS)
+
+
+DebugYamlLoader.add_constructor("tag:yaml.org,2002:python/object:utils.RepeatLogGate", construct_empty_log_gate)
+DEBUG_YAML_LOADER = DebugYamlLoader
+
+
+class DebugYamlDumper(yaml.Dumper):
+    """
+    yaml.Dumper whose anchor ids are drawn from a counter shared by every dumper writing the same stream.
+
+    dump_debug_yaml() emits the debug dict with one yaml.dump() call per top-level key, and each call
+    gets a fresh Dumper whose anchor numbering restarts at id001. Two keys that each contain an internal
+    alias would then both be labelled &id001, and the file would no longer load as a single document
+    ("found duplicate anchor"). Sharing the counter keeps every anchor in the stream unique.
+    """
+
+    def __init__(self, stream, anchor_ids=None, **kwargs):
+        """anchor_ids is the shared itertools.count(); without one this is a plain yaml.Dumper"""
+        super().__init__(stream, **kwargs)
+        self.anchor_ids = anchor_ids
+
+    def generate_anchor(self, node):
+        """Name the next anchor from the shared counter rather than this dumper's own"""
+        if self.anchor_ids is None:
+            return super().generate_anchor(node)
+        return "id{:03d}".format(next(self.anchor_ids))
+
+
+# An export limit is a (mode, target, power) tuple, and PyYAML tags a tuple as !!python/tuple,
+# which yaml.safe_load refuses - the debug dump is an artefact people attach to bug reports and has
+# to load with plain YAML tooling. Written as an ordinary sequence instead, which is what a reader
+# wants from one anyway. That includes a tuple used as a dict key, and a sequence cannot be a dict
+# key on the way back in ("found unhashable key"), so a tuple-keyed dict must be kept out of the
+# dump - io_slot_log_gate was one (#5569) and is in DEBUG_EXCLUDE_LIST for that reason.
+DebugYamlDumper.add_representer(tuple, lambda dumper, value: dumper.represent_list(list(value)))
+
+
+def dump_debug_yaml(debug, stream):
+    """
+    Write the debug dict to stream as one YAML document, one top-level key at a time.
+
+    yaml.dump() builds a Node object for every scalar in the data before it emits a byte, so dumping
+    the whole dict at once costs around thirty times the size of the output - ~150MB for a typical
+    5MB debug file, which set Predbat's peak memory and left ~30MB of heap fragmentation behind
+    at idle. Dumping per key bounds the node tree by the largest key instead (~20MB here). The
+    output is the same sorted single document; the only difference is that an object shared between
+    two top-level keys is written out twice rather than aliased.
+    """
+    dumper = functools.partial(DebugYamlDumper, anchor_ids=itertools.count(1))
+    for key in sorted(debug):
+        yaml.dump({key: debug[key]}, stream, Dumper=dumper)
+
+
+class UserInterface:
+    """Configuration management and HA event handling mixin.
+
+    Loads, validates, and synchronises configuration settings between
+    PredBat and Home Assistant. Creates entities for switches, input_numbers,
+    and selects. Routes HA events to appropriate handlers.
+    """
+
+    def call_notify(self, message):
+        """
+        Sync wrapper for call_notify
+        """
+        for device in self.notify_devices:
+            self.call_service_wrapper("notify/" + device, message=message)
+        return True
+
+    def call_service_wrapper_stub2(self, service, message):
+        """
+        Stub for 2 arg service wrapper
+        """
+        return self.call_service_wrapper(service, message=message)
+
+    async def async_call_notify(self, message):
+        """
+        Send HA notifications
+        """
+        for device in self.notify_devices:
+            await self.run_in_executor(self.call_service_wrapper_stub2, "notify/" + device, message)
+        return True
+
+    def resolve_arg(self, arg, value, default=None, indirect=True, combine=False, attribute=None, index=None, extra_args=None, quiet=False, required_unit=None):
+        """
+        Resolve argument templates and state instances
+        """
+        if isinstance(value, list) and (index is not None):
+            if index < len(value):
+                value = value[index]
+            else:
+                if not quiet:
+                    self.log("Warn: Out of range index {} within item {} value {}".format(index, arg, value))
+                value = None
+            index = None
+
+        if index and value is not None:
+            self.log("Warn: item {} is incorrectly setup, element {} has value {}".format(arg, index, value))
+
+        # If we have a list of items get each and add them up or return them as a list
+        if isinstance(value, list):
+            if combine:
+                final = 0
+                for item in value:
+                    # Convert each entry before summing: one sensor in kW among values in W would otherwise be added as W
+                    got = self.resolve_arg(arg, item, default=default, indirect=True, required_unit=required_unit)
+                    try:
+                        final += float(got)
+                    except (ValueError, TypeError):
+                        if not quiet:
+                            self.log("Warn: Return bad value {} from {} arg {}".format(got, item, arg))
+                            self.record_status("Warn: Return bad value {} from {} arg {}".format(got, item, arg), had_errors=True)
+                return final
+            else:
+                final = []
+                for item in value:
+                    item = self.resolve_arg(arg, item, default=default, indirect=indirect)
+                    if isinstance(item, list):
+                        final += item
+                    else:
+                        final.append(item)
+                return final
+
+        # Resolve templated data
+        for _repeat in range(2):
+            if isinstance(value, str) and "{" in value:
+                try:
+                    if extra_args:
+                        # Remove duplicates or format will fail
+                        arg_hash = {}
+                        arg_hash.update(self.args)
+                        arg_hash.update(extra_args)
+                        value = value.format(**arg_hash)
+                    else:
+                        value = value.format(**self.args)
+                except KeyError:
+                    if not quiet:
+                        self.log("Warn: can not resolve {} value {}".format(arg, value))
+                    value = default
+
+        # Resolve join list by name
+        if isinstance(value, str) and value.startswith("+[") and value.endswith("]"):
+            value = self.get_arg(value[2:-1], default=default, indirect=indirect, combine=False, attribute=attribute, index=index)
+
+        # Resolve indirect instance
+        if indirect and isinstance(value, str) and "." in value:
+            if "$" in value:
+                value, attribute = value.split("$")
+
+            if attribute:
+                value = self.get_state_wrapper(entity_id=value, default=default, attribute=attribute, required_unit=required_unit)
+            else:
+                value = self.get_state_wrapper(entity_id=value, default=default, required_unit=required_unit)
+        return value
+
+    def set_arg(self, arg, value, index=None):
+        """
+        Argument setter that can use HA state as well as fixed values
+        Parameters:
+        arg (str): The argument name to set.
+        value: The value to set for the argument, or None to delete it
+        Returns:
+        None
+        """
+        if value is None:
+            if arg in self.args:
+                del self.args[arg]
+        else:
+            if index is not None:
+                if arg not in self.args:
+                    self.args[arg] = []
+                while len(self.args[arg]) <= index:
+                    self.args[arg].append(None)
+                self.args[arg][index] = value
+            else:
+                self.args[arg] = value
+        # A credential value or the redact_strings/redact_strings_labelled denylists themselves
+        # can change here, so log()'s cached redaction pattern (log_secrets.py) must be rebuilt on next
+        # use - otherwise a newly added/changed secret keeps leaking into the log under the stale
+        # pattern until Predbat restarts (GH#4770 review).
+        self._invalidate_log_secret_pattern()
+
+    def get_arg(self, arg, default=None, indirect=True, combine=False, attribute=None, index=None, domain=None, can_override=True, required_unit=None):
+        """
+        Argument getter that can use HA state as well as fixed values
+        """
+        value = None
+        if can_override:
+            can_override = CONFIG_API_OVERRIDE.get(arg, False)
+
+        if can_override:
+            overrides = self.get_manual_api(arg)
+            if isinstance(default, list):
+                value = self.get_arg(arg, default=default, indirect=indirect, combine=combine, attribute=attribute, index=index, domain=domain, can_override=False)
+                is_dict_list = self.is_multi_instance_override(arg)
+                for override in overrides:
+                    # dict_list index only dedupes at write time, it has no output position (#4405)
+                    if is_dict_list:
+                        value.append(override.get("value", None))
+                        self.log("Note: API Overridden arg {} value {} appended".format(arg, value))
+                        continue
+                    override_index = override.get("index", 0)
+                    if override_index is None:
+                        override_index = 0
+                    for idx in range(max(len(value), override_index + 1)):
+                        if override_index == idx:
+                            if len(value) <= idx:
+                                # Extend length of value list to match index
+                                value.extend([default] * (idx - len(value) + 1))
+                            org_value = value[idx]
+                            value[idx] = override.get("value", None)
+                            if isinstance(org_value, float):
+                                try:
+                                    value[idx] = float(value[idx])
+                                except (ValueError, TypeError):
+                                    self.log("Warn: Return bad float value {} from {} override using default {}".format(value[idx], arg, default))
+                                    self.record_status("Warn: Return bad float value {} from arg override {}".format(value[idx], arg), had_errors=True)
+                                    value[idx] = default
+                            elif isinstance(org_value, int) and not isinstance(org_value, bool):
+                                try:
+                                    value[idx] = int(float(value[idx]))
+                                except (ValueError, TypeError):
+                                    self.log("Warn: Return bad int value {} from {} override using default {}".format(value[idx], arg, default))
+                                    self.record_status("Warn: Return bad int value {} from arg override {}".format(value[idx], arg), had_errors=True)
+                                    value[idx] = default
+                            elif isinstance(org_value, bool) and isinstance(value[idx], str):
+                                # Convert to Boolean
+                                if value[idx].lower() in ["on", "true", "yes", "enabled", "enable", "connected"]:
+                                    value[idx] = True
+                                else:
+                                    value[idx] = False
+                            self.log("Note: API Overridden arg {} value {} index {}".format(arg, value, idx))
+                if index:
+                    if index < len(value):
+                        value = value[index]
+                    else:
+                        self.log("Warn: Out of range index {} within item {} value {}".format(index, arg, value))
+                        value = None
+            elif overrides:
+                for override in overrides:
+                    override_index = override.get("index", 0)
+                    if override_index is None:
+                        override_index = 0
+                    if override_index == index:
+                        value = override.get("value", value)
+                        self.log("Note: API Overridden arg {} value {}".format(arg, value))
+                        break
+
+        # Get From HA config (not for domain specific which are apps.yaml options only)
+        if value is None and not domain:
+            value, default = self.get_ha_config(arg, default)
+
+        # Resolve locally if no HA config
+        if value is None:
+            if (arg not in self.args) and (default is not None) and (index is not None):
+                # Allow default to apply to all indices if there is not config item set
+                index = None
+            if domain:
+                value = self.args.get(domain, {}).get(arg, default)
+            else:
+                value = self.args.get(arg, default)
+            value = self.resolve_arg(arg, value, default=default, indirect=indirect, combine=combine, attribute=attribute, index=index, required_unit=required_unit)
+
+        if isinstance(default, float):
+            # Convert to float?
+            if value is None:
+                # Nothing resolved - not configured, or an out-of-range index on a per-inverter list
+                # (resolve_arg has already logged "Out of range index ..."). That is exactly what the
+                # caller's default is for, so apply it quietly rather than reporting an error: flagging
+                # it pins the warning on the status sensor and ends every run as "Read-Only with Errors"
+                # for a gap the caller already handles. A value that is present but unparseable is a
+                # genuine fault and is still reported below.
+                value = default
+            else:
+                try:
+                    value = float(value)
+                except (ValueError, TypeError):
+                    self.log("Warn: Return bad float value {} from {} using default {}".format(value, arg, default))
+                    self.record_status("Warn: Return bad float value {} from {}".format(value, arg), had_errors=True)
+                    value = default
+        elif isinstance(default, int) and not isinstance(default, bool):
+            # Convert to int?
+            if value is None:
+                # See the float case above - a missing value is what the default is for, not an error
+                value = default
+            else:
+                try:
+                    value = int(float(value))
+                except (ValueError, TypeError):
+                    self.log("Warn: Return bad int value {} from {} using default {}".format(value, arg, default))
+                    self.record_status("Warn: Return bad int value {} from {}".format(value, arg), had_errors=True)
+                    value = default
+        elif isinstance(default, bool) and isinstance(value, str):
+            # Convert to Boolean
+            if value.lower() in ["on", "true", "yes", "enabled", "enable", "connected"]:
+                value = True
+            else:
+                value = False
+        elif isinstance(default, list):
+            # Convert to list?
+            if not isinstance(value, list):
+                value = [value]
+
+        return value
+
+    async def select_event(self, event, data, kwargs):
+        """
+        Catch HA Input select updates
+
+        Parameters:
+        - event: The event triggered by the input select.
+        - data: The data associated with the event.
+        - kwargs: Additional keyword arguments.
+
+        Returns:
+        None
+
+        Description:
+        This method is used to handle Home Assistant input select updates.
+        It extracts the necessary information from the data and performs different actions based on the selected option.
+        The actions include calling update service, saving and restoring settings, performing manual selection, and exposing configuration.
+        After performing the actions, it triggers an update by setting update_pending flag to True and plan_valid flag to False.
+        """
+        service_data = data.get("service_data", {})
+        value = service_data.get("option", None)
+        entities = service_data.get("entity_id", [])
+
+        # Can be a string or an array
+        if isinstance(entities, str):
+            entities = [entities]
+
+        for entity_id in entities:
+            await self.components.select_event(entity_id, value)
+
+        for item in self.CONFIG_ITEMS:
+            if ("entity" in item) and (item["entity"] in entities):
+                entity = item["entity"]
+                self.log("select_event: {}, {} = {}".format(item["name"], entity, value))
+                if item["name"] == "update":
+                    self.log("Calling update service for {}".format(value))
+                    await self.async_download_predbat_version(value)
+                elif item["name"] == "saverestore":
+                    if value == "save current":
+                        await self.async_update_save_restore_list()
+                        await self.async_save_settings_yaml()
+                    elif value == "restore default":
+                        await self.async_restore_settings_yaml(None)
+                    else:
+                        await self.async_restore_settings_yaml(value)
+                elif item.get("manual") or item.get("manual_rate"):
+                    await self.async_manual_select(item["name"], value)
+                elif item.get("api"):
+                    await self.async_api_select(item["name"], value)
+                else:
+                    if item.get("value", None) != value:
+                        await self.async_expose_config(item["name"], value, event=True)
+                self.update_pending = True
+                self.plan_valid = False
+
+    async def number_event(self, event, data, kwargs):
+        """
+        Catch HA Input number updates
+
+        This method is called when there is an update to a Home Assistant input number entity.
+        It extracts the value and entity ID from the event data and processes it accordingly.
+        If the entity ID matches any of the entities specified in the CONFIG_ITEMS list,
+        it logs the entity and value, exposes the configuration item, and updates the pending plan.
+
+        Args:
+            event (str): The event name.
+            data (dict): The event data.
+            kwargs (dict): Additional keyword arguments.
+
+        Returns:
+            None
+        """
+        service_data = data.get("service_data", {})
+        value = service_data.get("value", None)
+        entities = service_data.get("entity_id", [])
+
+        # Can be a string or an array
+        if isinstance(entities, str):
+            entities = [entities]
+
+        for entity_id in entities:
+            await self.components.number_event(entity_id, value)
+
+        for item in self.CONFIG_ITEMS:
+            if ("entity" in item) and (item["entity"] in entities):
+                entity = item["entity"]
+                if item.get("value", None) != value:
+                    self.log("number_event: {} = {}".format(entity, value))
+                    await self.async_expose_config(item["name"], value, event=True)
+                    self.update_pending = True
+                    self.plan_valid = False
+
+    async def watch_event(self, entity, attribute, old, new, kwargs):
+        """
+        Catch HA state changes for watched entities
+        """
+        self.log("Watched event: {} = {} will trigger re-plan".format(entity, new))
+        self.update_pending = True
+        self.plan_valid = False
+
+    async def switch_event(self, event, data, kwargs):
+        """
+        Catch HA Switch toggle
+
+        This method is called when a Home Assistant switch is toggled. It handles the logic for updating the state of the switch
+        and triggering any necessary actions based on the switch state.
+
+        Parameters:
+        - event (str): The event triggered by the switch toggle.
+        - data (dict): Additional data associated with the event.
+        - kwargs (dict): Additional keyword arguments.
+
+        Returns:
+        - None
+
+        """
+        service = data.get("service", None)
+        service_data = data.get("service_data", {})
+        entities = service_data.get("entity_id", [])
+
+        # Can be a string or an array
+        if isinstance(entities, str):
+            entities = [entities]
+
+        for entity_id in entities:
+            await self.components.switch_event(entity_id, service)
+
+        for item in self.CONFIG_ITEMS:
+            if ("entity" in item) and (item["entity"] in entities):
+                value = item["value"]
+                entity = item["entity"]
+
+                if service == "turn_on":
+                    value = True
+                elif service == "turn_off":
+                    value = False
+                elif service == "toggle" and isinstance(value, bool):
+                    value = not value
+
+                # Check if value has changed
+                if item.get("value", None) != value:
+                    self.log("switch_event: {} = {}".format(entity, value))
+                    await self.async_expose_config(item["name"], value, event=True)
+                    self.update_pending = True
+                    self.plan_valid = False
+
+    def get_ha_config(self, name, default):
+        """
+        Get Home assistant config value, use default if not set
+
+        Parameters:
+        name (str): The name of the config value to retrieve.
+        default: The default value to use if the config value is not set.
+
+        Returns:
+        value: The value of the config if it is set, otherwise the default value.
+        default: The default value passed as an argument.
+        """
+        item = self.config_index.get(name)
+        if item and item["name"] == name:
+            enabled = self.user_config_item_enabled(item)
+            if enabled:
+                value = item.get("value", None)
+            else:
+                value = None
+            if default is None:
+                default = item.get("default", None)
+                if item.get("type") == "input_number" and isinstance(default, int) and not isinstance(default, bool):
+                    # This default is not just a fallback for a missing value - get_arg() (the only
+                    # caller that reaches here with default=None) applies a further type coercion to
+                    # whatever value this function returns, keyed on the *type* of this default,
+                    # regardless of whether that returned value is this default or the item's real
+                    # configured value. So an int default doesn't just risk supplying an int when
+                    # unset - it forces every read of this item back to an int even when the user has
+                    # genuinely configured a fractional one, via get_arg's int(float(value)) (#4296:
+                    # metric_battery_cycle's real, present, correctly-resolved 0.5 was still coerced
+                    # to 0 downstream, purely because its default happened to be the int 0). Normalise
+                    # here, at the source, so it can't matter which literal a future item's "default"
+                    # happens to be written as.
+                    step = item.get("step", 1)
+                    if isinstance(step, float) and step != int(step):
+                        default = float(default)
+            if value is None:
+                value = default
+            return value, default
+        return None, default
+
+    def convert_currency_unit(self, unit):
+        """
+        Convert a config item unit string (using the default £/p symbols) into the
+        user's configured currency symbols so displayed units match the rates.
+        """
+        if not unit:
+            return unit
+        major = self.currency_symbols[0] if self.currency_symbols and len(self.currency_symbols) > 0 else "£"
+        minor = self.currency_symbols[1] if self.currency_symbols and len(self.currency_symbols) > 1 else "p"
+        unit = unit.replace("£", "%%CURR_MAJOR%%").replace("p", minor).replace("%%CURR_MAJOR%%", major)
+        return unit
+
+    async def async_expose_config(self, name, value, quiet=True, event=False, force=False, in_progress=False):
+        return await self.run_in_executor(self.expose_config, name, value, quiet, event, force, in_progress)
+
+    def expose_config(self, name, value, quiet=True, event=False, force=False, in_progress=False, force_ha=False):
+        """
+        Share the config with HA
+        """
+        item = self.config_index.get(name, None)
+        if item:
+            enabled = self.user_config_item_enabled(item)
+            if not enabled:
+                item["value"] = None
+            else:
+                entity = item.get("entity")
+                has_changed = ((item.get("value", None) is None) or (value != item.get("value", None))) or force
+                if entity and (has_changed or force_ha):
+                    if has_changed and item.get("reset_inverter", False):
+                        self.inverter_needs_reset = True
+                        self.log("Set reset inverter true due to reset_inverter on item {}".format(name))
+                    if has_changed and item.get("reset_inverter_force", False):
+                        self.inverter_needs_reset = True
+                        self.log("Set reset inverter true due to reset_inverter_force on item {}".format(name))
+                        if event and item.get("value", None) is not None:
+                            self.inverter_needs_reset_force = name
+                            self.log("Set reset inverter force true due to reset_inverter_force on item {}".format(name))
+                    item["value"] = value
+                    if item["type"] == "input_number":
+                        """INPUT_NUMBER"""
+                        icon = item.get("icon", "mdi:numeric")
+                        unit = self.convert_currency_unit(item["unit"])
+                        self.set_state_wrapper(
+                            entity_id=entity,
+                            state=value,
+                            attributes={
+                                "friendly_name": item["friendly_name"],
+                                "min": item["min"],
+                                "max": item["max"],
+                                "step": item["step"],
+                                "unit_of_measurement": unit,
+                                "icon": icon,
+                            },
+                        )
+                    elif item["type"] == "switch":
+                        """SWITCH"""
+                        icon = item.get("icon", "mdi:light-switch")
+                        self.set_state_wrapper(entity_id=entity, state=("on" if value else "off"), attributes={"friendly_name": item["friendly_name"], "icon": icon})
+                    elif item["type"] == "select":
+                        """SELECT"""
+                        icon = item.get("icon", "mdi:format-list-bulleted")
+                        if value is None:
+                            value = item.get("default", "")
+                        options = item["options"]
+                        if value not in options:
+                            options.append(value)
+                        old_state = self.get_state_wrapper(entity_id=entity)
+                        if old_state and old_state != value:
+                            self.set_state_wrapper(entity_id=entity, state=old_state, attributes={"friendly_name": item["friendly_name"], "options": options, "icon": icon})
+                        self.set_state_wrapper(entity_id=entity, state=value, attributes={"friendly_name": item["friendly_name"], "options": options, "icon": icon})
+                    elif item["type"] == "update":
+                        """UPDATE"""
+                        summary = self.releases.get("latest_body", "")
+                        latest = self.releases.get("latest", "check HACS")
+                        state = "off"
+                        if item["installed_version"] != latest:
+                            state = "on"
+                        self.set_state_wrapper(
+                            entity_id=entity,
+                            state=state,
+                            attributes={
+                                "friendly_name": item["friendly_name"],
+                                "title": item["title"],
+                                "in_progress": in_progress,
+                                "auto_update": True,
+                                "installed_version": item["installed_version"],
+                                "latest_version": latest,
+                                "entity_picture": item["entity_picture"],
+                                "release_url": item["release_url"],
+                                "release_summary": summary,
+                                "skipped_version": None,
+                                "supported_features": 1,
+                            },
+                        )
+
+    def user_config_item_enabled(self, item):
+        """
+        Check if user config item is enable
+        """
+        enable = item.get("enable", None)
+        enable_condition = item.get("enable_condition", None)
+        enabled = True
+
+        if enable:
+            enabled_value = self.get_arg(enable, default=False)
+            if enable_condition:
+                # Evaluate the condition in python
+                try:
+                    # Use eval to evaluate the condition
+                    enabled = eval(enable_condition, {"__builtins__": None}, {enable: enabled_value})
+                except Exception as e:
+                    self.log("Warn: Enable to evaluate enable condition for item {} - '{}': {}".format(item, enable_condition, e))
+                    enabled = False
+                return enabled
+            else:
+                enabled = True if enabled_value else False
+
+        return enabled
+
+    async def async_update_save_restore_list(self):
+        return await self.run_in_executor(self.update_save_restore_list)
+
+    def update_save_restore_list(self):
+        """
+        Update list of current Predbat settings
+        """
+        global PREDBAT_SAVE_RESTORE
+        self.save_restore_dir = self.config_root + "/predbat_save"
+
+        if not os.path.exists(self.save_restore_dir):
+            os.mkdir(self.save_restore_dir)
+
+        PREDBAT_SAVE_RESTORE = ["save current", "restore default"]
+        for root, _dirs, files in os.walk(self.save_restore_dir):
+            for name in files:
+                filepath = os.path.join(root, name)
+                if filepath.endswith(".yaml") and not name.startswith("."):
+                    PREDBAT_SAVE_RESTORE.append(name)
+        item = self.config_index.get("saverestore", None)
+        item["options"] = PREDBAT_SAVE_RESTORE
+        self.expose_config("saverestore", None)
+
+    async def async_restore_settings_yaml(self, filename):
+        """
+        Restore settings from YAML file
+        """
+        self.save_restore_dir = self.config_root + "/predbat_save"
+
+        # Create full hierarchical version of filepath to write to the logfile
+        filepath_p = self.config_root_p + "/predbat_save"
+
+        if filename != "previous.yaml":
+            await self.async_save_settings_yaml("previous.yaml")
+
+        if not filename:
+            self.log("Restore settings to default")
+            for item in self.CONFIG_ITEMS:
+                if (item["value"] != item.get("default", None)) and item.get("restore", True):
+                    self.log("Restore setting: {} = {} (was {})".format(item["name"], item["default"], item["value"]))
+                    await self.async_expose_config(item["name"], item["default"], event=True)
+            if self.get_arg("set_system_notify"):
+                await self.async_call_notify(f"{self.prefix.capitalize()} settings restored from default")
+        else:
+            filepath = os.path.join(self.save_restore_dir, filename)
+            if os.path.exists(filepath):
+                filepath_p = filepath_p + "/" + filename
+
+                self.log("Restore settings from {}".format(filepath_p))
+                with open(filepath, "r") as file:
+                    settings = yaml.safe_load(file)
+                    for item in settings:
+                        current = self.config_index.get(item["name"], None)
+                        if current and (current["value"] != item["value"]) and current.get("restore", True):
+                            self.log("Restore setting: {} = {} (was {})".format(item["name"], item["value"], current["value"]))
+                            await self.async_expose_config(item["name"], item["value"], event=True)
+                if self.get_arg("set_system_notify"):
+                    await self.async_call_notify(f"{self.prefix.capitalize()} settings restored from {filename}")
+        await self.async_expose_config("saverestore", None)
+
+    def load_current_config(self):
+        """
+        Load the current configuration from a json file
+        """
+        if self.ha_interface.db_primary:
+            # No need to save/restore config from a file if we are using the database
+            return
+
+        filepath = self.config_root + "/predbat_config.json"
+        if os.path.exists(filepath):
+            with open(filepath, "r") as file:
+                try:
+                    settings = json.load(file)
+                except json.JSONDecodeError:
+                    self.log("Warn: Failed to load Predbat settings from {}".format(filepath))
+                    return
+
+                for name in settings:
+                    current = self.config_index.get(name, None)
+                    if not current:
+                        for item in self.CONFIG_ITEMS:
+                            if item.get("oldname", "") == name:
+                                self.log("Restore setting from old name {} to new name {}".format(name, item["name"]))
+                                current = item
+                    if current:
+                        item_value = settings[name]
+                        if current.get("value", None) != item_value:
+                            # self.log("Restore saved setting: {} = {} (was {})".format(name, item_value, current.get("value", None)))
+                            current["value"] = item_value
+
+    def save_current_config(self):
+        """
+        Saves the currently defined configuration to a json file
+        """
+        if self.ha_interface.db_primary:
+            # No need to save/restore config from a file if we are using the database
+            return
+
+        filepath = self.config_root + "/predbat_config.json"
+
+        # Create full hierarchical version of filepath to write to the logfile
+        filepath_p = self.config_root_p + "/predbat_config.json"
+
+        save_array = {}
+        for item in self.CONFIG_ITEMS:
+            if item.get("save", True):
+                if item.get("value", None) is not None:
+                    save_array[item["name"]] = item["value"]
+        # One setting per line, so the file can be read and diffed (e.g. kept in git)
+        with open(filepath, "w") as file:
+            json.dump(save_array, file, indent=2)
+            file.write("\n")
+        self.log("Saved current settings to {}".format(filepath_p))
+
+    async def async_save_settings_yaml(self, filename=None):
+        """
+        Save current Predbat settings
+        """
+        self.save_restore_dir = self.config_root + "/predbat_save"
+        filepath_p = self.config_root_p + "/predbat_save"
+
+        if not filename:
+            filename = self.now_utc.strftime("%y_%m_%d_%H_%M_%S")
+            filename += ".yaml"
+        filepath = os.path.join(self.save_restore_dir, filename)
+        filepath_p = filepath_p + "/" + filename
+
+        with open(filepath, "w") as file:
+            yaml.dump(self.CONFIG_ITEMS, file)
+        self.log("Saved Predbat settings to {}".format(filepath_p))
+        if self.get_arg("set_system_notify"):
+            await self.async_call_notify(f"{self.prefix.capitalize()} settings saved to {filename}")
+
+    def read_debug_yaml(self, filename):
+        """
+        Read debug yaml - used for debugging scenarios not for the main code
+        """
+        debug = {}
+        if os.path.exists(filename):
+            with open(filename, "r") as file:
+                debug = yaml.load(file, Loader=DEBUG_YAML_LOADER)
+        else:
+            self.log("Warn: Debug file {} not found".format(filename))
+            return
+
+        schema_version = debug.get("debug_schema_version", 0)
+        if schema_version > DEBUG_SCHEMA_VERSION:
+            self.log("Warn: Debug file {} was written by a newer Predbat (schema {} > {}) - replaying it may misread fields that have changed shape".format(filename, schema_version, DEBUG_SCHEMA_VERSION))
+
+        for key in debug:
+            if key == "debug_schema_version":
+                continue
+            if key not in ["CONFIG_ITEMS", "inverters"]:
+                self.__dict__[key] = copy.deepcopy(debug[key])
+            if key == "inverters":
+                new_inverters = []
+                for inverter in debug[key]:
+                    inverter_obj = copy.deepcopy(self.inverters[0])
+                    for key in inverter:
+                        inverter_obj.__dict__[key] = copy.deepcopy(inverter[key])
+                    # Decoded the same way as the two Predbat-level lists below - the inverter's own
+                    # copy is the same encoding and arrives in the same three shapes
+                    if hasattr(inverter_obj, "export_limits"):
+                        inverter_obj.export_limits = export_limits_from_stored(inverter_obj.export_limits)
+                    new_inverters.append(inverter_obj)
+                self.inverters = new_inverters
+
+        # Handle old-format octopus_slots (flat list of dicts) vs new format (list-of-lists per car)
+        if isinstance(self.octopus_slots, list) and self.octopus_slots and isinstance(self.octopus_slots[0], dict):
+            self.octopus_slots = [self.octopus_slots] + [[] for _ in range(7)]
+
+        # Both export limit lists come back from the dump as self-describing mappings (or bare
+        # packed floats in an older dump, or 3-element sequences a YAML round trip made of the
+        # tuples) - decode each back to a (mode, target, power) tuple. export_limits is the current
+        # inverter state; export_limits_best is the plan.
+        for attr in ("export_limits", "export_limits_best"):
+            if hasattr(self, attr):
+                setattr(self, attr, export_limits_from_stored(getattr(self, attr)))
+        if hasattr(self, "plan_preclip") and isinstance(self.plan_preclip, (list, tuple)) and len(self.plan_preclip) > 3:
+            self.plan_preclip = list(self.plan_preclip)
+            self.plan_preclip[3] = export_limits_from_stored(self.plan_preclip[3])
+            self.plan_preclip = tuple(self.plan_preclip)
+
+        for item in debug["CONFIG_ITEMS"]:
+            current = self.config_index.get(item["name"], None)
+            if current:
+                # print("Restore setting: {} = {} (was {})".format(item["name"], item["value"], current["value"]))
+                if current.get("value", None) != item.get("value", None):
+                    current["value"] = item.get("value", None)
+        self.log("Restored debug settings - minutes now {}".format(self.minutes_now))
+
+    def create_debug_yaml(self, write_file=True):
+        """
+        Write out a debug info yaml
+        """
+        time_now = self.now_utc.strftime("%H_%M_%S")
+        basename = "/debug/predbat_debug_{}.yaml".format(time_now)
+        filename = self.config_root + basename
+        # Create full hierarchical version of filepath to write to the logfile
+        filename_p = self.config_root_p + basename
+
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        debug = {}
+
+        # Store all predbat member variables into debug
+        for key in self.__dict__:
+            if not key.startswith("__") and not callable(getattr(self, key)):
+                if is_debug_excluded_key(key):
+                    pass
+                else:
+                    if key in ("args", "args_from_apps_yaml"):
+                        debug[key] = mask_secret_args(self.__dict__[key])
+                    else:
+                        debug[key] = self.__dict__[key]
+        inverters_debug = []
+        for inverter in self.inverters:
+            inverter_debug = {}
+            for key in inverter.__dict__:
+                if not key.startswith("__") and not callable(getattr(inverter, key)):
+                    if key.startswith("base"):
+                        pass
+                    elif getattr(inverter.__dict__[key], "base", None) is not None:
+                        # A helper object that keeps its own back-reference to Predbat (the GivTCP
+                        # REST client, Inverter.givtcp). yaml.dump() walks arbitrary objects through
+                        # __reduce_ex__(), so emitting one serialises the entire PredBat graph
+                        # through its .base: the dump either dies on the first unpicklable thing it
+                        # meets - an in-flight coroutine, the open log file - or, worse, succeeds and
+                        # writes ha_interface's access token and every other member
+                        # is_debug_excluded_key() deliberately drops into the file users attach to
+                        # public bug reports. Skipping "base" alone was enough only while every
+                        # such reference was named that.
+                        pass
+                    else:
+                        inverter_debug[key] = inverter.__dict__[key]
+            # Each inverter keeps its own copy of the current export instructions, in the same
+            # encoding as the two lists below - so it is written the same self-describing way rather
+            # than as the bare sequence the tuple representer would otherwise emit, which a replay
+            # would restore as a list and hand to export_mode_of to compare against a float.
+            if "export_limits" in inverter_debug:
+                inverter_debug["export_limits"] = export_limits_to_stored(inverter_debug["export_limits"])
+            inverters_debug.append(inverter_debug)
+        debug["inverters"] = inverters_debug
+        debug["CONFIG_ITEMS"] = copy.deepcopy(self.CONFIG_ITEMS)
+        # Write both export limit lists as self-describing mappings rather than the (mode, target,
+        # power) tuples in memory: 99.0 does not say "freeze" to anything that has not read const.py,
+        # and a tuple would emit as an ordinary sequence a reader could not tell from a window count.
+        for attr in ("export_limits", "export_limits_best"):
+            if attr in debug:
+                debug[attr] = export_limits_to_stored(debug[attr])
+        # Marks how the fields above are shaped, so a replay can tell an old encoding from a new one
+        # rather than guessing from the data. Absent in dumps written before versioning.
+        debug["debug_schema_version"] = DEBUG_SCHEMA_VERSION
+
+        # Explicit: "components" is in DEBUG_EXCLUDE_LIST so nothing under it is dumped
+        # automatically, and a plain redacted dict avoids the object-graph walk described above.
+        # getattr, not a bare attribute access: several tests stand self.components in for a
+        # minimal registry double that does not model .coordinator at all, and this function is
+        # what a real user's bug-report download runs - it must degrade to no discovery section
+        # rather than raise on an attribute a stand-in never promised to have.
+        coordinator = getattr(self.components, "coordinator", None) if self.components else None
+        if coordinator:
+            try:
+                debug["discovery"] = coordinator.catalogue()
+            except Exception as e:
+                self.log("Warn: Failed to add the discovery catalogue to the debug dump: {}".format(e))
+
+        if write_file:
+            with open(filename, "w") as file:
+                dump_debug_yaml(debug, file)
+            self.log("Wrote debug yaml to {}".format(filename_p))
+        else:
+            # Return the debug yaml as a string
+            text = io.StringIO()
+            dump_debug_yaml(debug, text)
+            return text.getvalue()
+
+    def create_entity_list(self):
+        """
+        Create the standard entity list
+        """
+
+        text = ""
+        text += "# Predbat Dashboard - {}\n".format(THIS_VERSION_DISPLAY)
+        text += "type: entities\n"
+        text += "Title: Predbat\n"
+        text += "entities:\n"
+        enable_list = [None]
+        for item in self.CONFIG_ITEMS:
+            enable = item.get("enable", None)
+            if enable and enable not in enable_list:
+                enable_list.append(enable)
+
+        for try_enable in enable_list:
+            for item in self.CONFIG_ITEMS:
+                entity = item.get("entity", None)
+                enable = item.get("enable", None)
+
+                if entity and enable == try_enable and self.user_config_item_enabled(item):
+                    text += "  - entity: " + entity + "\n"
+
+        for entity in self.dashboard_index:
+            text += "  - entity: " + entity + "\n"
+
+        # Find path
+        basename = "/predbat_dashboard.yaml"
+        filename = self.config_root + basename
+        # Create full hierarchical version of filepath to write to the logfile
+        filename_p = self.config_root_p + basename
+
+        # Write
+        han = open(filename, "w")
+        if han:
+            self.log("Creating predbat dashboard at {}".format(filename_p))
+            han.write(text)
+            han.close()
+        else:
+            self.log("Failed to write predbat dashboard to {}".format(filename_p))
+
+    def load_previous_value_from_ha(self, entity, attribute=None):
+        """
+        Load HA value either from state or from history if there is any
+        """
+        if attribute:
+            ha_value = self.get_state_wrapper(entity, attribute=attribute)
+            if ha_value is not None and ha_value not in ("unavailable", "unknown"):
+                return ha_value
+        else:
+            ha_value = self.get_state_wrapper(entity)
+            if ha_value is not None and ha_value not in ("unavailable", "unknown"):
+                return ha_value
+
+        # Try history if no current state
+        history = self.get_history_wrapper(entity_id=entity, required=False)
+        if history:
+            history = history[0]
+            if history:
+                if attribute:
+                    ha_value = history[-1].get("attributes", {}).get(attribute, None)
+                else:
+                    ha_value = history[-1].get("state", None)
+        return ha_value
+
+    async def trigger_watch_list(self, entity_id, attribute, old, new):
+        """
+        Trigger a watch event for an entity
+        """
+        for entity in self.watch_list:
+            if entity_id == entity:
+                await self.watch_event(entity, attribute, old, new, None)
+
+    async def trigger_callback(self, service_data):
+        """
+        Trigger a callback for a service via HA Interface
+
+        Returns True if a matching listener was found and run, False otherwise - callers
+        (e.g. HAInterface.call_service()'s loopback branch) use this as the success signal
+        for the same True/success, False/None-failure contract the websocket branch provides,
+        since loopback mode only ever simulates the entity-control services in EVENT_LISTEN_LIST,
+        not arbitrary third-party integration services.
+        """
+        for item in self.EVENT_LISTEN_LIST:
+            if item["domain"] == service_data.get("domain", "") and item["service"] == service_data.get("service", ""):
+                # self.log("Trigger callback for {} {}".format(item["domain"], item["service"]))
+                await item["callback"](item["service"], service_data, None)
+                return True
+        return False
+
+    def define_service_list(self):
+        self.SERVICE_REGISTER_LIST = [
+            {"domain": "input_number", "service": "set_value"},
+            {"domain": "input_number", "service": "increment"},
+            {"domain": "input_number", "service": "decrement"},
+            {"domain": "switch", "service": "turn_on"},
+            {"domain": "switch", "service": "turn_off"},
+            {"domain": "switch", "service": "toggle"},
+            {"domain": "select", "service": "select_option"},
+            {"domain": "select", "service": "select_first"},
+            {"domain": "select", "service": "select_last"},
+            {"domain": "select", "service": "select_next"},
+            {"domain": "select", "service": "select_previous"},
+        ]
+        self.EVENT_LISTEN_LIST = [
+            {"domain": "switch", "service": "turn_on", "callback": self.switch_event},
+            {"domain": "switch", "service": "turn_off", "callback": self.switch_event},
+            {"domain": "switch", "service": "toggle", "callback": self.switch_event},
+            {"domain": "input_number", "service": "set_value", "callback": self.number_event},
+            {"domain": "input_number", "service": "increment", "callback": self.number_event},
+            {"domain": "input_number", "service": "decrement", "callback": self.number_event},
+            {"domain": "number", "service": "set_value", "callback": self.number_event},
+            {"domain": "number", "service": "increment", "callback": self.number_event},
+            {"domain": "number", "service": "decrement", "callback": self.number_event},
+            {"domain": "select", "service": "select_option", "callback": self.select_event},
+            {"domain": "select", "service": "select_first", "callback": self.select_event},
+            {"domain": "select", "service": "select_last", "callback": self.select_event},
+            {"domain": "select", "service": "select_next", "callback": self.select_event},
+            {"domain": "select", "service": "select_previous", "callback": self.select_event},
+            {"domain": "update", "service": "install", "callback": self.update_event},
+            {"domain": "update", "service": "skip", "callback": self.update_event},
+        ]
+
+    def is_new_install(self):
+        """
+        Determine whether this is a genuinely new install, used to set sensible defaults
+        (e.g. mode defaults to Monitor rather than Control charge & discharge).
+        """
+        current_status = self.load_previous_value_from_ha(self.prefix + ".status")
+        if current_status:
+            return False
+
+        # HA's live state and history can both come back empty for a moment right after an
+        # abrupt restart, before HA's own state store has fully warmed back up. A single
+        # failed predbat.status read isn't enough evidence of a fresh install on its own -
+        # predbat_config.json only exists once Predbat has actually saved a config before,
+        # so its presence is a persistent, restart-proof signal that this is a real install,
+        # not a new one (see #4397/#4396 root cause, and #3259/#3306 for the resulting
+        # spurious config resets this was letting through).
+        config_path = os.path.join(self.config_root or "", "predbat_config.json")
+        if not self.ha_interface.db_primary and os.path.isfile(config_path):
+            self.log("predbat.status unavailable but predbat_config.json exists - not treating this as a new install")
+            return False
+
+        self.log("New install detected")
+        return True
+
+    def car_list_families(self):
+        """
+        Return the base names of the per-car config item families (name, name_1, ...)
+        """
+        names = set(item["name"] for item in self.CONFIG_ITEMS)
+        return set(name for name in names if name.startswith("car_") and name + "_1" in names)
+
+    def car_list_arg(self, item, car_families):
+        """
+        For a car config item given in apps.yaml as a list, return (True, this car's entry or None), otherwise (False, None)
+        """
+        name = item["name"]
+        base_name, car_n = name, 0
+        match = re.match(r"^(.+)_(\d+)$", name)
+        if match and match.group(1) in car_families:
+            base_name, car_n = match.group(1), int(match.group(2))
+
+        is_family = base_name in car_families
+        if not base_name.startswith("car_") or not (is_family or item.get("enable") == "num_cars"):
+            return False, None
+
+        own_list = False
+        if car_n and name in self.args:
+            if not isinstance(self.args[name], list):
+                # The car's own key in apps.yaml wins over the list
+                return False, None
+            # A list on a car's own key has no meaning, don't let it become the item default
+            self.log("Warn: Config item {} in apps.yaml is a list but sets a single car - ignoring it, use one value here or a list on {}".format(name, base_name))
+            own_list = True
+
+        values = self.args.get(base_name)
+        if not isinstance(values, list):
+            return own_list, None
+
+        if not is_family and len(values) > 1:
+            self.log("Warn: Config item {} in apps.yaml is a list but is one setting for all cars - using the first entry {}".format(base_name, values[0]))
+
+        value = values[car_n] if car_n < len(values) else None
+        if value is not None and item["type"] == "input_number":
+            try:
+                value = float(value)
+            except (ValueError, TypeError):
+                self.log("Warn: Config item {} entry {} for car {} in apps.yaml is not a number - ignoring it".format(base_name, value, car_n))
+                value = None
+        return True, value
+
+    def load_user_config(self, quiet=True, register=False, load_config=False):
+        """
+        Load config from HA
+        """
+
+        self.config_index = {}
+        self.log("Refreshing Predbat configuration")
+
+        # New install, used to set default of expert mode
+        new_install = self.is_new_install()
+
+        # Build config index
+        car_families = self.car_list_families()
+        for item in self.CONFIG_ITEMS:
+            name = item["name"]
+            self.config_index[name] = item
+
+            if name == "mode" and new_install:
+                item["default"] = PREDBAT_MODE_OPTIONS[PREDBAT_MODE_MONITOR]
+
+            car_list, car_default = self.car_list_arg(item, car_families)
+            if car_list:
+                # A car item given as an apps.yaml list, each car takes its own entry
+                if car_default is not None:
+                    item["default"] = car_default
+            elif name in self.args:
+                # If the item is in args, use it as the default
+                item["default"] = self.args[name]
+
+        # Load current config from JSON file when explicitly requested via load_config=True.
+        # This is done on the very first startup call (before HA state is read) so that
+        # JSON-saved values populate item["value"] and take priority over transient HA states.
+        # During HA restart, entities can return "unavailable"/"unknown", and without this
+        # pre-load those transient states would overwrite the saved JSON via save_current_config().
+        # Subsequent periodic calls omit load_config so in-memory values updated by HA events
+        # are not overwritten by the (potentially stale) JSON.
+        if load_config:
+            self.log("Loading current config")
+            self.load_current_config()
+
+        # Find values and monitor config
+        for item in self.CONFIG_ITEMS:
+            name = item["name"]
+            type = item["type"]
+            enabled = self.user_config_item_enabled(item)
+
+            entity = type + "." + self.prefix + "_" + name
+            item["entity"] = entity
+            ha_value = None
+
+            if not enabled:
+                item["value"] = None
+
+                # Remove the state if the entity still exists
+                ha_value = self.get_state_wrapper(entity)
+                if ha_value is not None:
+                    self.set_state_wrapper(entity_id=entity, state=ha_value, attributes={"friendly_name": "[Disabled] " + item["friendly_name"]})
+                continue
+
+            # Get from current state, if not from HA directly
+            ha_value = item.get("value", None)
+            # The update entity is synthesised after release discovery and is explicitly
+            # non-restorable. Looking in history when its current state is absent registers
+            # an empty 30-day query with HAHistory, which then retries every two minutes.
+            if ha_value is None and type != "update":
+                ha_value = self.load_previous_value_from_ha(entity)
+
+            # Update drop down menu
+            if name == "update":
+                if not ha_value:
+                    # Construct this version information as it's not set correctly already
+                    ha_value = THIS_VERSION + " Loading..."
+                else:
+                    # Leave current value until it's set during version discovery later
+                    continue
+
+            # Default?
+            if ha_value is None:
+                ha_value = item.get("default", None)
+
+            # Switch convert to text
+            if type == "switch" and isinstance(ha_value, str):
+                if ha_value.lower() in ["on", "true", "enable"]:
+                    ha_value = True
+                else:
+                    ha_value = False
+
+            if type == "input_number" and ha_value is not None:
+                try:
+                    # Convert to float first
+                    ha_value = float(ha_value)
+
+                    # Clamp to the declared min/max. This is reachable from an apps.yaml override,
+                    # which bypasses the HA input_number entity's own min/max enforcement entirely -
+                    # an out-of-range value here can otherwise silently distort the optimiser (e.g.
+                    # pv_metric10_weight is documented/limited to 0.0-1.0 but a raw apps.yaml value
+                    # of, say, 30 passes straight through unclamped).
+                    item_min = item.get("min", None)
+                    item_max = item.get("max", None)
+                    if item_min is not None and ha_value < item_min:
+                        self.record_status("Warn: Config item {} value {} is below the minimum {} - clamping to {}".format(name, ha_value, item_min, item_min), had_errors=True)
+                        ha_value = float(item_min)
+                    elif item_max is not None and ha_value > item_max:
+                        self.record_status("Warn: Config item {} value {} is above the maximum {} - clamping to {}".format(name, ha_value, item_max, item_max), had_errors=True)
+                        ha_value = float(item_max)
+
+                    # For entities with integer step, convert to int to preserve integer format.
+                    # Done after clamping since min/max can themselves be declared as floats (e.g.
+                    # metric_min_improvement_plan has step=1 but max=250.0) - clamping alone would
+                    # otherwise silently hand back a float and defeat this normalisation.
+                    step = item.get("step", 1)
+                    if isinstance(step, int) or (isinstance(step, float) and step == int(step)):
+                        # Step is an integer (e.g., 1, 2, etc.), so keep value as integer if it has no decimal part
+                        if ha_value == int(ha_value):
+                            ha_value = int(ha_value)
+                except (ValueError, TypeError):
+                    ha_value = None
+
+            if type == "update":
+                ha_value = None
+
+            # Push back into current state
+            if ha_value is not None:
+                if item.get("manual"):
+                    self.manual_times(name, new_value=ha_value)
+                elif item.get("manual_rate"):
+                    if "_import" in item["name"]:
+                        # Manual import rate
+                        self.manual_rates(name, new_value=ha_value, default_rate=self.get_arg("manual_import_value"))
+                    else:
+                        self.manual_rates(name, new_value=ha_value, default_rate=self.get_arg("manual_export_value"))
+                elif item.get("api"):
+                    self.api_select_update(name, new_value=ha_value)
+                else:
+                    self.expose_config(item["name"], ha_value, quiet=quiet, force_ha=True)
+
+        # Update the last time we refreshed the config
+        self.set_state_wrapper(entity_id=self.prefix + ".config_refresh", state=self.now_utc.strftime(TIME_FORMAT))
+
+        # Register HA services
+        if register:
+            self.watch_list = self.get_arg("watch_list", [], indirect=False)
+            self.log("Watch list {}".format(self.watch_list))
+
+            if self.ha_interface.websocket_active and not self.ha_interface.db_primary:
+                # Registering HA events as Websocket is not active
+                for item in self.SERVICE_REGISTER_LIST:
+                    self.fire_event_wrapper(domain=item["domain"], service=item["service"])
+
+        # Save current config to file if it was pending
+        self.save_current_config()
+
+    def resolve_arg_re(self, arg, arg_value, state_keys):
+        """
+        Resolve argument regular expression on list or string
+        """
+        matched = True
+
+        if isinstance(arg_value, list):
+            new_list = []
+            for item_value in arg_value:
+                item_matched, item_value = self.resolve_arg_re(arg, item_value, state_keys)
+                if not item_matched:
+                    self.log("Warn: Regular argument {} expression {} failed to match - disabling this item".format(arg, item_value))
+                    new_list.append(None)
+                else:
+                    new_list.append(item_value)
+            arg_value = new_list
+        elif isinstance(arg_value, dict):
+            new_dict = {}
+            for item_name in arg_value:
+                item_value = arg_value[item_name]
+                item_matched, item_value = self.resolve_arg_re(arg, item_value, state_keys)
+                if not item_matched:
+                    self.log("Warn: Regular argument {} expression {} failed to match - disabling this item".format(arg, item_value))
+                    new_dict[item_name] = None
+                else:
+                    new_dict[item_name] = item_value
+            arg_value = new_dict
+        elif isinstance(arg_value, str) and arg_value.startswith("re:"):
+            matched = False
+            my_re = "^" + arg_value[3:] + "$"
+            secret_arg = is_secret_key(arg)
+            for key in state_keys:
+                res = re.search(my_re, key)
+                if res:
+                    if len(res.groups()) > 0:
+                        arg_value = res.group(1)
+                    else:
+                        arg_value = res.group(0)
+                    # A matched entity id can itself embed a credential (e.g. an MPAN), and this fires
+                    # before auto_config()'s caller has invalidated the log-redaction cache to cover the
+                    # new value, so a secret-flagged arg only logs the pattern and key name (#5106).
+                    self.log("Regular expression argument {} matched {} with {}".format(arg, my_re, SECRET_MASK if secret_arg else arg_value))
+                    matched = True
+                    break
+        return matched, arg_value
+
+    def auto_config(self, final=False):
+        """
+        Auto configure
+        match arguments with sensors
+        """
+
+        states = self.get_state_wrapper()
+        state_keys = states.keys()
+        disabled = []
+        self.unmatched_args = {}
+
+        # Find each arg re to match
+        changed = False
+        for arg in self.args:
+            arg_value = self.args[arg]
+            matched, arg_value = self.resolve_arg_re(arg, arg_value, state_keys)
+            if not matched:
+                if final:
+                    self.log("Warn: Regular expression argument: {} unable to match {}, now will disable".format(arg, arg_value))
+                    disabled.append(arg)
+            else:
+                self.args[arg] = arg_value
+                changed = True
+
+        # Remove unmatched keys
+        for key in disabled:
+            self.unmatched_args[key] = self.args[key]
+            del self.args[key]
+            changed = True
+
+        # A `re:` pattern can resolve to a live HA entity's state/attribute - a credential-shaped
+        # value from a third-party integration is exactly what redact_strings/redact_strings_labelled
+        # exist to catch (GH#4770) - and a disabled key's removal changes what collect_log_secret_values()
+        # sees from args too. Unlike set_arg() (this class's only other args mutator, which invalidates
+        # unconditionally on every call), auto_config() runs over every configured arg on each call, so
+        # invalidating once at the end - only when something actually changed - avoids rebuilding the
+        # pattern key-by-key while still closing the gap: a value resolved or removed here must not keep
+        # leaking under the stale pattern (or keep being redacted after a redact_strings entry is removed)
+        # until Predbat next restarts.
+        if changed:
+            self._invalidate_log_secret_pattern()
+
+    def split_command_index(self, command):
+        """
+        Get the index of a command
+        """
+        command_index = None
+        if "(" in command:
+            command = command.replace(")", "")
+            command_split = command.split("(")
+            if len(command_split) > 1:
+                command = command_split[0]
+                command_index = int(command_split[1])
+        return command, command_index
+
+    def is_multi_instance_override(self, command):
+        """
+        True if the command is a dict_list override (e.g. rates_import_override)
+        """
+        return APPS_SCHEMA.get(command, {}).get("type") == "dict_list"
+
+    def strip_command_args(self, command):
+        """
+        Strip the ?args or =value suffix from a manual API command string
+        """
+        if "?" in command:
+            return command.split("?")[0]
+        elif "=" in command:
+            return command.split("=")[0]
+        return command
+
+    def get_manual_api(self, command_type):
+        """
+        Get the manual API command
+        """
+        apply_commands = []
+        command_index = None
+        for api_command in self.manual_api:
+            command_split = api_command.split("?")
+            if len(command_split) > 1:
+                command = command_split[0]
+                command, command_index = self.split_command_index(command)
+                command_args = command_split[1].split("&")
+                args_dict = {}
+                args_dict["index"] = command_index
+                value = {}
+                for arg in command_args:
+                    arg_split = arg.split("=")
+                    if len(arg_split) > 1:
+                        value[arg_split[0]] = arg_split[1]
+                    else:
+                        value[arg_split[0]] = True
+                args_dict["value"] = value
+                if command == command_type:
+                    apply_commands.append(args_dict)
+            else:
+                command_split = api_command.split("=")
+                if len(command_split) > 1:
+                    command = command_split[0]
+                    command, command_index = self.split_command_index(command)
+                    command_arg = command_split[1]
+                    args_dict = {}
+                    args_dict["index"] = command_index
+                    args_dict["value"] = command_arg
+
+                    if command == command_type:
+                        apply_commands.append(args_dict)
+
+        return apply_commands
+
+    async def async_manual_select(self, config_item, value):
+        """
+        Async wrapper for selection on manual times dropdown
+        """
+        return await self.run_in_executor(self.manual_select, config_item, value)
+
+    async def async_api_select(self, config_item, value):
+        """
+        Async wrapper for selection on api dropdown
+        """
+        return await self.run_in_executor(self.api_select, config_item, value)
+
+    def manual_select(self, config_item, value):
+        """
+        Selection on manual times dropdown
+        """
+        item = self.config_index.get(config_item)
+        if not item:
+            return
+        if not value:
+            # Ignore null selections
+            return
+        manual_rate = item.get("manual_rate", False)
+        if value.startswith("+"):
+            # Ignore selections which are just the current value
+            return
+        values = item.get("value", "")
+        if not values:
+            values = ""
+        values = values.replace("+", "")
+        values_list = []
+        exclude_list = []
+        if values:
+            values_list = values.split(",")
+        if value == "off":
+            values_list = []
+        elif "[" in value:
+            value = value.replace("[", "")
+            value = value.replace("]", "")
+            # For manual rates, remove any override for the same time slot regardless of rate value
+            if manual_rate and "=" in value:
+                time_part = value.split("=")[0]
+                old_count = len(values_list)
+                values_list = [v for v in values_list if not v.startswith(time_part + "=")]
+                if len(values_list) < old_count:
+                    self.log(f"Cleared rate override for {time_part}")
+            elif value in values_list:
+                # For non-rate overrides, remove exact match
+                values_list.remove(value)
+        else:
+            # For manual rates, remove any existing override for the same time slot before adding new one
+            if manual_rate and "=" in value:
+                time_part = value.split("=")[0]
+                # Remove any existing entries with the same time
+                old_count = len(values_list)
+                values_list = [v for v in values_list if not v.startswith(time_part + "=")]
+                if len(values_list) < old_count:
+                    self.log(f"Removed existing rate override for {time_part} before adding new value")
+
+            if value not in values_list:
+                values_list.append(value)
+                exclude_list.append(value)
+        item_value = ",".join(values_list)
+        if item_value:
+            item_value = "+" + item_value
+
+        if not item_value:
+            item_value = "off"
+
+        if manual_rate:
+            # Update manual rates sensor
+            if "_import" in item["name"]:
+                # Manual import rate
+                self.manual_rates(config_item, new_value=item_value, default_rate=self.get_arg("manual_import_value"))
+            elif "_export" in item["name"]:
+                # Manual export rate
+                self.manual_rates(config_item, new_value=item_value, default_rate=self.get_arg("manual_export_value"))
+            elif "_load" in item["name"]:
+                # Manual load rate
+                self.manual_rates(config_item, new_value=item_value, default_rate=self.get_arg("manual_load_value"))
+            elif "_soc_max" in item["name"]:
+                # Manual soc maximum (ceiling) rate
+                self.manual_rates(config_item, new_value=item_value, default_rate=self.get_arg("manual_soc_max_value"))
+            elif "_soc" in item["name"]:
+                # Manual soc rate
+                self.manual_rates(config_item, new_value=item_value, default_rate=self.get_arg("manual_soc_value"))
+            else:
+                self.log("Warn: Manual rate sensor {} not recognised".format(config_item))
+        else:
+            self.manual_times(config_item, new_value=item_value)
+
+        # Update other drop downs that may need this time excluding
+        for item in self.CONFIG_ITEMS:
+            if item["name"] != config_item and item.get("manual"):
+                value = item.get("value", "")
+                if value and value != "reset" and exclude_list:
+                    self.manual_times(item["name"], exclude=exclude_list)
+
+    def api_select(self, config_item, value):
+        """
+        Selection on manual times dropdown
+        """
+        item = self.config_index.get(config_item)
+        if not item:
+            return
+        if not value:
+            # Ignore null selections
+            return
+        if value.startswith("+"):
+            # Ignore selections which are just the current value
+            return
+        values = item.get("value", "")
+        if not values:
+            values = ""
+        values = values.replace("+", "")
+        values_list = []
+        if values:
+            values_list = values.split(",")
+        if value == "off":
+            values_list = []
+        elif "[" in value:
+            value = value.replace("[", "")
+            value = value.replace("]", "")
+            if value in values_list:
+                values_list.remove(value)
+        else:
+            if value not in values_list:
+                values_list.append(value)
+        item_value = ",".join(values_list)
+        if item_value:
+            item_value = "+" + item_value
+
+        if not item_value:
+            item_value = "off"
+        self.api_select_update(config_item, new_value=item_value)
+
+    def api_select_update(self, config_item, new_value=None):
+        """
+        Update API selector
+        """
+        time_overrides = []
+
+        # Deconstruct the value into a list of minutes
+        item = self.config_index.get(config_item)
+        if new_value:
+            values = new_value
+        else:
+            values = item.get("value", "")
+
+        values = values.replace("+", "")
+        values_list = []
+        if values:
+            values_list = values.split(",")
+
+        for value in values_list:
+            if value == "off":
+                continue
+            value_no_eq = self.strip_command_args(value)
+            has_index = "(" in value_no_eq
+            value_command = value_no_eq.split("(")[0] if has_index else value_no_eq
+
+            # No-index dict_list commands only dedupe against an exact repeat, not by name (#4405)
+            is_multi_instance = not has_index and self.is_multi_instance_override(value_command)
+
+            if is_multi_instance:
+                if value in time_overrides:
+                    time_overrides.remove(value)
+            else:
+                for prev in time_overrides[:]:
+                    if self.strip_command_args(prev) == value_no_eq:
+                        time_overrides.remove(prev)
+            time_overrides.append(value)
+
+        values = ",".join(time_overrides)
+        if values:
+            values = "+" + values
+
+        # Create the new dropdown, off first so cancelling everything doesn't mean scrolling the whole list (#5105)
+        time_values = ["off"]
+        for minute_str in time_overrides:
+            minute_str = "[" + minute_str + "]"
+            time_values.append(minute_str)
+
+        if values not in time_values:
+            time_values.append(values)
+        item["options"] = time_values
+        if not values:
+            values = "off"
+        self.expose_config(config_item, values, force=True)
+        return time_overrides
+
+    def manual_time_origin(self):
+        """
+        Midnight and minutes-now for decoding manual override selections
+
+        Derived from now_utc rather than read from self.midnight_utc / self.minutes_now, which
+        calculate_yesterday() rewrites for the duration of the savings calculation. Those writes
+        land on the shared instance, so a caller on another thread - the web server rendering the
+        plan, or a user clicking a slot on the plan card - could otherwise decode the stored
+        selection against a clock a day behind, and persist the result (#4900).
+        """
+        midnight_utc = self.now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        minutes_now = int((self.now_utc - midnight_utc).total_seconds() / 60)
+        return midnight_utc, minutes_now
+
+    def manual_rates(self, config_item, exclude=None, new_value=None, default_rate=0, update=True):
+        """
+        Update manual rates sensor
+
+        Set update=False to decode the stored selection without writing it back - read-only
+        callers should use this. See the note in manual_times() for the shared time origin.
+        """
+        if exclude is None:
+            exclude = []
+        rate_overrides_minutes = {}
+        rate_overrides = []
+        plan_interval = self.get_arg("plan_interval_minutes", 30)
+        midnight_utc, minutes_now_real = self.manual_time_origin()
+        minutes_now = int(minutes_now_real / plan_interval) * plan_interval
+        manual_rate_max = MANUAL_RATE_MAX_MINUTES
+
+        # Deconstruct the value into a list of minutes
+        item = self.config_index.get(config_item)
+        if item is None:
+            return rate_overrides_minutes
+
+        if new_value:
+            values = new_value
+        else:
+            values = item.get("value", "")
+        values = values.replace("+", "")
+        values_list = []
+        if values:
+            values_list = values.split(",")
+        for value in values_list:
+            if value == "off":
+                continue
+            if "=" in value:
+                rate_time, rate_value = value.split("=")
+            else:
+                rate_time = value
+                rate_value = default_rate
+
+            try:
+                rate_value = float(rate_value)
+            except (ValueError, TypeError):
+                rate_value = default_rate
+
+            # Parse time with day of week support using utility function
+            override_time = get_override_time_from_string(self.now_utc, rate_time, plan_interval)
+
+            if override_time:
+                # Calculate minutes from midnight today
+                minutes = int((override_time - midnight_utc).total_seconds() / 60)
+                minutes_now_slot = int(minutes_now / plan_interval) * plan_interval
+
+                if (minutes - minutes_now_slot) >= 0 and (minutes - minutes_now_real) < manual_rate_max:
+                    rate_overrides.append((minutes, rate_value))
+                    for minute in range(minutes, minutes + plan_interval):
+                        rate_overrides_minutes[minute] = rate_value
+
+        # Reconstruct the list in order based on minutes
+        values_list = []
+        for minute, rate in rate_overrides:
+            minute_str = (midnight_utc + timedelta(minutes=minute)).strftime("%a %H:%M")
+            minute_rate_str = minute_str + "=" + str(rate)
+            if minute_rate_str not in exclude and minute_rate_str not in values_list:
+                values_list.append(minute_rate_str)
+        values = ",".join(values_list)
+        if values:
+            values = "+" + values
+
+        # Create the new dropdown, off first so cancelling everything doesn't mean scrolling the whole list (#5105)
+        if update:
+            time_values = ["off"]
+            for minute in range(minutes_now, minutes_now + manual_rate_max, plan_interval):
+                minute_str = (midnight_utc + timedelta(minutes=minute)).strftime("%a %H:%M")
+                if minute in rate_overrides_minutes:
+                    rate_value = rate_overrides_minutes[minute]
+                    minute_str = f"{minute_str}={rate_value}"
+                    minute_str = "[" + minute_str + "]"
+                time_values.append(minute_str)
+
+            if values not in time_values:
+                time_values.append(values)
+            item["options"] = time_values
+            if not values:
+                values = "off"
+            self.expose_config(config_item, values, force=True)
+
+        return rate_overrides_minutes
+
+    def manual_times(self, config_item, exclude=None, new_value=None, update=True):
+        """
+        Update manual times sensor
+
+        The stored selection is a list of "%a %H:%M" strings which this re-resolves to absolute
+        minutes and then writes back in its re-rendered form, so both halves of that round trip
+        share the single origin from manual_time_origin() - previously the parse used
+        self.midnight_utc and the render self.midnight, which moved every stored slot on by a day
+        whenever the two disagreed (#4900).
+
+        Set update=False to decode the stored selection without writing it back, which is what a
+        read-only caller wants.
+        """
+        if exclude is None:
+            exclude = []
+        time_overrides = []
+        plan_interval = self.get_arg("plan_interval_minutes", 30)
+        midnight_utc, minutes_now_real = self.manual_time_origin()
+        minutes_now = int(minutes_now_real / plan_interval) * plan_interval
+        manual_time_max = MANUAL_TIME_MAX_MINUTES
+
+        # Deconstruct the value into a list of minutes
+        item = self.config_index.get(config_item)
+        if item is None:
+            return []
+
+        if new_value:
+            values = new_value
+        else:
+            values = item.get("value", "")
+        values = values.replace("+", "")
+        values_list = []
+        if values:
+            values_list = values.split(",")
+        for value in values_list:
+            if value == "off":
+                continue
+
+            # Parse time with day of week support using utility function
+            override_time = get_override_time_from_string(self.now_utc, value, plan_interval)
+
+            if override_time:
+                # Calculate minutes from midnight today
+                minutes = int((override_time - midnight_utc).total_seconds() / 60)
+                minutes_now_slot = int(minutes_now / plan_interval) * plan_interval
+
+                if (minutes >= minutes_now_slot) and (minutes - minutes_now_slot) < manual_time_max:
+                    time_overrides.append(minutes)
+
+        # Reconstruct the list in order based on minutes
+        values_list = []
+        for minute in time_overrides:
+            minute_str = (midnight_utc + timedelta(minutes=minute)).strftime("%a %H:%M")
+            if minute_str not in exclude and minute_str not in values_list:
+                values_list.append(minute_str)
+        values = ",".join(values_list)
+        if values:
+            values = "+" + values
+
+        # Create the new dropdown, off first so cancelling everything doesn't mean scrolling the whole list (#5105)
+        if update:
+            time_values = ["off"]
+            for minute in range(minutes_now, minutes_now + manual_time_max, plan_interval):
+                minute_str = (midnight_utc + timedelta(minutes=minute)).strftime("%a %H:%M")
+                if minute in time_overrides:
+                    minute_str = "[" + minute_str + "]"
+                time_values.append(minute_str)
+
+            if values not in time_values:
+                time_values.append(values)
+            item["options"] = time_values
+            if not values:
+                values = "off"
+            self.expose_config(config_item, values, force=True)
+
+        if time_overrides:
+            time_txt = []
+            for minute in time_overrides:
+                time_txt.append(self.time_abs_str(minute))
+        return time_overrides
+
+    async def update_event(self, event, data, kwargs):
+        """
+        Update event.
+
+        This function is called when an update event is triggered. It handles the logic for updating the application.
+
+        Parameters:
+        - event (str): The name of the event that triggered the update.
+        - data (dict): Additional data associated with the update event.
+        - kwargs (dict): Additional keyword arguments passed to the update event.
+
+        Returns:
+        None
+        """
+        self.log("Update event {} {} {}".format(event, data, kwargs))
+        if data and data.get("service", "") == "install":
+            service_data = data.get("service_data", {})
+            entities = service_data.get("entity_id", [])
+
+            # Can be a string or an array, the HA update card sends an array
+            if isinstance(entities, str):
+                entities = [entities]
+
+            if "update.predbat_version" in entities:
+                latest = self.releases.get("latest", None)
+                if latest:
+                    self.log("Requested install of latest Predbat version {}".format(latest))
+                    await self.async_download_predbat_version(latest)
+        elif data and data.get("service", "") == "skip":
+            self.log("Requested to skip the update, this is not yet supported...")
