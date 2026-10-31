@@ -1,7 +1,15 @@
 #install python en pip
 ARG BUILD_FROM
 ARG BUILD_VERSION
-FROM $BUILD_FROM
+ARG TARGETARCH
+
+# Pinned Ubuntu base images (ignore BUILD_FROM from Supervisor to ensure Ubuntu, not Alpine)
+# Digests resolved from ghcr.io registry manifests for tag 10.0.5 on 2026-10-25; Ubuntu 24.04, Python 3.12.
+FROM ghcr.io/hassio-addons/ubuntu-base/aarch64:10.0.5@sha256:6e729479f273b9f83165e43f80a7574d19c5f490a3df80d7d0830c5369cbaa04 AS base-arm64
+FROM ghcr.io/hassio-addons/ubuntu-base/amd64:10.0.5@sha256:0b873304745adf7e57bfa0e96fbc4eed0117c1bf3597b4f0d5a42c2987bc5aa8 AS base-amd64
+
+# Select base matching target architecture (TARGETARCH is arm64 or amd64 from BuildKit)
+FROM base-${TARGETARCH} AS final-base
 
 # Set shell
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
