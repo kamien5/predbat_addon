@@ -10,7 +10,6 @@ ingress_root: "/"
 panel_icon: mdi:bat
 arch:
   - aarch64
-  - amd64
 init: false
 homeassistant_api: true
 hassio_api: false

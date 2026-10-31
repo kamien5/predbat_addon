@@ -14,6 +14,7 @@ import unittest
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CONFIG_YAML = os.path.join(REPO_ROOT, "predbat", "config.yaml")
 BUILD_YAML = os.path.join(REPO_ROOT, "predbat", "build.yaml")
+DOCKERFILE = os.path.join(REPO_ROOT, "predbat", "Dockerfile")
 
 
 class ConfigYamlTestCase(unittest.TestCase):
@@ -82,12 +83,40 @@ class ConfigYamlTestCase(unittest.TestCase):
 
     def test_build_from_pinned_sha256(self) -> None:
         entries = re.findall(
-            r"(?m)^[ \t]+(?:aarch64|amd64):\s*\"([^\"]+)\"\s*$",
+            r"(?m)^[ \t]+aarch64:\s*\"([^\"]+)\"\s*$",
             self.build_text,
         )
-        self.assertGreaterEqual(len(entries), 2)
+        self.assertEqual(len(entries), 1)
         for entry in entries:
             self.assertIn("@sha256:", entry)
+
+    def test_dockerfile_from_hardcoded_and_matches_build_yaml(self) -> None:
+        with open(DOCKERFILE, "r", encoding="utf-8") as handle:
+            dockerfile_text = handle.read()
+        self.assertNotIn("BUILD_FROM", dockerfile_text)
+        from_matches = re.findall(r"(?m)^FROM\s+(\S+)\s*$", dockerfile_text)
+        self.assertEqual(len(from_matches), 1)
+        image = from_matches[0]
+        self.assertIn("@sha256:", image)
+        build_from = re.search(
+            r"(?m)^[ \t]+aarch64:\s*\"([^\"]+)\"\s*$",
+            self.build_text,
+        )
+        self.assertIsNotNone(build_from)
+        assert build_from is not None
+        self.assertEqual(image, build_from.group(1))
+
+    def test_config_arch_aarch64_only(self) -> None:
+        match = re.search(r"(?m)^arch:\n((?:[ \t]+-.*\n)+)", self.config_text)
+        self.assertIsNotNone(match)
+        assert match is not None
+        arch_block = match.group(1)
+        entries = [
+            line.strip()[2:].strip()
+            for line in arch_block.splitlines()
+            if line.strip().startswith("-")
+        ]
+        self.assertEqual(entries, ["aarch64"])
 
 
 if __name__ == "__main__":

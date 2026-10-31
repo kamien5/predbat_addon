@@ -1,7 +1,7 @@
 #install python en pip
-ARG BUILD_FROM
 ARG BUILD_VERSION
-FROM $BUILD_FROM
+# Base image is hardcoded: Supervisor ignores build.yaml and would override an ARG-based FROM.
+FROM ghcr.io/hassio-addons/ubuntu-base/aarch64:10.0.5@sha256:6e729479f273b9f83165e43f80a7574d19c5f490a3df80d7d0830c5369cbaa04
 
 # Set shell
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]

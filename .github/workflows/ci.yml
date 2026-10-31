@@ -67,8 +67,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
-            platform: linux/amd64
           - arch: aarch64
             platform: linux/arm64
     steps:
@@ -95,14 +93,11 @@ jobs:
           ARCH: ${{ matrix.arch }}
           PLATFORM: ${{ matrix.platform }}
         run: |
-          BUILD_FROM="$(sed -n "s/^  ${ARCH}: \"\(.*\)\"$/\1/p" predbat/build.yaml)"
-          case "$BUILD_FROM" in
-            *@sha256:*) ;;
-            *) echo "::error::build_from for ${ARCH} is not pinned by digest"; exit 1 ;;
-          esac
+          if grep -n BUILD_FROM predbat/Dockerfile; then
+            echo "::error::predbat/Dockerfile must not use BUILD_FROM"; exit 1
+          fi
           docker buildx build \
             --platform "$PLATFORM" \
-            --build-arg "BUILD_FROM=$BUILD_FROM" \
             --build-arg "BUILD_ARCH=$ARCH" \
             --build-arg "BUILD_VERSION=ci" \
             --output type=cacheonly \
