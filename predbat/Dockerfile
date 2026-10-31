@@ -9,7 +9,6 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # Install Python and pip in a single layer
 # Using python3 instead of python3-minimal for better pip package compatibility
 RUN apt-get update \
-    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends \
         python3 \
         python3-pip \
@@ -19,8 +18,17 @@ WORKDIR /app_data
 COPY rootfs /
 # COPY ingress.conf /etc/nginx/http.d/
 
+# Pinned Predbat v9.5.0 code (vendored from springfall2008/batpred @ 0cfceaaa, see VENDOR.txt).
+# The build fails if any vendored file does not match MANIFEST.sha256.
+COPY vendor /opt/predbat/vendor
+COPY MANIFEST.sha256 VENDOR.txt /opt/predbat/
+RUN cd /opt/predbat/vendor \
+    && sha256sum --strict -c --quiet ../MANIFEST.sha256 \
+    && test "$(find . -type f | wc -l)" -eq "$(wc -l < ../MANIFEST.sha256)" \
+    && chmod -R a-w /opt/predbat
+
 COPY requirements.txt /tmp/
-RUN pip install --break-system-packages -r /tmp/requirements.txt
+RUN pip install --break-system-packages --no-cache-dir --require-hashes --only-binary=:all: -r /tmp/requirements.txt
 
 # Start app
 RUN chmod a+x /run.sh
@@ -38,13 +46,13 @@ LABEL \
     io.hass.arch="${BUILD_ARCH}" \
     io.hass.type="addon" \
     io.hass.version=${BUILD_VERSION} \
-    maintainer="springfall2008 (https://github.com/springfall2008)" \
+    maintainer="kamien5 (https://github.com/kamien5)" \
     org.opencontainers.image.title="${BUILD_NAME}" \
     org.opencontainers.image.description="${BUILD_DESCRIPTION}" \
-    org.opencontainers.image.vendor="Springfall2008" \
-    org.opencontainers.image.authors="springfall2008 (https://github.com/springfall2008)" \
-    org.opencontainers.image.licenses="MIT" \
-    org.opencontainers.image.url="https://github.com/springfall2008" \
+    org.opencontainers.image.vendor="kamien5" \
+    org.opencontainers.image.authors="kamien5 (fork of springfall2008/predbat_addon by Trefor Southwell)" \
+    org.opencontainers.image.licenses="NOASSERTION" \
+    org.opencontainers.image.url="https://github.com/kamien5/predbat_addon" \
     org.opencontainers.image.source="https://github.com/${BUILD_REPOSITORY}" \
     org.opencontainers.image.documentation="https://github.com/${BUILD_REPOSITORY}/blob/main/README.md" \
     org.opencontainers.image.created=${BUILD_DATE} \

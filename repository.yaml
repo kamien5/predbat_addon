@@ -1,4 +1,4 @@
 # https://developers.home-assistant.io/docs/add-ons/repository#repository-configuration
-name: Predbat app
-url: 'https://github.com/springfall2008/predbat_addon'
-maintainer: Trefor Southwell <tdlj@tdlj.net>
+name: Predbat app (kamien5 hardened fork)
+url: 'https://github.com/kamien5/predbat_addon'
+maintainer: kamien5 (fork of springfall2008/predbat_addon by Trefor Southwell)

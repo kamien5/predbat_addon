@@ -1,0 +1,2428 @@
+# -----------------------------------------------------------------------------
+# Predbat Home Battery System
+# Copyright Trefor Southwell 2025-2026 - All Rights Reserved
+# This application maybe used for personal use only and not for commercial use
+# -----------------------------------------------------------------------------
+# fmt off
+# pylint: disable=consider-using-f-string
+# pylint: disable=line-too-long
+# pylint: disable=attribute-defined-outside-init
+
+
+"""Main PredBat orchestrator module.
+
+Entry point for the battery prediction and optimisation system. The PredBat class
+uses multiple inheritance to combine Home Assistant interface, data fetching,
+planning, execution, output publishing, and user interface capabilities into a
+single orchestrator that runs the main prediction/optimisation loop every 5 minutes.
+"""
+
+import copy
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+import traceback
+import gc
+import random
+import time
+import threading
+
+# from memory_profiler import profile
+
+IS_COMPILED = getattr(sys, "frozen", False)
+
+import hass as hass
+import pytz
+import asyncio
+
+THIS_VERSION = "v9.5.0"
+THIS_VERSION_DISPLAY = THIS_VERSION
+
+from download import predbat_update_move, predbat_update_download, check_install, read_deploy_git_version, DEFAULT_PREDBAT_REPOSITORY
+from const import MINUTE_WATT
+
+# Only do the self-install/self-update logic if we are NOT compiled.
+if not IS_COMPILED:
+    # Show the actual commit for a dev deploy (coverage/deploy) or standalone git
+    # checkout (hass.py) rather than just the release tag - see git_version.txt
+    git_version = read_deploy_git_version(os.path.dirname(__file__))
+    if git_version:
+        THIS_VERSION_DISPLAY = "{} ({})".format(THIS_VERSION, git_version)
+
+    # Sanity check the install and re-download if corrupted
+    passed, modified = check_install(THIS_VERSION, repository=DEFAULT_PREDBAT_REPOSITORY)
+    if not passed:
+        print("Warn: Predbat files are not installed correctly, trying to download them")
+        files = predbat_update_download(THIS_VERSION, repository=DEFAULT_PREDBAT_REPOSITORY)
+        if files:
+            predbat_update_move(THIS_VERSION, files)
+        sys.exit(1)
+    elif modified:
+        print("Warn: Predbat files are installed but have modifications")
+    else:
+        print("Predbat files are installed correctly for version {}".format(THIS_VERSION_DISPLAY))
+else:
+    # In compiled mode, we skip the entire self-update logic
+    print("Running in compiled mode; skipping local file checks and auto-update.")
+
+from const import (
+    COMPONENT_ERROR_STATUS_PREFIX,
+    COMPONENT_ERROR_STATUS_SUFFIX,
+    REPEAT_FULL_LOG_SECONDS,
+    TIME_FORMAT,
+    PREDICT_STEP,
+    RUN_EVERY,
+    INVERTER_TEST,
+    CONFIG_ROOTS,
+    CONFIG_REFRESH_PERIOD,
+    INVERTER_QUICK_UPDATE_SECONDS,
+    DEBUG_ENABLE_MAX_HOURS,
+)
+from config import APPS_SCHEMA, CONFIG_ITEMS
+import debug_history
+from utils import (
+    strptime_aware,
+    RepeatLogGate,
+    minutes_since_yesterday,
+    minutes_since_midnight,
+    dp1,
+    dp2,
+    dp3,
+    find_unmasked_secret_paths,
+    is_entity_id,
+    mask_secret_args,
+    malloc_trim,
+    limit_malloc_arenas,
+    MALLOC_ARENA_LIMIT,
+    export_limits_to_stored,
+    export_limits_from_stored,
+)
+from predheat import PredHeat
+from octopus import Octopus
+from energydataservice import Energidataservice
+from stromligning import Stromligning
+from components import Components, COMPONENT_LIST
+from execute import Execute
+from marginal import Marginal
+from plan import Plan
+from fetch import Fetch
+from output import Output
+from userinterface import UserInterface
+from compare import Compare
+from plugin_system import PluginSystem
+from github import GitHub
+from ha import run_async
+from control_ledger import ControlLedger
+from control_monitor import ControlMonitor
+
+
+class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, Marginal, Execute, Output, UserInterface, GitHub):
+    """Main PredBat orchestrator combining all subsystems via multiple inheritance.
+
+    Inherits from Hass (HA interface), Octopus (rate loading), Energidataservice, Stromligning,
+    Fetch (data loading), Plan (optimisation), Execute (inverter control),
+    Output (sensor publishing), and UserInterface (config management).
+    Runs the main prediction/optimisation loop every 5 minutes via update_pred().
+    """
+
+    def unit_conversion(self, entity_id, state, units, required_unit, going_to=False):
+        """
+        Convert state to the required unit if necessary
+        """
+
+        if not required_unit:
+            return state
+
+        if not units:
+            units = self.ha_interface.get_state(entity_id=entity_id, default="", attribute="unit_of_measurement")
+        if not units:
+            return state
+
+        units = str(units).strip()
+        required_unit = str(required_unit).strip()
+
+        try:
+            state = float(state)
+        except (ValueError, TypeError):
+            pass
+
+        # Swap order for going to conversion
+        if going_to:
+            units, required_unit = required_unit, units
+
+        if isinstance(state, float) and units and required_unit and units != required_unit:
+            units_lhs = units[0]
+            if units_lhs == "K":
+                units_lhs = "k"
+            if units_lhs not in ["k", "M", "m"]:
+                units_lhs = ""
+
+            required_lhs = required_unit[0]
+            if required_lhs not in ["k", "M", "m"]:
+                required_lhs = ""
+            if required_lhs == "K":
+                required_lhs = "k"
+
+            if units_lhs == "M" and required_lhs == "k":
+                # Convert MW to kW
+                state *= 1000.0
+                units = "k" + units[1:]
+            elif units_lhs == "k" and required_lhs == "M":
+                # Convert kW to MW
+                state /= 1000.0
+                units = "M" + units[1:]
+            elif units_lhs == "k" and required_lhs == "":
+                # Convert kWh to Wh
+                state *= 1000.0
+                units = units[1:]  # Remove 'k' from units
+            elif units_lhs == "" and required_lhs == "k":
+                # Convert Wh to kWh
+                state /= 1000.0
+                units = "k" + units  # Add 'k' to units
+            elif units_lhs == "m" and required_lhs == "":
+                # Convert mW to W
+                state /= 1000.0
+                units = units[1:]  # Remove 'm' from units
+            elif units_lhs == "" and required_lhs == "m":
+                # Convert W to mW
+                state *= 1000.0
+                units = "m" + units  # Add 'm' to units
+
+            if units != required_unit:
+                self.log("Warn: unit_conversion - Units mismatch for {}: expected {}, got {} after conversion".format(entity_id, required_unit, units))
+        return state
+
+    def get_state_wrapper(self, entity_id=None, default=None, attribute=None, refresh=False, required_unit=None, raw=False):
+        """
+        Wrapper function to get state from HA
+
+        entity_id = The entity id to get
+        default = Default value if not found
+        attribute = Specific attribute to get, if not set defaults to the current state
+        refresh = Force a refresh of the state from HA
+        required_unit = Convert the state to this unit if different
+        raw = Fetch the raw database information which includes state and all the attributes
+        """
+        if not self.ha_interface:
+            self.log("Error: get_state_wrapper - No HA interface available")
+            return None
+
+        # A literal is not something a state can be read from. Anything fetched with indirect=False
+        # can arrive here as one - several apps.yaml settings accept a fixed value in place of an
+        # entity, which the huawei and sofar templates use for reserve - and indexing into it raised
+        # rather than reading nothing, taking inverter creation down with it (GH#5003). entity_id of
+        # None is left alone: that is the documented "give me every state" call.
+        if entity_id is not None and not is_entity_id(entity_id):
+            self.log("Warn: get_state_wrapper - {} is a fixed value, not an entity id, so no state can be read from it".format(entity_id))
+            return default
+
+        # Entity with coded attribute
+        if entity_id and "$" in entity_id:
+            entity_id, attribute = entity_id.split("$")
+
+        state = self.ha_interface.get_state(entity_id=entity_id, default=default, attribute=attribute, refresh=refresh, raw=raw)
+        if not raw and required_unit:
+            state = self.unit_conversion(entity_id, state, None, required_unit)
+
+        return state
+
+    def set_state_wrapper(self, entity_id, state, attributes=None, required_unit=None):
+        """
+        Wrapper function to get state from HA
+        """
+        if attributes is None:
+            attributes = {}
+        if not self.ha_interface:
+            self.log("Error: set_state_wrapper - No HA interface available")
+            return False
+
+        # Same as get_state_wrapper - a fixed value in apps.yaml is not somewhere a state can be
+        # written, so say so rather than creating an entity named after a number (GH#5003)
+        if not is_entity_id(entity_id):
+            self.log("Warn: set_state_wrapper - {} is a fixed value, not an entity id, so {} can not be written to it".format(entity_id, state))
+            return False
+
+        state = self.unit_conversion(entity_id, state, None, required_unit, going_to=True)
+        return self.ha_interface.set_state(entity_id, state, attributes=attributes)
+
+    def fire_event_wrapper(self, domain, service):
+        """
+        Wrapper function to fire a HA event
+        """
+        if not self.ha_interface:
+            self.log("Error: fire_event_wrapper - No HA interface available")
+            return False
+        return self.call_service_wrapper("fire_event/service_registered", event_domain=domain, event_service=service)
+
+    def call_service_wrapper(self, service, **kwargs):
+        """
+        Wrapper function to call a HA service
+        """
+        if not self.ha_interface:
+            self.log("Error: call_service_wrapper - No HA interface available")
+            return False
+        return self.ha_interface.call_service(service, **kwargs)
+
+    def get_services_wrapper(self):
+        """
+        Wrapper function to get services from HA
+        """
+        if not self.ha_interface:
+            self.log("Error: get_services_wrapper - No HA interface available")
+            return False
+        return self.ha_interface.get_services()
+
+    def get_history_wrapper(self, entity_id, days=30, required=True, tracked=True):
+        """
+        Wrapper function to get history from HA
+        """
+        if not self.ha_interface:
+            self.log("Error: get_history_wrapper - No HA interface available")
+            return None
+
+        # If history cache is enabled then use it
+        ha_history = None
+        if self.components:
+            ha_history = self.components.get_component("ha_history")
+        if ha_history:
+            history = ha_history.get_history(entity_id, days=days, tracked=tracked)
+        else:
+            history = self.ha_interface.get_history(entity_id, days=days, now=self.now_utc)
+
+        if history and isinstance(history, list):
+            ## Get default units and patch it into missing entries in the history
+            unit_of_measurement = self.get_state_wrapper(entity_id, attribute="unit_of_measurement")
+            if unit_of_measurement:
+                for record in history[0]:
+                    if "attributes" not in record or not record["attributes"]:
+                        record["attributes"] = {}
+                    if "unit_of_measurement" not in record["attributes"]:
+                        record["attributes"]["unit_of_measurement"] = unit_of_measurement
+
+        if required and (history is None):
+            self.log("Error: Failure to fetch history for {}".format(entity_id))
+            raise ValueError
+        else:
+            return history
+
+    def time_now_str(self):
+        """
+        Return time now as human string
+        """
+        return (self.midnight_utc + timedelta(minutes=self.minutes_now)).strftime("%H:%M:%S")
+
+    def time_abs_str(self, minute):
+        """
+        Return time absolute as human string
+        """
+        return (self.midnight_utc + timedelta(minutes=minute)).strftime("%m-%d %H:%M:%S")
+
+    def reset(self):
+        """
+        Init stub
+        """
+        self.text_plan = "Computing please wait..."
+        self.prediction_cache_enable = True
+        self.base_load = 0
+        self.plan_interval_minutes = self.args.get("plan_interval_minutes", 30)
+        self.db_manager = None
+        self.plan_debug = False
+        self.arg_errors = {}
+        self.arg_warnings = {}
+        self.validate_config_retries_remaining = 0
+        self.validate_config_next_retry_time = None
+        self.ha_interface = None
+        self.num_cars = 0
+        self.fatal_error = False
+        self.components = None
+        self.CONFIG_ITEMS = copy.deepcopy(CONFIG_ITEMS)
+        self.comparison = None
+        self.predheat = None
+        self.predbat_mode = "Monitor"
+        self.soc_kwh_history = {}
+        self.unmatched_args = {}
+        self.define_service_list()
+        self.stop_thread = False
+
+        # Forecast.solar API request metrics for monitoring
+        self.currency_symbols = self.args.get("currency_symbols", "£p")
+        self.watch_list = []
+        self.restart_active = False
+        self.clock_skew_warn_time = {}  # Per-inverter time the moderate clock-skew warning was last logged, so it repeats hourly rather than every cycle
+        self.control_ledger = ControlLedger()
+        self.control_ledger_restored = False
+        self.control_monitor = ControlMonitor()
+        self.inverter_needs_reset = False
+        self.inverter_needs_reset_force = ""
+        self.inverters = []
+        self.manual_charge_times = []
+        self.manual_export_times = []
+        self.manual_freeze_charge_times = []
+        self.manual_freeze_export_times = []
+        self.manual_demand_times = []
+        self.manual_all_times = []
+        self.manual_api = []
+        self.manual_import_rates = {}
+        self.manual_export_rates = {}
+        self.manual_load_adjust = {}
+        self.config_index = {}
+        self.dashboard_index = []
+        self.dashboard_index_app = {}
+        self.dashboard_values = {}
+        self.prefix = self.args.get("prefix", "predbat")
+        self.current_status = None
+        # The status sensor's state (unclamped) and detail as last written, so a repeated warning can keep both
+        self.status_state = None
+        self.status_detail = ""
+        # The state the last completed run carried out, with no warning text - the sensor's run_state attribute
+        self.status_run_state = None
+        self.previous_status = None
+        self.had_errors = False
+        self.status_warning = None
+        self.status_warning_debug = ""
+        self.status_lock = threading.RLock()
+        self.plan_valid = False
+        self.plan_preclip = None
+        self.plan_last_updated = None
+        self.plan_last_updated_minutes = 0
+        self.plugin_system = None
+        self.calculate_plan_every = 5
+        self.prediction_started = False
+        self.inverter_rate_intent = {}
+        self.inverter_balance_overridden = {}
+        self.update_pending = True
+        self.midnight_utc = None
+        self.difference_minutes = 0
+        self.minutes_to_midnight = 0
+        self.days_previous = [7]
+        self.days_previous_weight = [1]
+        self.max_days_previous = max(self.days_previous) + 1
+        self.forecast_days = 0
+        self.forecast_minutes = 0
+        self.soc_kw = 0
+        self.soc_percent = 0
+        self.soc_max = 10.0
+        self.battery_temperature = 20
+        self.end_record = 24 * 60 * 2
+        self.predict_soc = {}
+        self.predict_soc_best = {}
+        self.predict_iboost_best = {}
+        self.predict_car_hold_best = {}
+        self.predict_metric_best = {}
+        self.metric_min_improvement = 0.0
+        self.metric_min_improvement_export = 0.1
+        self.metric_min_improvement_export_freeze = 0.1
+        self.metric_min_improvement_plan = 2.0
+        self.export_more_solar = False
+        self.export_more_solar_threshold = 1.0
+        self.export_more_solar_warned_reason = None
+        self.metric_battery_cycle = 0.0
+        self.metric_battery_value_scaling = 1.0
+        self.metric_battery_value_export_scaling = 0.8
+        self.calculate_pv90_plan = False
+        self.pv_metric90_weight = 0.15
+        # DC array size in kWp, capping the p90 cloud model's extrapolation. Auto-detected from the
+        # forecast provider (see resolve_pv_array_kwp); 0 leaves the cap inert.
+        self.pv_array_kwp = 0.0
+        self.load_scaling90 = 0.9
+        self.metric_future_rate_offset_import = 0.0
+        self.metric_future_rate_offset_export = 0.0
+        self.metric_inday_adjust_damping = 1.0
+        self.metric_standing_charge = 0.0
+        self.metric_self_sufficiency = 0.0
+        self.metric_dynamic_load_adjust = False
+        self.metric_pv_calibration_enable = True
+        self.dynamic_load_baseline = {}
+        self.iboost_value_scaling = 1.0
+        self.rate_import = {}
+        self.rate_import_no_io = {}
+        self.rate_import_base = {}
+        self.rate_export = {}
+        self.rate_export_base = {}
+        self.rate_gas = {}
+        self.rate_slots = []
+        self.low_rates = []
+        self.low_rates_tariff = []
+        self.high_export_rates = []
+        self.cost_today_sofar = 0
+        self.carbon_today_sofar = 0
+        self.octopus_free_slots = []
+        self.octopus_saving_slots = []
+        self.car_charging_slots = []
+        self.car_charging_now_slots = []
+        self.reserve = 0
+        self.reserve_percent = 0.0
+        self.reserve_current = 0
+        self.reserve_current_percent = 0.0
+        self.battery_loss = 1.0
+        self.battery_loss_discharge = 1.0
+        self.inverter_loss = 1.0
+        self.inverter_freeze_export_discharge_rate = 0.0
+        self.inverter_hybrid = True
+        self.pv_ac_limit = 0
+        self.inverter_soc_reset = False
+        self.inverter_set_charge_before = True
+        self.best_soc_min = 0
+        self.best_soc_max = 0
+        self.best_soc_keep = 0
+        self.best_soc_keep_weight = 0.5
+        self.rate_min = 0
+        self.rate_min_minute = 0
+        self.rate_min_forward = {}
+        self.rate_min_base = 0
+        self.rate_max = 0
+        self.rate_max_minute = 0
+        self.rate_max_base = 0
+        self.rate_import_tariff_max = 0
+        self.rate_export_cost_threshold = 99
+        self.rate_import_cost_threshold = 99
+        self.rate_import_pre_event_end = None
+        self.rate_import_pre_event_threshold = None
+        self.rate_best_cost_threshold_charge = None
+        self.rate_best_cost_threshold_export = None
+        self.rate_average = 0
+        self.rate_export_min = 0
+        self.rate_export_min_minute = 0
+        self.rate_export_max = 0
+        self.rate_export_max_minute = 0
+        self.rate_export_max_forward = {}
+        self.rate_export_average = 0
+        self.rate_gas_min = 0
+        self.rate_gas_max = 0
+        self.rate_gas_average = 0
+        self.rate_gas_min_minute = 0
+        self.rate_gas_max_minute = 0
+        self.set_soc_minutes = 5
+        self.set_window_minutes = 5
+        self.debug_enable = False
+        self.debug_enable_started = None
+        self.debug_history_last_capture = None
+        self.debug_history_storage_warned = None
+        self.import_today = {}
+        self.import_today_now = 0
+        self.export_today = {}
+        self.export_today_now = 0
+        self.pv_today = {}
+        self.pv_today_now = 0
+        self.pv_power = 0
+        self.load_power = 0
+        self.battery_power = 0
+        self.grid_power = 0
+        self.car_charging_power = 0
+        self.car_charging_power_configured = False
+        self.io_adjusted = {}
+        # Bird-in-hand credit for a confirmed dispatch run and whether one is in force (io_confirmed_credit_update)
+        self.io_confirmed_credit = {}
+        self.io_confirmed_active = False
+        # One replan may take a same-cost plan once a run becomes boosted (should_replace_plan)
+        self.io_confirmed_tiebreak = False
+        # Repeated Intelligent slot lists are logged briefly between full logs (rate_add_io_slots)
+        self.io_slot_log_gate = RepeatLogGate(REPEAT_FULL_LOG_SECONDS)
+        self.current_charge_limit = 0.0
+        self.current_charge_limit_kwh = 0.0
+        self.inverter_limit = 0.0
+        self.export_limit = 0.0
+        self.charge_limit = []
+        self.charge_limit_best = []
+        self.charge_window = []
+        self.charge_window_best = []
+        self.car_charging_battery_size = [100]
+        self.car_charging_limit = [100]
+        # Per-car charge limit as the prediction model should see it, or None to use car_charging_limit.
+        # Set by fetch_sensor_data_cars() for cars on Octopus Intelligent dispatch slots (#4967).
+        self.car_charging_limit_model = None
+        self.car_charging_soc = [0]
+        self.car_charging_soc_next = [None]
+        self.car_charging_rate = [7.4]
+        self.car_charging_loss = 1.0
+        self.export_window = []
+        self.export_limits = []
+        self.export_limits_best = []
+        self.export_window_best = []
+        self.battery_rate_max_charge = 0.0333
+        self.battery_rate_max_charge_dc = 0
+        self.battery_rate_max_discharge = 0.0333
+        self.battery_rate_max_export = 0.0333
+        self.battery_rate_min = 0
+        self.battery_rate_max_scaling = 1.0
+        self.battery_rate_max_scaling_discharge = 1.0
+        self.car_energy_reported_load = False
+        self.charge_rate_now = 0
+        self.discharge_rate_now = 0
+        self.car_charging_hold = False
+        self.car_charging_manual_soc = []
+        self.car_charging_manual_soc_energy = []
+        # Each manually tracked car's record, also published as a sensor so a restart can read it back - see car_manual_soc_track()
+        self.car_manual_soc_state = {}
+        self.car_charging_threshold = 99
+        self.car_charging_energy = {}
+        self.car_charging_energy_warned = False
+        # Which component's automatic_config() owns octopus_ready_time/octopus_charge_limit.
+        # Both OctopusAPI and OhmeAPI can wire them, and Octopus re-runs its automatic_config
+        # whenever the tariff or intelligent device set moves - without a claim it silently takes the
+        # args back off Ohme part way through a run. None means nobody has claimed them. The claim
+        # does not cover octopus_intelligent_slot: Octopus goes on wiring its dispatch sensor there
+        # as the record of completed dispatches, and Ohme adds octopus_intelligent_planned_slot (#5413).
+        self.car_slot_owner = None
+        self.octopus_intelligent_charging = False
+        self.octopus_intelligent_ignore_unplugged = False
+        self.octopus_intelligent_consider_full = False
+        self.octopus_intelligent_trust_slots = True
+        self.octopus_intelligent_dynamic = True
+        self.notify_devices = ["notify"]
+        self.octopus_url_cache = {}
+        self.dispatch_timeline_last = {}
+        self.dispatch_timeline_pending = []
+        self.dispatch_unconfirmed_last = {}
+        self.ge_url_cache = {}
+        self.github_url_cache = {}
+        self.load_minutes = {}
+        self.load_minutes_now = 0
+        self.load_minutes_age = 0
+        self.load_minutes_source = None
+        self.load_last_period = 0
+        self.load_last_status = "baseline"
+        self.dynamic_load_car_since = {}
+        self.dynamic_load_car_cancelled = {}
+        self.dynamic_load_car_warned = []
+        self.dynamic_load_car_warned_iog_off = False
+        self.dynamic_load_car_warned_dynamic_off = False
+        self.dynamic_load_car_run = {}
+        self.dynamic_load_car_confirmed = {}
+        self.dynamic_load_car_confirmed_periods = {}
+        self.dynamic_load_car_saved = {}
+        self.dynamic_load_car_sensors = {}
+        self.dynamic_load_car_effective = {}
+        self.dynamic_load_car_stripped = 0
+        self.octopus_surplus = set()
+        self.octopus_slots_planned = {}
+        self.octopus_slots_held = {}
+        self.octopus_slots_held_saved = {}
+        self.dispatch_billing_warned = None
+        self.battery_capacity_nominal = False
+        self.battery_scaling_auto = False
+        self.releases = {}
+        self.balance_inverters_enable = False
+        self.balance_inverters_charge = True
+        self.balance_inverters_discharge = True
+        self.balance_inverters_crosscharge = True
+        self.balance_inverters_threshold_charge = 1.0
+        self.balance_inverters_threshold_discharge = 1.0
+        self.load_inday_adjustment = 1.0
+        self.holiday_load_scaling = 0.7
+        self.set_read_only = True
+        self.set_read_only_axle = False
+        self.set_reserve_enable = False
+        self.set_charge_freeze_only = False
+        self.metric_cloud_coverage = 0.0
+        self.future_energy_rates_import = {}
+        self.future_energy_rates_export = {}
+        self.load_scaling_dynamic = {}
+        self.battery_charge_power_curve = {}
+        self.battery_charge_power_curve_default = {}
+        self.battery_charge_power_curve_auto = False
+        self.battery_discharge_power_curve = {}
+        self.battery_discharge_power_curve_default = {}
+        self.battery_discharge_power_curve_auto = False
+        self.computed_charge_curve = False
+        self.computed_discharge_curve = False
+        self.isCharging = False
+        self.isCharging_Target = 0
+        self.isExporting = False
+        self.isExporting_Target = 0
+        self.savings_today_predbat = 0.0
+        self.savings_today_predbat_soc = 0.0
+        self.savings_today_pvbat = 0.0
+        self.savings_today_actual = 0.0
+        self.savings_last_updated = None
+        self.cost_yesterday_car = 0.0
+        self.cost_total_car = 0.0
+        self.carbon_yesterday = 0.0
+        self.rate_import = {}
+        self.rate_import_replicated = {}
+        self.rate_import_saving_minutes = set()
+        self.rate_import_pre_saving = {}
+        self.rate_export = {}
+        self.rate_export_replicated = {}
+        self.rate_export_saving_minutes = set()
+        self.rate_export_pre_saving = {}
+        self.rate_slots = []
+        self.low_rates = []
+        self.low_rates_tariff = []
+        self.high_export_rates = []
+        self.axle_sessions = []
+        self.cost_today_sofar = 0
+        self.carbon_today_sofar = 0
+        self.import_today = {}
+        self.export_today = {}
+        self.pv_today = {}
+        self.load_minutes = {}
+        self.load_minutes_age = 0
+        self.load_minutes_source = None
+        self.load_forecast = {}
+        self.load_forecast_array = []
+        self.pv_forecast_minute = {}
+        self.pv_forecast_minute10 = {}
+        self.pv_forecast_minute90 = {}
+        self.pv_light_dark = {}
+        # (p50, p90) content signatures from the previous plan run, used to spot a p90 that has been
+        # left behind by a p50 reassigned underneath it - see Plan.refresh_pv_forecast_minute90()
+        self.pv_forecast_minute90_signatures = None
+        self.load_scaling_dynamic = {}
+        self.carbon_intensity = {}
+        self.carbon_history = {}
+        self.carbon_enable = False
+        self.iboost_enable = False
+        self.iboost_gas = False
+        self.iboost_solar = False
+        self.iboost_solar_excess = False
+        self.iboost_gas_export = False
+        self.iboost_smart = False
+        self.iboost_smart_min_length = 30
+        self.iboost_on_export = False
+        self.iboost_prevent_discharge = False
+        self.iboost_smart_threshold = 0
+        self.iboost_rate_threshold = 9999
+        self.iboost_rate_threshold_export = 9999
+        self.iboost_plan = []
+        self.iboost_energy_subtract = True
+        self.iboost_running = False
+        self.iboost_running_full = False
+        self.iboost_running_solar = False
+        self.last_service_hash = {}
+        self.count_inverter_writes = {}
+        self.rate_slots = []
+        self.low_rates = []
+        self.low_rates_tariff = []
+        self.high_export_rates = []
+        self.octopus_slots = [[] for _ in range(8)]
+        self.cost_today_sofar = 0
+        self.carbon_today_sofar = 0
+        self.import_today = {}
+        self.export_today = {}
+        self.pv_today = {}
+        self.load_minutes = {}
+        self.load_minutes_age = 0
+        self.load_minutes_source = None
+        self.battery_temperature_charge_curve = {}
+        self.battery_temperature_discharge_curve = {}
+        self.battery_temperature_history = {}
+        self.battery_temperature_prediction = {}
+        self.alerts = []
+        self.alert_active_keep = {}
+        self.manual_soc_keep = {}
+        self.manual_soc_max_keep = {}
+        self.all_active_keep = {}
+        self.all_active_keep_max = {}
+        self.set_charge_low_power = False
+        self.set_export_low_power = False
+        self.config_root = "./"
+        self.inverter_can_charge_during_export = True
+        self.inverter_support_feedin_first = False
+        self.octopus_last_joined_try = None
+        # None = not yet confirmed, True = the current Power Down join service is confirmed registered.
+        # Deliberately never set to False - a failed probe still re-tries every join rather than being
+        # cached, since the underlying result can be an ambiguous timeout, not just "not registered".
+        # See the join logic in octopus.py and TODO(#4599).
+        self.octopus_join_service_power_down = None
+        self.calculate_savings_max_charge_slots = 1
+        self.inverter_data_last_fetch = None
+        # Pre-initialise the inverter clock skew offsets (set for real in fetch_config_options());
+        # anything that runs before that first fetch, e.g. in template mode, must read 0 rather
+        # than AttributeError on an unset attribute (#4965)
+        self.inverter_clock_skew_start = 0
+        self.inverter_clock_skew_end = 0
+        self.inverter_clock_skew_discharge_start = 0
+        self.inverter_clock_skew_discharge_end = 0
+        self.octopus_url_cache_loaded = False
+        self.github_url_cache_loaded = False
+        self.load_forecast_history = False
+        self.prediction_kernel_enable = False
+
+        for root in CONFIG_ROOTS:
+            if os.path.exists(root):
+                self.config_root = root
+                break
+        self.config_root_p = self.config_root
+        self.log("Config root is {}".format(self.config_root))
+
+    def update_time(self, print=True):
+        """
+        Update the current time/date
+        """
+        self.local_tz = pytz.timezone(self.args.get("timezone", "Europe/London"))
+        skew = self.args.get("clock_skew", 0)
+        if skew:
+            self.log("Warn: Clock skew is set to {} minutes".format(skew))
+        self.now_utc_real = datetime.now(self.local_tz)
+        now_utc = self.now_utc_real + timedelta(minutes=skew)
+        now_utc = now_utc.replace(second=0, microsecond=0, minute=(now_utc.minute - (now_utc.minute % PREDICT_STEP)))
+
+        self.now_utc = now_utc
+        self.midnight_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        # Everything below is measured against now_utc, the configured timezone's clock. This used
+        # to run off a second, naive clock (datetime.now(), the host's), which agreed with now_utc
+        # only while the container's timezone matched the timezone: setting - and silently offset
+        # minutes_now and every rendered timestamp from the midnight_utc-keyed data they describe
+        # when it did not. now_utc and the midnight derived from it share a tzinfo, so these stay
+        # wall-clock differences, exactly as the naive arithmetic was.
+        self.difference_minutes = minutes_since_yesterday(now_utc)
+        self.minutes_now = minutes_since_midnight(now_utc, self.midnight_utc)
+        self.minutes_to_midnight = 24 * 60 - self.minutes_now
+        self.log("--------------- PredBat - update at {} with clock skew {} minutes, minutes now {}".format(now_utc, skew, self.minutes_now))
+
+    # @profile
+    def _emit_snapshot_metrics(self):
+        """Emit point-in-time metrics after each update cycle."""
+        from predbat_metrics import metrics
+
+        m = metrics()
+
+        m.up.labels(version=THIS_VERSION).set(1)
+        m.last_update_timestamp.set_to_current_time()
+
+        # Plan age
+        if self.plan_last_updated:
+            plan_age = self.now_utc - self.plan_last_updated
+            m.plan_age_minutes.set(plan_age.total_seconds() / 60.0)
+
+        # Battery state
+        m.battery_soc_kwh.set(self.soc_kw)
+        m.battery_soc_percent.set(self.soc_percent)
+        m.battery_max_kwh.set(self.soc_max)
+        m.charge_rate_kw.set(self.charge_rate_now * MINUTE_WATT / 1000.0)
+        m.discharge_rate_kw.set(self.discharge_rate_now * MINUTE_WATT / 1000.0)
+        m.grid_power.set(self.grid_power / 1000.0)
+        m.battery_power.set(self.battery_power / 1000.0)
+        m.load_power.set(self.load_power / 1000.0)
+        m.pv_power.set(self.pv_power / 1000.0)
+
+        # Currency symbol
+        m.currency_symbol = self.currency_symbols[0]
+
+        # Cost and savings
+        m.cost_today.set(self.cost_today_sofar)
+        m.savings_today_pvbat.set(self.savings_today_pvbat)
+        m.savings_today_actual.set(self.savings_today_actual)
+        m.savings_today_predbat.set(self.savings_today_predbat)
+
+        # Config validity
+        m.config_valid.set(0 if self.arg_errors else 1)
+        m.config_warnings.set(len(self.arg_errors) if self.arg_errors else 0)
+
+        # Errors
+        if self.had_errors:
+            m.errors_total.labels(type="general").inc()
+
+        # Control ownership ledger
+        conflict_events = self.control_ledger.recent_events(time.time())
+        m.control_conflicts_24h.set(len(conflict_events))
+        sustained = self.control_ledger.sustained_controls(conflict_events)
+        m.control_conflicts_sustained_total.set(len(sustained))
+        m.control_conflicts_events = self.control_ledger.newest_events(20)
+        m.control_conflicts_sustained_controls = sustained
+
+        # Control failure monitor
+        m.control_failures_24h.set(len(self.control_monitor.recent_events(time.time())))
+        m.control_failures_total.set(self.control_monitor.total)
+        m.control_failures_events = self.control_monitor.newest_events(20)
+
+    def publish_control_failures(self, now):
+        """
+        Publish the control-failure sensors, restoring their history first if not yet done.
+
+        The two entities ARE the durable store: the events attribute and the total's state are what
+        restore() reads back after a restart. The restore is retried every cycle until the total
+        reads back as a number, and while it is unresolved a total of 0 is not written - publishing
+        0 over a total that merely could not be read yet would register as a reset in HA long-term
+        statistics. Only the first attempt and every 12th after it fall back to history; the rest
+        read current state only, so an install that has never failed does not search 30 days of
+        history every cycle.
+
+        Args:
+            now (float): epoch seconds
+        """
+        monitor = self.control_monitor
+        if not monitor.restored:
+            if monitor.history_read_due():
+                read = self.load_previous_value_from_ha
+            else:
+
+                def read(entity, attribute=None):
+                    """Current state only, filtered the way load_previous_value_from_ha filters it."""
+                    value = self.get_state_wrapper(entity, attribute=attribute)
+                    return None if value in ("unavailable", "unknown") else value
+
+            monitor.restore(
+                read(self.prefix + ".control_failures", attribute="events"),
+                read(self.prefix + ".control_failures_total"),
+            )
+        monitor.prune(now)
+        recent = monitor.recent_events(now)
+        by_mode = monitor.by_mode(recent)
+        self.dashboard_item(
+            self.prefix + ".control_failures",
+            state=len(recent),
+            attributes={
+                "friendly_name": "Control failures (24h)",
+                "state_class": "measurement",
+                "unit_of_measurement": "failures",
+                "icon": "mdi:battery-alert",
+                "events": monitor.newest_events(20),
+                "by_mode": by_mode,
+            },
+        )
+        if monitor.restored or monitor.total > 0:
+            self.dashboard_item(
+                self.prefix + ".control_failures_total",
+                state=monitor.total,
+                attributes={
+                    "friendly_name": "Control failures (total)",
+                    "state_class": "total_increasing",
+                    "unit_of_measurement": "failures",
+                    "icon": "mdi:battery-alert",
+                },
+            )
+            # Once written, the entity holds our own value, so there is nothing left to restore
+            monitor.restored = True
+        if recent:
+            self.log("Control failures: {} slot(s) in the last 24h {}".format(len(recent), by_mode))
+
+    def save_plan(self):
+        """Save the current best plan via the storage component so it can be restored on next startup."""
+        storage = self.components.get_component("storage") if self.components else None
+        if not storage:
+            self.log("Warning: Storage component unavailable, cannot save plan")
+            return
+        plan_data = {
+            "charge_window_best": self.charge_window_best,
+            "charge_limit_best": self.charge_limit_best,
+            "export_window_best": self.export_window_best,
+            "export_limits_best": export_limits_to_stored(self.export_limits_best),
+            "plan_preclip": self.plan_preclip,
+            "plan_last_updated": self.plan_last_updated.isoformat() if self.plan_last_updated else None,
+            "plan_last_updated_minutes": self.plan_last_updated_minutes,
+        }
+        try:
+            # storage.load() checks expiry against real wall-clock time (datetime.now(timezone.utc)),
+            # the same convention every other expiry-bearing storage.save() call in the codebase
+            # uses (github.py, octopus.py, enphase.py, fox.py, kraken.py, solax.py, etc.) - self.now_utc
+            # is Predbat's own simulated/plan clock, which is deliberately not real time during a
+            # debug-file replay or a test, and can drift from it. Using it here made a freshly-saved
+            # plan look already-expired the instant it was written whenever that drift exceeded 8
+            # hours (#5079).
+            expiry = datetime.now(timezone.utc) + timedelta(hours=8)
+            run_async(storage.save("predbat", "plan", plan_data, format="json", expiry=expiry))
+            self.log("Saved plan to storage")
+        except Exception as e:
+            self.log("Warning: Failed to save plan: {}".format(e))
+
+    def load_plan(self):
+        """Restore a previously saved plan from storage if it is recent enough."""
+        storage = self.components.get_component("storage") if self.components else None
+        if not storage:
+            self.log("Warning: Storage component unavailable, cannot load plan")
+            return
+
+        try:
+            plan_data = run_async(storage.load("predbat", "plan"))
+        except Exception as e:
+            self.log("Warning: Failed to load saved plan: {}".format(e))
+            return
+
+        if not plan_data:
+            self.log("No saved plan found in storage")
+            return
+
+        if not isinstance(plan_data, dict):
+            self.log("Warning: Saved plan has unexpected type {}, ignoring".format(type(plan_data).__name__))
+            return
+
+        saved_updated = plan_data.get("plan_last_updated")
+        if not saved_updated:
+            self.log("Saved plan has no timestamp, ignoring")
+            return
+
+        try:
+            saved_dt = datetime.fromisoformat(saved_updated)
+        except (ValueError, TypeError):
+            self.log("Warning: Saved plan timestamp is invalid, ignoring")
+            return
+
+        if saved_dt.tzinfo is None:
+            saved_dt = saved_dt.replace(tzinfo=timezone.utc)
+
+        age_minutes = (self.now_utc - saved_dt).total_seconds() / 60
+
+        self.charge_window_best = plan_data.get("charge_window_best", [])
+        self.charge_limit_best = plan_data.get("charge_limit_best", [])
+        self.export_window_best = plan_data.get("export_window_best", [])
+        # Accepts the self-describing mapping form, the 3-element sequences a JSON round trip makes
+        # of the tuples, and the bare packed floats written by versions before the split.
+        self.export_limits_best = export_limits_from_stored(plan_data.get("export_limits_best", []))
+        # The pre-clip snapshot plan selection scores against. Older saves predate it, and it is only ever a
+        # four part plan, so anything else is discarded and the comparison falls back to the clipped plans.
+        preclip = plan_data.get("plan_preclip")
+        if isinstance(preclip, (list, tuple)) and len(preclip) == 4:
+            preclip_parts = list(preclip)
+            preclip_parts[3] = export_limits_from_stored(preclip_parts[3])
+            self.plan_preclip = tuple(preclip_parts)
+        else:
+            self.plan_preclip = None
+        self.plan_last_updated = saved_dt
+        self.plan_last_updated_minutes = plan_data.get("plan_last_updated_minutes", 0)
+        self.plan_valid = True
+        self.log("Restored saved plan from {:.0f} minutes ago: {} charge windows, {} export windows".format(age_minutes, len(self.charge_window_best), len(self.export_window_best)))
+
+    def _debug_enable_auto_scope(self):
+        """Write a raw debug.yaml this cycle if switch.predbat_debug_enable is on, and
+        auto-disable the switch after DEBUG_ENABLE_MAX_HOURS rather than let it run forever.
+
+        debug_enable also gates verbose logging and the C++ kernel bypass (a more accurate but far
+        slower prediction path, see #4453) - both genuinely useful while actively watching a live
+        issue develop cycle to cycle, at a finer grain than the rotating debug-history buffer's
+        (#4417) coarsest interval of 1 hour. So this does not remove the raw per-cycle write, only
+        bounds how long it - and the slow-path logging it's normally turned on alongside - can run
+        unattended, since leaving it on by accident causes both unbounded predbat_debug_*.yaml disk
+        growth and a standing performance cost, not just the former.
+        """
+        if not self.debug_enable:
+            self.debug_enable_started = None
+            return
+
+        if self.debug_enable_started is None:
+            self.debug_enable_started = self.now_utc
+
+        if (self.now_utc - self.debug_enable_started) >= timedelta(hours=DEBUG_ENABLE_MAX_HOURS):
+            self.log("Warn: debug_enable has been on for over {} hours - auto-disabling to bound disk writes and the slower debug prediction path. Re-enable if you need more time.".format(DEBUG_ENABLE_MAX_HOURS))
+            self.expose_config("debug_enable", False)
+            self.debug_enable = False
+            self.debug_enable_started = None
+            return
+
+        self.create_debug_yaml()
+
+    def _capture_debug_history(self):
+        """Capture a rolling debug-history snapshot if due, for #4417.
+
+        Independent of switch.predbat_debug_enable - runs on a coarse interval so
+        there is always some recent history to replay a bug report against, rather
+        than only when the switch happened to already be on before the problem
+        occurred. switch.predbat_debug_history_enable disables the routine capture
+        entirely (default on), but debug_history_force_capture still works even
+        then - an explicit "give me one right now" request (e.g. from an automation
+        that just noticed something worth investigating) is a different intent to
+        "keep a rolling background history" and must not be silently skipped by
+        that switch. debug_history_count has a config-schema minimum of 1 (not 0)
+        precisely so it can't also mean "off" - the switch is the only off-switch,
+        avoiding two independent, potentially-conflicting ways to disable this.
+
+        debug_history_last_capture and the force-capture switch are both only
+        updated on a genuine successful capture, per @springfall2008's #4438 review
+        (items 1-3): previously both reset unconditionally, so a failed attempt
+        (an exception, or storage simply being unavailable) was silently treated
+        as if it had succeeded - deferring the next *routine* retry a full
+        debug_history_interval for no reason, and (for a forced request) resetting
+        the switch before the snapshot the docs promise it waits for was actually
+        taken. A failed forced capture now leaves the switch on, so it retries
+        every cycle until it succeeds or the switch is turned off - a routine
+        capture retries at its normal interval either way, since a failure simply
+        leaves last_capture at its previous (possibly-None) value rather than
+        artificially advancing it.
+
+        The "storage unavailable" warning is throttled separately
+        (debug_history_storage_warned), on the same interval, so a persistent
+        outage logs once per interval instead of every ~5-minute cycle - this is
+        deliberately independent of the capture throttle above, so a later
+        genuine capture attempt is never skipped just because the warning was
+        recently logged.
+        """
+        count = int(self.get_arg("debug_history_count", 15))
+        interval_hours = max(1, int(self.get_arg("debug_history_interval", 3)))
+        enabled = self.get_arg("debug_history_enable", True)
+        forced = self.get_arg("debug_history_force_capture", False)
+        if not enabled and not forced:
+            return
+        if not forced:
+            if self.debug_history_last_capture is not None and (self.now_utc - self.debug_history_last_capture) < timedelta(hours=interval_hours):
+                return
+        storage = self.components.get_component("storage") if self.components else None
+        if not storage:
+            if self.debug_history_storage_warned is None or (self.now_utc - self.debug_history_storage_warned) >= timedelta(hours=interval_hours):
+                self.log("Warning: Storage component unavailable, cannot capture debug history")
+                self.debug_history_storage_warned = self.now_utc
+            return
+        try:
+            yaml_text = self.create_debug_yaml(write_file=False)
+            # Label the snapshot with the plan slot it falls in, not the arbitrary moment the
+            # ~5-minute cycle happened to trigger the capture - so it lines up exactly with one
+            # plan row's own timestamp (both are minute_relative offsets from self.midnight_utc
+            # in steps of self.plan_interval_minutes, see output.py's raw_plan builder) instead of
+            # needing a fuzzy nearest-match window in the plan's History view.
+            slot_minutes = max(1, self.plan_interval_minutes)
+            minutes_since_midnight = int((self.now_utc - self.midnight_utc).total_seconds() // 60)
+            capture_time = self.midnight_utc + timedelta(minutes=(minutes_since_midnight // slot_minutes) * slot_minutes)
+            # The window this buffer is meant to cover, e.g. 15 x 3h = 45h - a snapshot older
+            # than that gets pruned even if max_count hasn't been reached yet, so a burst of
+            # close-together captures (several force-captures, or a shortened interval) can't
+            # leave something far older than the intended window lingering just because the
+            # count cap alone hasn't caught up to it. count's config-schema minimum is 1, but
+            # clamp defensively anyway in case a stale persisted value predates that minimum.
+            count = max(count, 1)
+            max_age = timedelta(hours=interval_hours * count)
+            run_async(debug_history.capture_snapshot(storage, yaml_text, capture_time, count, max_age=max_age))
+        except Exception as e:
+            self.log("Warning: Failed to capture debug history snapshot: {}".format(e))
+            return
+        self.debug_history_last_capture = self.now_utc
+        if forced:
+            # Only reset once the snapshot has genuinely been taken, matching docs/customisation.md -
+            # an automation should never have to remember to turn it back off, but a failed attempt
+            # should retry rather than being silently swallowed by an early reset.
+            self.expose_config("debug_history_force_capture", False)
+
+    def record_final_run_status(self, status, status_extra):
+        """
+        Publish the component health dashboard item and record the final run status for this cycle.
+        Any component that is active but not alive fails the run, even if the plan itself computed successfully.
+        """
+        failed_components = []
+        if self.components:
+            all_components = self.components.get_all()
+            active_components = self.components.get_active()
+            error_count = 0
+            component_status = {}
+            component_error_count = {}
+            all_healthy = True
+            for component_name in all_components:
+                is_active = self.components.is_active(component_name)
+                is_alive = self.components.is_alive(component_name)
+                component_error_count[component_name] = self.components.get_error_count(component_name)
+                if is_active and not is_alive:
+                    # Component is active but not alive - error state
+                    component_status[component_name] = "error"
+                    all_healthy = False
+                    error_count += 1
+                    component = self.components.get_component(component_name)
+                    if not component.is_calculating():
+                        # hasattr rather than a plain call: a component registered outside
+                        # ComponentBase (tests register fakes directly) doesn't have the method
+                        name = COMPONENT_LIST.get(component_name, {}).get("name", component_name)
+                        message = component.health_message() if hasattr(component, "health_message") else None
+                        failed_components.append("{} ({})".format(name, message) if message else name)
+                elif self.components.load_error(component_name):
+                    # Configured but could not be imported or constructed - an error, not merely disabled
+                    component_status[component_name] = "error"
+                    all_healthy = False
+                    error_count += 1
+                    failed_components.append(COMPONENT_LIST.get(component_name, {}).get("name", component_name))
+                elif is_active:
+                    component_status[component_name] = "running"
+                else:
+                    component_status[component_name] = "disabled"
+            self.dashboard_item(
+                "binary_sensor." + self.prefix + "_components_healthy",
+                state="on" if all_healthy else "off",
+                attributes={
+                    "friendly_name": "Predbat components healthy",
+                    "icon": "mdi:cog-outline" if all_healthy else "mdi:cog-off-outline",
+                    "components": component_status,
+                    "component_error_count": component_error_count,
+                    "active_count": len(active_components),
+                    "total_count": len(all_components),
+                    "error_count": error_count,
+                },
+            )
+
+        # Published as the sensor's run_state attribute by whichever status write follows, and kept until the
+        # next run completes: a run that stops early, or a warning part way through one, leaves the inverter
+        # on this state.
+        self.status_run_state = status
+
+        if self.had_errors:
+            self.log("Error: Completed run status {} with Errors reported (check log)".format(status))
+            self.record_status_under_warning(status, status_extra)
+        elif failed_components:
+            error_status = COMPONENT_ERROR_STATUS_PREFIX + status + COMPONENT_ERROR_STATUS_SUFFIX + ", ".join(failed_components)
+            self.log(error_status)
+            self.record_status(
+                error_status,
+                debug="best_charge_limit={} best_charge_window={} best_export_limit= {} best_export_window={}".format(self.charge_limit_best, self.charge_window_best, self.export_limits_best, self.export_window_best),
+                notify=True,
+                had_errors=True,
+            )
+        else:
+            self.log("Info: Completed run status {}".format(status))
+            self.record_status(
+                status,
+                debug="best_charge_limit={} best_charge_window={} best_export_limit= {} best_export_window={}".format(self.charge_limit_best, self.charge_window_best, self.export_limits_best, self.export_window_best),
+                notify=True,
+                extra=status_extra,
+            )
+
+    def update_car_manual_soc(self):
+        """
+        Write the predicted next car SoC back to the manual car SoC tracker for cars using car_charging_manual_soc
+
+        A car with a car_charging_energy sensor is skipped: car_manual_soc_track() adds the energy it
+        actually took instead, and adding the plan's prediction as well would count it twice.
+
+        So is a car whose plugged-in sensor (car_charging_plugged, else car_charging_planned) now reads unplugged, or whose
+        car_charging_now sensor reads not charging: it is not charging, so there is nothing to add. A car_charging_now
+        sensor that is unavailable or unknown is no reading, and the plan's prediction is written as before. Unlike the
+        reset on unplug, a car_charging_planned that turns off when a charge finishes is right here: nothing more is added.
+
+        What is written goes into the car's tracking record too, so the next cycle does not take it for a value
+        the user entered.
+        """
+        for car_n in range(self.num_cars):
+            if car_n < len(self.car_charging_manual_soc_energy) and self.car_charging_manual_soc_energy[car_n]:
+                continue
+            plug_arg = self.car_plug_arg(car_n, planned=True)
+            if plug_arg and self.car_plugged_in_now(car_n, plug_arg) is False:
+                continue
+            if car_n < len(self.car_charging_manual_soc) and self.car_charging_manual_soc[car_n] and self.get_car_charging_now_tristate(car_n) is False:
+                # The car_charging_now sensor says the car is not charging, whatever the plan predicted
+                self.log("Car {} charging Manual SoC held at {} as car_charging_now reports it is not charging".format(car_n, self.car_charging_soc[car_n]))
+                continue
+            if car_n < len(self.car_charging_manual_soc) and self.car_charging_manual_soc[car_n]:
+                car_postfix = "" if car_n == 0 else "_" + str(car_n)
+                self.log("Car {} charging Manual SoC current is {} next is {}".format(car_n, self.car_charging_soc[car_n], self.car_charging_soc_next[car_n]))
+                if self.car_charging_soc_next[car_n] is not None:
+                    soc_next = self.car_charging_soc_next[car_n]
+                    # The modelled car SoC can run past the real charge limit when the prediction's fill
+                    # clamp is inert (octopus_intelligent_consider_full off, #4967) - the tracked manual
+                    # SoC stands in for a measurement, so keep it within the real per-car limit
+                    if car_n < len(self.car_charging_limit):
+                        soc_next = min(soc_next, self.car_charging_limit[car_n])
+                    self.expose_config("car_charging_manual_soc_kwh" + car_postfix, dp3(soc_next))
+                    self.car_manual_soc_written(car_n, dp3(soc_next))
+
+    def run_comparison(self, status=None, status_extra=""):
+        """
+        Run the tariff comparison, clearing compare_active afterwards even if it raises (#5472).
+
+        status and status_extra are the run's final status, already recorded. The comparison runs after
+        that and re-reads sensors and rates, so it can record a warning that takes over the status
+        sensor; when it does, the run's state is added after it, as for a warning raised
+        during the run itself.
+        """
+        status_before = self.current_status
+        # Without the finally, a crashed comparison leaves compare_active on and re-triggers itself every cycle
+        self.expose_config("compare_active", True)
+        try:
+            self.comparison.run_all()
+        finally:
+            self.expose_config("compare_active", False)
+        if status is not None and self.current_status != status_before:
+            self.record_status_under_warning(status, status_extra)
+
+    def update_pred(self, scheduled=True):
+        """
+        Update the prediction state, everything is called from here right now
+        """
+        recompute = False
+        status_extra = ""
+        self.reset_run_status()
+
+        self.update_time()
+        self.save_current_config()
+
+        # Check our version, don't check for cloud version which can't update directly
+        if not self.get_arg("user_id", None):
+            self.download_predbat_releases()
+
+        # Check if we are still running the template configuration, if so don't run the plan
+        if self.is_template_mode():
+            self.log("Error: You have not completed editing the apps.yaml template, Predbat cannot run. Please comment out 'Template: True' line in apps.yaml to start Predbat running")
+            self.record_status("Error: Template Configuration, remove 'Template: True' line in apps.yaml to start predbat running", had_errors=True)
+            return
+
+        self.expose_config("active", True)
+        self.fetch_config_options()
+        sensor_force_replan = self.fetch_sensor_data()
+
+        # Check if any sensor changes require a replan
+        if sensor_force_replan:
+            self.log("Sensor changes require a replan, will recompute the plan")
+            recompute = True
+
+        # Open the control-ledger cycle BEFORE the first inverter read. fetch_inverter_data()
+        # runs update_status(), which writes scheduled_charge_enable through write_and_poll_switch
+        # and so CONFIRMS ownership - stamping those with the previous cycle number made the next
+        # observe() of them hit the STALE rung whenever execute_plan() had written the entity in
+        # the prior run. Every write in a run must share that run's cycle number.
+        self.control_ledger.begin_cycle()
+
+        # Fetch inverter data
+        if not self.fetch_inverter_data():
+            self.log("Error: Failed to fetch inverter data, not able to compute a plan")
+            self.record_status("Error: Failed to fetch inverter data, not able to compute a plan", had_errors=True)
+            return
+        self.check_export_more_solar_effective()
+        self.log_replay_state()
+        self.log_replay_inverter()
+
+        # Check if we have valid import rates
+        if self.rate_min == self.rate_max == 0:
+            self.log("Error: Import rates are all zero, not able to compute a plan")
+            self.record_status("Error: Import rates are all zero, not able to compute a plan", had_errors=True)
+            return
+
+        if self.dynamic_load():
+            self.log("Dynamic load adjustment changed, will recompute the plan")
+            recompute = True
+
+        if not scheduled or not self.plan_valid or recompute:
+            self.log("Will recompute the plan as it is invalid")
+            recompute = True
+        else:
+            plan_age = self.now_utc - self.plan_last_updated
+            plan_age_minutes = plan_age.seconds / 60.0
+            self.log("Plan was last updated on {} and is now {} minutes old".format(self.plan_last_updated, dp1(plan_age_minutes)))
+
+        # Calculate the new plan (or re-use existing)
+        recompute = self.calculate_plan(recompute=recompute)
+
+        # Persist the plan so it can be restored immediately on next startup
+        if recompute and self.plan_valid:
+            self.save_plan()
+
+        # Publish rate data
+        self.publish_rate_and_threshold()
+
+        # Execute the plan, re-read the inverter first if we had to calculate (as time passes during calculations)
+        if recompute:
+            if not self.fetch_inverter_data():
+                self.log("Error: Failed to fetch inverter data, not able to execute the plan")
+                self.record_status("Error: Failed to fetch inverter data, not able to execute the plan", had_errors=True)
+                return
+        status, status_extra = self.execute_plan()
+
+        # If the plan was not updated, and the time has expired lets update it now
+        if not recompute:
+            plan_age = self.now_utc - self.plan_last_updated
+            plan_age_minutes = plan_age.seconds / 60.0
+
+            if (plan_age_minutes + RUN_EVERY) > self.calculate_plan_every:
+                recompute = True
+                self.log("Will recompute the plan as it is now {} minutes old and will exceed the max age of {} minutes before the next run".format(dp1(plan_age_minutes), self.calculate_plan_every))
+                plan_random_delay = self.get_arg("plan_random_delay", 0)
+                if plan_random_delay > 0:
+                    delay = random.uniform(0, plan_random_delay)
+                    self.log("Adding a random delay of {:.1f} seconds before recalculating the plan....".format(delay))
+                    time.sleep(delay)
+                # Calculate an updated plan, fetch the inverter data again and execute the plan
+                self.calculate_plan(recompute=True)
+                if not self.fetch_inverter_data():
+                    self.log("Error: Failed to fetch inverter data, not able to execute the plan")
+                    self.record_status("Error: Failed to fetch inverter data, not able to execute the plan", had_errors=True)
+                    return
+                status, status_extra = self.execute_plan()
+            else:
+                self.log("Will not recompute the plan, it is {} minutes old and max age is {} minutes".format(dp1(plan_age_minutes), self.calculate_plan_every))
+
+        # Notify listeners that plan has been executed (consumed by gateway, plugins, etc.)
+        if self.plugin_system:
+            self.plugin_system.call_hooks(
+                "on_plan_executed",
+                charge_windows=self.charge_window_best,
+                charge_limits=self.charge_limit_best,
+                export_windows=self.export_window_best,
+                export_limits=self.export_limits_best,
+                charge_rate_w=int(self.battery_rate_max_charge * MINUTE_WATT),
+                discharge_rate_w=int(self.battery_rate_max_discharge * MINUTE_WATT),
+                soc_max=self.soc_max,
+                reserve=self.reserve,
+                timezone=str(self.local_tz),
+            )
+
+        # iBoost solar diverter model update state, only on 5 minute intervals
+        if self.iboost_enable and scheduled:
+            if self.iboost_energy_today:
+                # If we have a realtime sensor just use that data
+                self.iboost_next = self.iboost_today
+            elif recompute and (self.minutes_now >= 0) and (self.minutes_now < self.calculate_plan_every):
+                # Reset at midnight
+                self.iboost_next = 0
+            # Save next iBoost model value
+            self.expose_config("iboost_today", self.iboost_next)
+            self.log("iBoost model today updated to {}".format(self.iboost_next))
+
+        # Update register writes counter
+        previous_inverter_writes = self.load_previous_value_from_ha(self.prefix + ".inverter_register_writes")
+        try:
+            previous_inverter_writes = int(previous_inverter_writes)
+        except (ValueError, TypeError):
+            previous_inverter_writes = 0
+        for id in self.count_inverter_writes.keys():
+            previous_inverter_writes += self.count_inverter_writes[id]
+            self.count_inverter_writes[id] = 0
+
+        self.dashboard_item(
+            self.prefix + ".inverter_register_writes",
+            state=dp2(previous_inverter_writes),
+            attributes={
+                "friendly_name": "Total register writes (all inverters)",
+                "state_class": "measurement",
+                "unit_of_measurement": "writes",
+                "icon": "mdi:counter",
+            },
+        )
+        self.log("Total inverter register writes now {}".format(previous_inverter_writes))
+
+        # Control interference detection. Restored once per process from the entity's own
+        # attributes so the 24h window survives a pod restart - without this "3 in 24h"
+        # silently means "3 since the last restart".
+        now_ts = time.time()
+        if not self.control_ledger_restored:
+            self.control_ledger.restore(self.load_previous_value_from_ha(self.prefix + ".control_conflicts", attribute="events"))
+            self.control_ledger_restored = True
+        # prune() and recent_events() are NOT the same filter and neither can stand in for the
+        # other. prune() maintains the durable store, dropping only what has genuinely aged out;
+        # a future-dated event (a clock behind NTP) stays, because the clock corrects and the
+        # history must survive until it does. recent_events() is what can be JUDGED right now, so
+        # it is what the count and the sustained list are built from. The "events" attribute
+        # publishes the stored list, because that attribute IS the store restore() reads back -
+        # publishing only the events it can judge would delete the rest on the next run.
+        self.control_ledger.prune(now_ts)
+        conflict_events = self.control_ledger.recent_events(now_ts)
+        sustained = self.control_ledger.sustained_controls(conflict_events)
+        self.dashboard_item(
+            self.prefix + ".control_conflicts",
+            state=len(conflict_events),
+            attributes={
+                "friendly_name": "Settings changed outside Predbat (24h)",
+                "state_class": "measurement",
+                "unit_of_measurement": "changes",
+                "icon": "mdi:account-alert",
+                # Newest 20, but explicitly NOT purely by time - see newest_events(). This
+                # attribute is the durable store restore() reads back, and on a pod whose clock is
+                # behind, the event just detected carries a small "at" and looks like the oldest
+                # thing here, so any by-time cap would discard exactly the one that cannot be
+                # recovered from anywhere else.
+                "events": self.control_ledger.newest_events(20),
+                "sustained": sustained,
+            },
+        )
+        if conflict_events:
+            self.log("Control interference: {} change(s) in the last 24h, sustained on {}".format(len(conflict_events), sustained or "nothing"))
+
+        self.publish_control_failures(now_ts)
+
+        if self.calculate_savings:
+            # Get current totals
+            savings_total_predbat = self.load_previous_value_from_ha(self.prefix + ".savings_total_predbat")
+            try:
+                savings_total_predbat = float(savings_total_predbat)
+            except (ValueError, TypeError):
+                savings_total_predbat = 0.0
+            savings_total_last_updated = self.load_previous_value_from_ha(self.prefix + ".savings_total_predbat", attribute="last_updated")
+            savings_total_start_date = self.load_previous_value_from_ha(self.prefix + ".savings_total_predbat", attribute="start_date")
+            todays_date = self.now_utc_real.strftime("%Y-%m-%d")
+
+            # If there is no date its a new install so we will save tomorrow as the first point
+            if not savings_total_last_updated:
+                savings_total_last_updated = todays_date
+            if not savings_total_start_date:
+                savings_total_start_date = todays_date
+
+            savings_total_pvbat = self.load_previous_value_from_ha(self.prefix + ".savings_total_pvbat")
+            try:
+                savings_total_pvbat = float(savings_total_pvbat)
+            except (ValueError, TypeError):
+                savings_total_pvbat = 0.0
+
+            savings_total_soc = self.load_previous_value_from_ha(self.prefix + ".savings_total_soc")
+            try:
+                savings_total_soc = float(savings_total_soc)
+            except (ValueError, TypeError):
+                savings_total_soc = 0.0
+
+            savings_total_actual = self.load_previous_value_from_ha(self.prefix + ".savings_total_actual")
+            try:
+                savings_total_actual = float(savings_total_actual)
+            except (ValueError, TypeError):
+                savings_total_actual = 0.0
+
+            if self.num_cars > 0:
+                cost_total_car = self.load_previous_value_from_ha(self.prefix + ".cost_total_car")
+                try:
+                    cost_total_car = float(cost_total_car)
+                except (ValueError, TypeError):
+                    cost_total_car = 0.0
+            else:
+                cost_total_car = 0
+
+            if self.carbon_enable:
+                carbon_total = self.load_previous_value_from_ha(self.prefix + ".carbon_total")
+                try:
+                    carbon_total = float(carbon_total)
+                except (ValueError, TypeError):
+                    carbon_total = 0.0
+            else:
+                carbon_total = 0.0
+
+            # Increment total at 1am once we have today's data stable (cloud data can lag)
+            if self.minutes_now > 60 and savings_total_last_updated and savings_total_last_updated != todays_date and scheduled and not self.set_read_only:
+                savings_total_predbat += self.savings_today_predbat
+                savings_total_pvbat += self.savings_today_pvbat
+                savings_total_soc = self.savings_today_predbat_soc
+                savings_total_actual += self.savings_today_actual
+                savings_total_last_updated = todays_date
+                cost_total_car += self.cost_yesterday_car
+                if self.carbon_enable:
+                    carbon_total += self.carbon_yesterday
+
+            self.dashboard_item(
+                self.prefix + ".savings_total_predbat",
+                state=dp2(savings_total_predbat),
+                attributes={
+                    "friendly_name": "Total Predbat savings",
+                    "state_class": "measurement",
+                    "unit_of_measurement": self.currency_symbols[1],
+                    "pounds": dp2(savings_total_predbat / 100.0),
+                    "icon": "mdi:cash-multiple",
+                    "start_date": savings_total_start_date,
+                    "last_updated": savings_total_last_updated,
+                },
+            )
+            self.dashboard_item(
+                self.prefix + ".savings_total_soc",
+                state=dp2(savings_total_soc),
+                attributes={
+                    "friendly_name": "Predbat savings, yesterday SoC",
+                    "state_class": "measurement",
+                    "unit_of_measurement": "kWh",
+                    "icon": "mdi:battery-50",
+                    "start_date": savings_total_start_date,
+                    "last_updated": savings_total_last_updated,
+                },
+            )
+            self.dashboard_item(
+                self.prefix + ".savings_total_actual",
+                state=dp2(savings_total_actual),
+                attributes={
+                    "friendly_name": "Actual total energy cost",
+                    "state_class": "measurement",
+                    "unit_of_measurement": self.currency_symbols[1],
+                    "pounds": dp2(savings_total_actual / 100.0),
+                    "icon": "mdi:cash-multiple",
+                    "start_date": savings_total_start_date,
+                    "last_updated": savings_total_last_updated,
+                },
+            )
+            self.dashboard_item(
+                self.prefix + ".savings_total_pvbat",
+                state=dp2(savings_total_pvbat),
+                attributes={
+                    "friendly_name": "Total Savings vs no PV/Battery system",
+                    "state_class": "measurement",
+                    "unit_of_measurement": self.currency_symbols[1],
+                    "pounds": dp2(savings_total_pvbat / 100.0),
+                    "icon": "mdi:cash-multiple",
+                    "start_date": savings_total_start_date,
+                    "last_updated": savings_total_last_updated,
+                },
+            )
+            if self.num_cars > 0:
+                self.dashboard_item(
+                    self.prefix + ".cost_total_car",
+                    state=dp2(cost_total_car),
+                    attributes={
+                        "friendly_name": "Total car cost (approx)",
+                        "state_class": "measurement",
+                        "unit_of_measurement": self.currency_symbols[1],
+                        "pounds": dp2(cost_total_car / 100.0),
+                        "icon": "mdi:cash-multiple",
+                        "start_date": savings_total_start_date,
+                        "last_updated": savings_total_last_updated,
+                    },
+                )
+            if self.carbon_enable:
+                self.dashboard_item(
+                    self.prefix + ".carbon_total",
+                    state=dp2(carbon_total),
+                    attributes={
+                        "friendly_name": "Total carbon emissions",
+                        "state_class": "measurement",
+                        "unit_of_measurement": "g",
+                        "kg": dp2(carbon_total / 1000.0),
+                        "icon": "mdi:carbon-molecule",
+                        "start_date": savings_total_start_date,
+                        "last_updated": savings_total_last_updated,
+                    },
+                )
+
+        # Car SoC increment
+        if scheduled:
+            self.update_car_manual_soc()
+
+        # Holiday days left countdown, subtract a day at midnight every day
+        if scheduled and self.holiday_days_left > 0 and self.minutes_now < RUN_EVERY:
+            self.holiday_days_left -= 1
+            self.expose_config("holiday_days_left", self.holiday_days_left)
+            self.log("Holiday days left is now {}".format(self.holiday_days_left))
+
+        self._debug_enable_auto_scope()
+        self._capture_debug_history()
+
+        self.record_final_run_status(status, status_extra)
+
+        self.expose_config("active", False)
+        self.save_current_config()
+
+        # Call plugin update hooks
+        if self.plugin_system:
+            self.plugin_system.call_hooks("on_update")
+
+        # Emit snapshot metrics (no-ops when prometheus_client absent)
+        self._emit_snapshot_metrics()
+
+        if self.comparison:
+            if (scheduled and self.minutes_now < RUN_EVERY) or self.get_arg("compare_active", False):
+                # Compare tariffs either when triggered or daily at midnight
+                self.run_comparison(status, status_extra)
+            else:
+                # Otherwise just update HA sensors to prevent then expiring
+                self.comparison.publish_only()
+        else:
+            self.expose_config("compare_active", False)
+
+        # Free memory
+        if not self.debug_enable:
+            self.load_minutes_step = {}
+            self.load_minutes_step10 = {}
+            self.pv_forecast_minute_step = {}
+            self.pv_forecast_minute10_step = {}
+
+        gc.collect()
+        # Collecting frees the objects; on glibc the pages stay with the process until trimmed
+        malloc_trim()
+
+        # Schedule inverter update for 30 seconds time to allow the inverter to process the changes we just made before we fetch the data again
+        # This allows the power flow to update for the user more quickly.
+        self.inverter_data_last_fetch = datetime.now() - timedelta(seconds=INVERTER_QUICK_UPDATE_SECONDS) + timedelta(seconds=30)
+
+    async def async_download_predbat_version(self, version):
+        """
+        Sync wrapper for async download_predbat_version
+        """
+        return await self.run_in_executor(self.download_predbat_version, version)
+
+    def download_predbat_version(self, version):
+        """
+        Download a version of Predbat from GitHub
+
+        Args:
+            version (str): The version of Predbat to download.
+
+        Returns:
+            bool: True if the download and update were successful, False otherwise.
+        """
+        if version == THIS_VERSION:
+            self.log("Warn: Predbat update requested for the same version as we are running ({}), no update required".format(version))
+            return
+
+        selected_tag = version.split(" ")[0] if version else ""
+        if selected_tag == "main":
+            repository = self.get_predbat_repository()
+        else:
+            repository = DEFAULT_PREDBAT_REPOSITORY
+
+        self.log("Update Predbat to version {} from repository {}".format(version, repository))
+        self.expose_config("version", True, force=True, in_progress=True)
+
+        files = predbat_update_download(version, repository=repository)
+        if files:
+            # Notify before killing threads so the WebSocket is still healthy
+            if self.get_arg("set_system_notify"):
+                self.call_notify(f"{self.prefix.capitalize()}: update to: {version}")
+
+            # Kill the current threads
+            self.log("Kill current threads before update")
+            self.stop_thread = True
+
+            # Perform the update
+            self.log("Perform the update.....")
+            if predbat_update_move(version, files):
+                self.log("Update to version {} completed".format(version))
+                return True
+            else:
+                self.log("Warn: Predbat update failed to move Predbat version {}".format(version))
+                return False
+        else:
+            self.log("Warn: Predbat update failed to download Predbat version {}".format(version))
+        return False
+
+    def validate_is_int(self, value):
+        """
+        Validate that a value is an integer
+        """
+        try:
+            value = int(value)
+        except (ValueError, TypeError):
+            return False
+        return True
+
+    def validate_is_float(self, value):
+        """
+        Validate that a value is a float
+        """
+        try:
+            value = float(value)
+        except (ValueError, TypeError):
+            return False
+        return True
+
+    def validate_is_boolean(self, value):
+        """
+        Validate that a value is a boolean switch
+        """
+        if isinstance(value, str) and value.lower() in ["on", "off"]:
+            return True
+
+        try:
+            value = bool(value)
+        except (ValueError, TypeError):
+            return False
+        return True
+
+    def validate_config(self):
+        """
+        Uses APPS_SCHEMA to validate the self.args configuration read from apps.yaml
+        """
+        errors = 0
+        self.arg_errors = {}
+        for name in APPS_SCHEMA:
+            spec = APPS_SCHEMA[name]
+            required = spec.get("required", False)
+            expected_type = spec.get("type", "string")
+
+            # Check required
+            if required and name not in self.args:
+                self.log("Warn: Validation of apps.yaml found missing configuration item '{}'".format(name))
+
+            # Check type
+            if name in self.args:
+                value = self.get_arg(name, indirect=False)
+                expected_types = expected_type.split("|")
+                allowed = spec.get("allowed", None)
+                entries = spec.get("entries", None)
+                optional_entries = spec.get("optional_entries", False)
+                required_entries = None
+                matches = False
+                if entries is not None:
+                    if isinstance(entries, str):
+                        required_entries = self.get_arg(entries, 0, indirect=False)
+                    else:
+                        required_entries = int(entries)
+
+                    if isinstance(value, list):
+                        if len(value) < required_entries:
+                            if not optional_entries:
+                                self.log("Warn: Validation of apps.yaml found configuration item '{}' has {} entries, expected {} based on {}".format(name, len(value), required_entries, entries))
+                                self.arg_errors[name] = "Invalid number of entries, expected {}".format(required_entries)
+                                errors += 1
+                                continue
+                    elif required_entries > 1:
+                        if not optional_entries:
+                            self.log("Warn: Validation of apps.yaml found configuration item '{}' is not a list, but requires {} entries based on {}".format(name, required_entries, entries))
+                            self.arg_errors[name] = "Invalid type, expected list"
+                            errors += 1
+                            continue
+
+                for expected_type in expected_types:
+                    if expected_type == "none":
+                        if self.get_arg(name, indirect=False) is None:
+                            matches = True
+                            break
+                    elif expected_type == "integer" or expected_type == "integer_list":
+                        if expected_type == "integer" and isinstance(value, int):
+                            value = [value]
+                        elif expected_type == "integer_list":
+                            value = self.get_arg(name, [], indirect=False)
+
+                        if isinstance(value, list):
+                            matches = True
+                            if required_entries is not None and len(value) > required_entries:
+                                value = value[:required_entries]
+                            # min/max are declared on some APPS_SCHEMA entries (log_count, #5076)
+                            # but were never actually enforced here - the schema promised a range
+                            # check that validate_config() silently skipped (Copilot review on
+                            # #5076).
+                            schema_min = spec.get("min", None)
+                            schema_max = spec.get("max", None)
+                            for item in value:
+                                if not self.validate_is_int(item):
+                                    self.log("Warn: Validation of apps.yaml found configuration item '{}' element {} is not an integer".format(name, item))
+                                    self.arg_errors[name] = "Invalid type, expected integer item {}".format(item)
+                                    errors += 1
+                                    break
+                                if not spec.get("zero", True) and int(item) == 0:
+                                    self.log("Warn: Validation of apps.yaml found configuration item '{}' is zero".format(name))
+                                    self.arg_errors[name] = "Invalid value, expected non-zero integer item {}".format(item)
+                                    errors += 1
+                                    break
+                                if (schema_min is not None and int(item) < schema_min) or (schema_max is not None and int(item) > schema_max):
+                                    self.log("Warn: Validation of apps.yaml found configuration item '{}' value {} is outside the allowed range [{}, {}]".format(name, item, schema_min, schema_max))
+                                    self.arg_errors[name] = "Invalid value, expected between {} and {}".format(schema_min, schema_max)
+                                    errors += 1
+                                    break
+                    elif expected_type == "float" or expected_type == "float_list":
+                        if expected_type == "float" and (isinstance(value, float) or isinstance(value, int)):
+                            value = [value]
+                        elif expected_type == "float_list":
+                            value = self.get_arg(name, [], indirect=False)
+
+                        if isinstance(value, list):
+                            matches = True
+                            if required_entries is not None and len(value) > required_entries:
+                                value = value[:required_entries]
+                            for item in value:
+                                if not self.validate_is_float(item):
+                                    self.log("Warn: Validation of apps.yaml found configuration item '{}' element {} is not a float".format(name, item))
+                                    self.arg_errors[name] = "Invalid type, expected float item {}".format(item)
+                                    errors += 1
+                                    break
+                    elif expected_type == "string" or expected_type == "string_list":
+                        if expected_type == "string" and isinstance(value, str):
+                            value = [value]
+                        elif expected_type == "string_list":
+                            value = self.get_arg(name, [], indirect=False)
+
+                        if isinstance(value, list):
+                            matches = True
+                            if required_entries is not None and len(value) > required_entries:
+                                value = value[:required_entries]
+                            for item in value:
+                                if not isinstance(item, str):
+                                    self.log("Warn: Validation of apps.yaml found configuration item '{}' element {} is not a string".format(name, item))
+                                    self.arg_errors[name] = "Invalid type, expected string item {}".format(item)
+                                    errors += 1
+                                    break
+
+                                if spec.get("empty", False) and not item:
+                                    self.log("Warn: Validation of apps.yaml found configuration item '{}' is empty".format(name))
+                                    self.arg_errors[name] = "Invalid value, expected non-empty string"
+                                    errors += 1
+                                    break
+
+                                if allowed and item not in allowed:
+                                    self.log("Warn: Validation of apps.yaml found configuration item '{}' value {} is not in allowed list {}".format(name, item, allowed))
+                                    self.arg_errors[name] = "Invalid value {}, expected one of {}".format(item, allowed)
+                                    errors += 1
+                                    break
+                    elif expected_type == "boolean" or expected_type == "boolean_list":
+                        if expected_type == "boolean" and self.validate_is_boolean(value):
+                            value = [value]
+                        elif expected_type == "boolean_list":
+                            value = self.get_arg(name, [], indirect=False)
+
+                        if isinstance(value, list):
+                            if required_entries is not None and len(value) > required_entries:
+                                value = value[:required_entries]
+                            matches = True
+                            for item in value:
+                                if not self.validate_is_boolean(item):
+                                    self.log("Warn: Validation of apps.yaml found configuration item '{}' element {} is not a boolean".format(name, item))
+                                    self.arg_errors[name] = "Invalid type, expected boolean item {}".format(item)
+                                    errors += 1
+                                    break
+                    elif expected_type == "integer" or expected_type == "integer_list":
+                        if expected_type == "integer" and isinstance(value, int):
+                            value = [value]
+                        elif expected_type == "integer_list":
+                            value = self.get_arg(name, [], indirect=False)
+
+                        if isinstance(value, list):
+                            if required_entries is not None and len(value) > required_entries:
+                                value = value[:required_entries]
+
+                            matches = True
+                            for item in value:
+                                if not self.validate_is_int(item):
+                                    self.log("Warn: Validation of apps.yaml found configuration item '{}' element {} is not an integer".format(name, item))
+                                    self.arg_errors[name] = "Invalid type, expected integer item {}".format(item)
+                                    errors += 1
+                                    break
+
+                                if allowed and item not in allowed:
+                                    self.log("Warn: Validation of apps.yaml found configuration item '{}' value {} is not in allowed list {}".format(name, item, allowed))
+                                    self.arg_errors[name] = "Invalid value {}, expected one of {}".format(item, allowed)
+                                    errors += 1
+                                    break
+
+                    elif expected_type == "dict" or expected_type == "dict_list":
+                        if expected_type == "dict" and isinstance(value, dict):
+                            value = [value]
+                        elif expected_type == "dict_list":
+                            value = self.get_arg(name, [], indirect=False)
+                        if isinstance(value, list):
+                            if required_entries is not None and len(value) > required_entries:
+                                value = value[:required_entries]
+
+                            matches = True
+                            for item in value:
+                                if not isinstance(item, dict):
+                                    self.log("Warn: Validation of apps.yaml found configuration item '{}' element {} is not a dict. Must be in the format 'item: value'".format(name, item))
+                                    self.arg_errors[name] = "Invalid type, element {} expected dict".format(item)
+                                    errors += 1
+                                    break
+
+                                # scalar_value_dict (e.g. redact_strings_labelled): warn when a
+                                # mapping value isn't a plain string, because quoting affects what
+                                # the value actually is - an unquoted numeric MPAN loses a leading
+                                # zero in YAML before Predbat ever sees it, which no amount of
+                                # redaction can recover. Warn, don't error, and don't rely on this
+                                # to keep the value safe: collect_log_secret_values() flattens and
+                                # str()s any shape (see _flatten_denylist_value), so redaction
+                                # holds whether or not the user acts on this (#5053 review).
+                                if spec.get("scalar_value_dict", False):
+                                    for key, sub_value in item.items():
+                                        if not isinstance(sub_value, str):
+                                            # The value is deliberately not interpolated: this
+                                            # branch exists for redact_strings_labelled, whose
+                                            # values are the very credentials that must never
+                                            # reach the log, and this warning runs before the
+                                            # redaction pattern has been built from them
+                                            # (#5053 review). The key alone identifies the entry.
+                                            self.log(
+                                                "Warn: Validation of apps.yaml found configuration item '{}' entry '{}' value is a {}, not a string - quote it to keep its exact formatting (e.g. a leading zero)".format(name, key, type(sub_value).__name__)
+                                            )
+                    elif expected_type == "int_float_dict":
+                        if spec.get("or_auto", False) and value == "auto":
+                            matches = True
+                        elif isinstance(value, dict):
+                            matches = True
+                            for key in value:
+                                if not self.validate_is_int(key):
+                                    self.log("Warn: Validation of apps.yaml found configuration item '{}' element {}, value {} is not a int => float value".format(name, key, value))
+                                    self.arg_errors[name] = "Invalid element key {} expected int".format(key)
+                                    errors += 1
+                                    break
+                                if not self.validate_is_float(value[key]):
+                                    self.log("Warn: Validation of apps.yaml found configuration item '{}' element {} value {} is not a int => float value".format(name, key, value))
+                                    self.arg_errors[name] = "Invalid element key {} value {}, expected int => float".format(key, value[key])
+                                    errors += 1
+                                    break
+                    elif expected_type == "sensor_list" or expected_type == "sensor":
+                        sensor_type = spec.get("sensor_type", None)
+
+                        if expected_type == "sensor" and isinstance(value, str):
+                            value = [value]
+                        elif expected_type == "sensor_list":
+                            value = self.get_arg(name, [], indirect=False)
+
+                        if isinstance(value, list):
+                            # Auto trim to length
+                            if required_entries is not None and len(value) > required_entries:
+                                value = value[:required_entries]
+
+                            matches = True
+                            for sensor in value:
+                                sensor_types = []
+                                if sensor_type:
+                                    sensor_types = sensor_type.split("|")
+
+                                if "action" in sensor_types and isinstance(sensor, str) and "." in sensor:
+                                    # Allow action sensors
+                                    continue
+                                if ("integer" in sensor_types or "float" in sensor_types) and self.validate_is_int(sensor) and not spec.get("modify", False):
+                                    # Allow fixed integer values
+                                    continue
+                                if "float" in sensor_types and self.validate_is_float(sensor) and not spec.get("modify", False):
+                                    # Allow fixed float values
+                                    continue
+                                if "string" in sensor_types and isinstance(sensor, str) and not spec.get("modify", False) and "." not in sensor:
+                                    # Allow fixed string values
+                                    continue
+
+                                if not isinstance(sensor, str):
+                                    self.log("Warn: Validation of apps.yaml found configuration item '{}' element {} is not a valid entity_id (must be a string)".format(name, sensor))
+                                    self.arg_errors[name] = "Invalid entity_id in element {}".format(sensor)
+                                    errors += 1
+                                    break
+                                if "." not in sensor:
+                                    self.log("Warn: Validation of apps.yaml found configuration item '{}' element {} is not a valid entity_id (must contain a dot)".format(name, sensor))
+                                    self.arg_errors[name] = "Invalid entity_id in element {}".format(sensor)
+                                    errors += 1
+                                    break
+
+                                if spec.get("modify", False):
+                                    prefix = sensor.split(".")[0]
+                                    if prefix not in ["switch", "select", "input_number", "number", "time", "input_number", "input_datetime"]:
+                                        if sensor.startswith("sensor.predbat_"):
+                                            # We can ignore predbat generated sensors as they are control placeholders
+                                            pass
+                                        else:
+                                            self.log("Warn: Validation of apps.yaml found configuration item '{}' element {} which cannot be modified".format(name, sensor))
+                                            self.arg_errors[name] = "Invalid entity_id in element {}, can not be modified".format(sensor)
+                                            errors += 1
+                                            break
+
+                                state = self.get_state_wrapper(sensor)
+                                if state is None:
+                                    self.log("Expected types {} state {}".format(sensor_types, state))
+                                    if "none" in sensor_types:
+                                        # Allow None values for sensors
+                                        continue
+                                    else:
+                                        self.log("Warn: Validation of apps.yaml found configuration item '{}' element {} returned value 'None', not a valid value".format(name, sensor))
+                                        self.arg_errors[name] = "Invalid value None in element {}".format(sensor)
+                                        errors += 1
+                                        break
+
+                                if spec.get("transient_ok", False) and isinstance(state, str) and state.strip().lower() in ["unavailable", "unknown", "none", ""]:
+                                    # Home Assistant reports these while an entity is offline or has
+                                    # not produced a reading yet. For a sensor that legitimately drops
+                                    # out - an EV charger with nothing plugged into it - that is normal
+                                    # rather than a misconfiguration, and flagging it leaves the whole
+                                    # run reporting errors. A missing entity is still an error above,
+                                    # so a typo in the name is still caught.
+                                    continue
+
+                                validated = False
+                                if "float" in sensor_types and self.validate_is_float(state):
+                                    validated = True
+                                if "integer" in sensor_types and self.validate_is_int(state):
+                                    validated = True
+                                if "boolean" in sensor_types and self.validate_is_boolean(state):
+                                    validated = True
+                                if "dict" in sensor_types and isinstance(state, dict):
+                                    validated = True
+                                if "list" in sensor_types and isinstance(state, list):
+                                    validated = True
+                                if "string" in sensor_types and isinstance(state, str):
+                                    validated = True
+
+                                if not validated:
+                                    self.log("Warn: Validation of apps.yaml found configuration item '{}' element {} is not a valid type {}".format(name, sensor, sensor_type))
+                                    self.arg_errors[name] = "Invalid type in element {}, expected {}".format(sensor, sensor_type)
+                                    errors += 1
+                                    break
+
+                    if matches:
+                        break
+                if not matches:
+                    self.log("Warn: Validation of apps.yaml found configuration item '{}' is not of type '{}' value was {}".format(name, expected_type, value))
+                    self.arg_errors[name] = "Invalid type, expected {}".format(expected_type)
+                    errors += 1
+        if errors:
+            self.log("Error: Validation of apps.yaml found {} configuration errors".format(errors))
+        else:
+            self.log("Validation of apps.yaml was successful")
+
+        self.check_apps_yaml_secrets()
+
+        return errors
+
+    def check_apps_yaml_secrets(self, apps_yaml_path=None):
+        """
+        Re-read apps.yaml with the ruamel round-trip loader (the same one the web config
+        editors use) and warn about credential-like values stored in plain text instead of
+        via a '!secret' reference into secrets.yaml.
+
+        By the time apps.yaml reaches self.args, '!secret' has already been resolved to its
+        real value, so an inline key and a secrets.yaml reference are indistinguishable there -
+        this re-reads the raw file to recover that distinction. Populates self.arg_warnings
+        rather than self.arg_errors: an inline credential is not an invalid configuration, so
+        it should not turn the same red "apps.yaml has N errors" banner on for a large
+        fraction of existing installs.
+        """
+        self.arg_warnings = {}
+        try:
+            from ruamel.yaml import YAML
+        except ImportError:
+            return
+
+        if apps_yaml_path is None:
+            apps_yaml_path = hass.resolve_apps_yaml_path()
+        if not os.path.exists(apps_yaml_path):
+            return
+
+        try:
+            yaml_loader = YAML(typ="rt")
+            with open(apps_yaml_path, "r") as handle:
+                data = yaml_loader.load(handle)
+        except Exception as e:
+            self.log("Warn: Unable to re-read {} to check for unmasked secrets: {}".format(apps_yaml_path, e))
+            return
+
+        if not isinstance(data, dict):
+            return
+        root = data.get("pred_bat")
+        if not isinstance(root, dict):
+            return
+
+        for key_path in find_unmasked_secret_paths(root):
+            self.arg_warnings[key_path] = "Credential-like value is stored in plain text in apps.yaml - consider using '!secret' to reference secrets.yaml instead"
+
+        if self.arg_warnings:
+            self.log("Warn: apps.yaml has {} credential-like value(s) not using the !secret mechanism: {}".format(len(self.arg_warnings), ", ".join(sorted(self.arg_warnings))))
+
+    def validate_config_schedule_retry(self, errors):
+        """
+        Called immediately after validate_config() with its error count. If validation failed,
+        (re-)arms a retry sequence so a self-healed condition (e.g. a slow-starting integration's
+        sensor not populated yet) clears its own error status without needing a manual restart -
+        see #4379. A clean validation cancels any retry sequence already in progress.
+        """
+        if errors:
+            retries = int(self.get_arg("validate_config_retries", 2))
+            if retries > 0:
+                self.validate_config_retries_remaining = retries
+                retry_minutes = max(0, int(self.get_arg("validate_config_retry_minutes", 1)))
+                self.validate_config_next_retry_time = self.now_utc + timedelta(minutes=retry_minutes)
+            else:
+                self.validate_config_retries_remaining = 0
+                self.validate_config_next_retry_time = None
+        else:
+            self.validate_config_retries_remaining = 0
+            self.validate_config_next_retry_time = None
+
+    def validate_config_check_retry(self):
+        """
+        Called every 15 seconds from update_time_loop(). Re-runs validate_config() if a retry is
+        due, only while a retry sequence is armed (i.e. only following an actual validation
+        failure - see #4379) - a no-op the rest of the time.
+        """
+        if self.validate_config_retries_remaining <= 0:
+            return
+        if self.validate_config_next_retry_time is None or self.now_utc < self.validate_config_next_retry_time:
+            return
+
+        self.validate_config_retries_remaining -= 1
+        errors = self.validate_config()
+        if errors == 0:
+            self.log("Info: Config validation retry succeeded, previous errors have now cleared")
+            self.validate_config_retries_remaining = 0
+            self.validate_config_next_retry_time = None
+        elif self.validate_config_retries_remaining <= 0:
+            self.log("Warn: Config validation still failing after all retries, giving up until the next restart or config change")
+            self.validate_config_next_retry_time = None
+        else:
+            retry_minutes = self.get_arg("validate_config_retry_minutes", 1)
+            self.validate_config_next_retry_time = self.now_utc + timedelta(minutes=retry_minutes)
+
+    def is_running(self):
+        """
+        Check if the app is running
+        """
+        if self.stop_thread:
+            return False
+        if not self.dashboard_index:
+            return False
+        if self.fatal_error:
+            return False
+
+        if not self.ha_interface:
+            return False
+
+        if self.components:
+            if not self.components.is_all_alive():
+                return False
+
+        # Read predbat.status
+        status_entity = self.prefix + ".status"
+        predbat_error = self.get_state_wrapper(status_entity, attribute="error", default=True)
+        if predbat_error is None or predbat_error:
+            return False
+        predbat_last_updated = self.get_state_wrapper(status_entity, attribute="last_updated", default=None)
+        if predbat_last_updated is None:
+            return False
+
+        try:
+            predbat_last_updated = datetime.fromisoformat(predbat_last_updated)
+        except ValueError:
+            return False
+
+        # Check if the last updated time is within the last 15 minutes. An install upgraded
+        # from before record_status() wrote a timezone-aware last_updated may still have the
+        # old naive format persisted in HA until the next record_status() call overwrites it -
+        # comparing against a timezone-aware "now" in that case would raise TypeError.
+        if predbat_last_updated.tzinfo is None:
+            now = datetime.now()
+        else:
+            now = datetime.now(timezone.utc)
+        if (now - predbat_last_updated).total_seconds() > 15 * 60:
+            return False
+        return True
+
+    def initialize(self):
+        """
+        Setup the app, called once each time the app starts
+        """
+        # Snapshot of apps.yaml exactly as the user wrote it, before Predbat's own defaulting
+        # (auto_config/load_user_config) or any component's automatic_config() touches self.args -
+        # lets ComponentBase.set_arg_auto() tell "user explicitly configured this" apart from
+        # "Predbat defaulted it" or "another component already overwrote it" (issue #4494 follow-up).
+        # Masked at the source (set_arg_auto() is only ever called with auto-discovery targets
+        # like battery_scaling or sensor entity ids, never credential-shaped keys) so this second
+        # copy of apps.yaml can never carry a real secret regardless of how it's later dumped.
+        self.args_from_apps_yaml = mask_secret_args(self.args)
+        self.apps_yaml_override_warned = set()  # {arg} already warned about via set_arg_auto()
+        self.log("Predbat: Startup {}".format(__name__))
+        # Cap glibc's per-thread malloc arenas before the component threads exist to be given one each
+        if limit_malloc_arenas():
+            self.log("Limited malloc arenas to {}".format(MALLOC_ARENA_LIMIT))
+        self.update_time(print=False)
+        self.started_time = self.now_utc_real
+        run_every = RUN_EVERY * 60
+        # The host's naive clock, deliberately not now_utc: the run times below are handed to
+        # run_every(), and hass.py's timer_tick compares them against datetime.now(). This is the
+        # only place that needs it, so it stays local rather than living on the instance.
+        host_now = datetime.now()
+        host_midnight = host_now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        try:
+            self.reset()
+            self.update_time(print=False)
+
+            # Start all sub-components
+            self.components = Components(self)
+            self.components.initialize(phase=0)
+
+            # Initialise plugin system early so plugins can register web endpoints
+            # before the web server starts
+            try:
+                self.log("Initialising plugin system")
+                self.plugin_system = PluginSystem(self)
+                self.plugin_system.discover_plugins()
+            except Exception as e:
+                self.log("Warning: Failed to initialise plugin system: {}".format(e))
+                self.plugin_system = None
+
+            # Now start all sub-components (including web server which will pick up registered endpoints)
+            if not self.components.start(phase=0):
+                self.log("Error: Some components failed to start (phase0)")
+                self.record_status("Error: Some components failed to start (phase0)", had_errors=True)
+
+            if not self.ha_interface:
+                raise ValueError("HA interface not found")
+
+            # Call plugin initialisation hooks after components are ready
+            if self.plugin_system:
+                self.plugin_system.call_hooks("on_init")
+
+            # Printable config root
+            self.config_root_p = self.config_root
+            slug = self.ha_interface.get_slug()
+            if slug:
+                # and use slug name to determine printable config_root pathname when writing debug info to the log file
+                self.config_root_p = "/app_configs/" + slug
+
+            self.log("Config root is {} and printable config_root_p is now {}".format(self.config_root, self.config_root_p))
+
+            self.ha_interface.update_states()
+            self.auto_config()
+            self.load_user_config(quiet=False, register=False, load_config=True)
+            self.comparison = Compare(self)
+
+            self.components.initialize(phase=1)
+            if not self.components.start(phase=1):
+                self.log("Error: Some components failed to start (phase 1)")
+                self.record_status("Error: Some components failed to start (phase 1)", had_errors=True)
+
+            self.components.initialize(phase=2)
+            if not self.components.start(phase=2):
+                self.log("Error: Some components failed to start (phase 2)")
+                self.record_status("Error: Some components failed to start (phase 2)", had_errors=True)
+
+            # Discovery barrier: every component has now started or timed out, so assemble what
+            # they reported into the catalogue. Observe only - nothing here changes configuration.
+            try:
+                self.components.coordinator.assemble()
+                self.components.coordinator.publish()
+            except Exception as e:
+                self.log("Warn: Failed to assemble the discovery catalogue: {}".format(e))
+
+            self.load_user_config(quiet=False, register=True)
+            self.auto_config(final=True)
+            self.validate_config_schedule_retry(self.validate_config())
+
+            # Restore the last saved plan so it is immediately active before the first calculation
+            self.load_plan()
+            # And the Octopus Intelligent dispatch state, so a restart part-way through a dispatch carries on from it
+            self.dynamic_load_car_load()
+            # And the half hours Octopus Intelligent dispatches ran in, so they keep the dispatch rate
+            self.octopus_held_load()
+
+        except Exception as e:
+            self.log("Error: Exception raised {}".format(e))
+            self.log("Error: " + traceback.format_exc())
+            self.record_status("Error: Exception raised {}".format(e), debug=traceback.format_exc(), had_errors=True)
+            raise e
+
+        # Started
+        self.publish_last_started()
+
+        # Run every N minutes aligned to the minute
+        seconds_now = (host_now - host_midnight).seconds
+
+        # Calculate next run time to exactly align with the run_every time
+        seconds_offset = seconds_now % run_every
+        seconds_next = seconds_now + (run_every - seconds_offset)
+        next_time = host_midnight + timedelta(seconds=seconds_next)
+        self.log("Predbat: Next run time will be {} and then every {} seconds".format(next_time, run_every))
+
+        # First run is now
+        self.update_pending = True
+
+        # And then every N minutes
+        if not INVERTER_TEST:
+            self.run_every(self.run_time_loop, next_time, run_every, random_start=0, random_end=0)
+            self.run_every(self.update_time_loop, datetime.now(), 15, random_start=0, random_end=0)
+        else:
+            self.update_time_loop(None)
+
+        # Balance inverters
+
+        # Predheat
+        predheat = self.args.get("predheat", {})
+        if predheat:
+            self.predheat = PredHeat(self)
+            self.predheat.initialize()
+
+    async def terminate(self):
+        """
+        Called once each time the app terminates
+        """
+        self.log("Predbat terminating")
+        self.stop_thread = True
+        if self.components:
+            await self.components.stop()
+        self.log("Info: Components stopped")
+
+        await asyncio.sleep(0)
+        self.log("Predbat terminated")
+
+    def update_time_loop(self, cb_args):
+        """
+        Called every 15 seconds
+        """
+        if not self.ha_interface or (not self.ha_interface.websocket_active and not self.ha_interface.db_primary):
+            # Only report db_primary when there is an interface to read it from - when ha_interface is None
+            # reading it here raised AttributeError before fatal_error could be set below (#5135)
+            if self.ha_interface:
+                self.log("Error: HA interface not active and db_primary is {}".format(self.ha_interface.db_primary))
+            else:
+                self.log("Error: HA interface not active")
+            self.fatal_error = True
+            raise Exception("HA interface not active")
+
+        self.check_entity_refresh()
+        self.validate_config_check_retry()
+        if not self.prediction_started:
+            # A car's charging slots cancelled or resumed by dynamic load - replan now, not in 5 minutes
+            self.dynamic_load_car_poll()
+            # A car starting or stopping charging - apply or release "Hold for car" now, not in 5 minutes
+            self.car_charging_now_poll()
+        if self.update_pending and not self.prediction_started:
+            # Full update required
+            self.update_pending = False
+            self.prediction_started = True
+            try:
+                self.load_user_config()
+                self.validate_config_schedule_retry(self.validate_config())
+                self.update_pred(scheduled=False)
+                self.create_entity_list()
+            except Exception as e:
+                self.log("Error: Exception raised {}".format(e))
+                self.log("Error: " + traceback.format_exc())
+                self.record_status("Error: Exception raised {}".format(e), debug=traceback.format_exc(), had_errors=True)
+                raise e
+            finally:
+                self.prediction_started = False
+                # Always clear the active flag, even on early return or exception, so the
+                # web spinner and predbat.active switch don't get stuck on
+                self.expose_config("active", False)
+        elif not self.prediction_started:
+            time_now = datetime.now()
+            inverter_data_last_fetch = self.inverter_data_last_fetch
+            if inverter_data_last_fetch is None:
+                # If we have never fetched inverter data, set the last fetch time to the past to trigger an update
+                inverter_data_last_fetch = time_now - timedelta(hours=24)
+            # Find the time since we last fetched inverter data and if it is greater than the quick update threshold, perform a quick update of the inverter data.
+            tdiff = time_now - inverter_data_last_fetch
+            if tdiff.total_seconds() >= INVERTER_QUICK_UPDATE_SECONDS:
+                # Perform quick update of inverter data for the dashboard only
+                self.prediction_started = True
+                try:
+                    self.quick_inverter_data_update()
+                except Exception as e:
+                    self.log("Error: Exception raised {}".format(e))
+                    self.log("Error: " + traceback.format_exc())
+                    self.record_status("Error: Exception raised {}".format(e), debug=traceback.format_exc(), had_errors=True)
+                    raise e
+                finally:
+                    self.prediction_started = False
+
+    def check_entity_refresh(self):
+        """
+        Check if we need to refresh the config entities with HA
+        """
+        # Check if we need to refresh the config entities with HA
+        config_refresh = self.get_state_wrapper(entity_id=self.prefix + ".config_refresh")
+        config_refresh_stamp = None
+        if config_refresh:
+            try:
+                config_refresh_stamp = strptime_aware(config_refresh, TIME_FORMAT)
+            except (ValueError, TypeError):
+                config_refresh_stamp = None
+
+        age = CONFIG_REFRESH_PERIOD
+        if config_refresh_stamp:
+            tdiff = self.now_utc - config_refresh_stamp
+            age = tdiff.seconds / 60 + tdiff.days * 60 * 24
+            if age >= CONFIG_REFRESH_PERIOD:
+                self.log("Info: Refresh config entities due to their age of {} minutes".format(age))
+                self.update_pending = True
+        else:
+            self.log("Info: Refresh config entities as config_refresh state is unknown")
+            self.update_pending = True
+
+    def run_time_loop(self, cb_args):
+        """
+        Called every N minutes
+        """
+        if not self.ha_interface or (not self.ha_interface.websocket_active and not self.ha_interface.db_primary):
+            self.log("Error: HA interface not active")
+            self.fatal_error = True
+            raise Exception("HA interface not active")
+
+        self.check_entity_refresh()
+        if not self.prediction_started:
+            self.prediction_started = True
+            try:
+                config_changed = False
+                if self.update_pending:
+                    self.update_pending = False
+                    self.ha_interface.update_states()
+                    self.load_user_config()
+                    self.validate_config_schedule_retry(self.validate_config())
+                    config_changed = True
+
+                # Run the prediction
+                self.update_pred(scheduled=True)
+
+                if config_changed:
+                    self.create_entity_list()
+            except Exception as e:
+                self.log("Error: Exception raised {}".format(e))
+                self.log("Error: " + traceback.format_exc())
+                self.record_status("Error: Exception raised {}".format(e), debug=traceback.format_exc(), had_errors=True)
+                raise e
+            finally:
+                self.prediction_started = False
+                # Always clear the active flag, even on early return or exception, so the
+                # web spinner and predbat.active switch don't get stuck on
+                self.expose_config("active", False)
+
+    def register_hook(self, hook_name, callback):
+        """
+        Register a hook callback (convenience method for plugins)
+        """
+        if self.plugin_system:
+            self.plugin_system.register_hook(hook_name, callback)

@@ -1,0 +1,3910 @@
+# -----------------------------------------------------------------------------
+# Predbat Home Battery System
+# Copyright Trefor Southwell 2026 - All Rights Reserved
+# This application maybe used for personal use only and not for commercial use
+# -----------------------------------------------------------------------------
+# fmt off
+# pylint: disable=consider-using-f-string
+# pylint: disable=line-too-long
+# pylint: disable=attribute-defined-outside-init
+
+"""Base inverter abstraction layer.
+
+Provides the unified Inverter class that abstracts control of different
+inverter brands (GivEnergy, Fox ESS, Solis, SolaX, etc.) behind a common
+interface. Handles charge/discharge rate control, window programming,
+target SoC setting, and reserve management via both REST API and Home
+Assistant entity writes with polling validation.
+"""
+
+import math
+import os
+import re
+import time
+import pytz
+from datetime import datetime, timedelta
+from config import INVERTER_DEF, SOLAX_SOLIS_MODES_NEW, SOLAX_SOLIS_MODES, SOLAX_SOLIS_MODES_FB00
+from const import (
+    MINUTE_WATT,
+    TIME_FORMAT,
+    TIME_FORMAT_OCTOPUS,
+    TIME_FORMAT_SOLIS,
+    INVERTER_TEST,
+    TIME_FORMAT_SECONDS,
+    INVERTER_MAX_RETRY,
+    INVERTER_WRITE_BACKOFF_FAILURES,
+    INVERTER_WRITE_DEGRADED_INTERVAL,
+    EXPORT_MODE_TARGET,
+    EXPORT_MODE_IDLE,
+    FULL_EXPORT_POWER,
+    INVERTER_WRITE_POLL_INTERVAL,
+    INVERTER_WRITE_POLL_MAX_INTERVAL,
+    INVERTER_CLOCK_SKEW_RESTART_MINUTES,
+    INVERTER_CLOCK_SKEW_WARN_MINUTES,
+    INVERTER_CLOCK_SKEW_WARN_REPEAT_MINUTES,
+    INVERTER_LIMIT_DEFAULT_W,
+    EXPORT_LIMIT_DEFAULT_W,
+)
+from control_ledger import generation_from_state, OWNED, UNOWNED
+from utils import calc_percent_limit, compute_window_minutes, dp0, dp1, dp2, dp3, dp4, is_entity_id, time_string_to_stamp, minute_data, minute_data_state, window2minutes, pack_export_limit, strptime_aware
+
+TIME_FORMAT_HMS = "%H:%M:%S"
+
+# Largest SoC jump (percentage points) between consecutive readings that the charge curve learner
+# accepts as genuine. Wide enough for inverters that report SoC in 5% steps; a larger jump is a
+# glitch (e.g. a stray 0% reading) and would otherwise stamp one sample across a huge SoC range.
+CHARGE_CURVE_MAX_SOC_STEP = 10
+
+# Sentinel for "this side has committed nothing yet", distinct from any real commit key a caller
+# might use - including None, which adjust_charge_window() can legitimately produce for an unset
+# window time.
+_NOT_COMMITTED = object()
+
+
+def within_fuzzy(value, target, fuzzy, fuzzy_below=None):
+    """
+    Whether a numeric read counts as target: within fuzzy either side, or within fuzzy_below when it is
+    short of target and fuzzy_below is given - for a value the device rounds down (#5324).
+    """
+    if fuzzy_below is not None and value < target:
+        return target - value <= fuzzy_below
+    return abs(value - target) <= fuzzy
+
+
+def calibration_reported(value):
+    """
+    True when a battery_calibration reading means a calibration cycle is running.
+
+    Shared by refresh_config(), which caches the result per plan cycle, and the control-failure
+    monitor's 60s poll, which must see a calibration that starts between plan runs.
+    """
+    return value in ("on", "On", "true", "True", True)
+
+
+class Inverter:
+    """Unified inverter control abstraction for multiple brands.
+
+    Provides a common interface for controlling GivEnergy, Fox ESS, Solis,
+    SolaX, and other inverter brands. Handles charge/discharge rate control,
+    window programming, target SoC setting, and reserve management via both
+    REST API and Home Assistant entity writes with polling validation.
+    """
+
+    # Write retry policy, set per type from INVERTER_DEF by refresh_config(). Declared here too so an
+    # Inverter built without __init__ (the test stubs) gets the default policy: INVERTER_MAX_RETRY
+    # attempts per write and no per-control backoff. Only GWMQTT sets anything else.
+    inv_write_max_retry = INVERTER_MAX_RETRY
+    inv_write_backoff = False
+
+    def self_test(self, minutes_now):
+        self.base.log("======= INVERTER CONTROL SELF TEST START ========")
+        self.adjust_battery_target(99, False)
+        self.adjust_battery_target(100, False)
+        self.adjust_charge_rate(215)
+        self.adjust_charge_rate(self.battery_rate_max_charge)
+        self.adjust_discharge_rate(220)
+        self.adjust_discharge_rate(self.battery_rate_max_discharge)
+        self.adjust_reserve(100)
+        self.adjust_reserve(6)
+        self.adjust_reserve(4)
+        self.adjust_pause_mode(pause_charge=True)
+        self.adjust_pause_mode(pause_discharge=True)
+        self.adjust_pause_mode(pause_charge=True, pause_discharge=True)
+        self.adjust_pause_mode()
+        self.disable_charge_window()
+        timea = time_string_to_stamp("23:00:00")
+        timeb = time_string_to_stamp("23:01:00")
+        timec = time_string_to_stamp("05:00:00")
+        timed = time_string_to_stamp("05:01:00")
+        self.adjust_charge_window(timeb, timed, minutes_now)
+        self.adjust_charge_window(timea, timec, minutes_now)
+        self.adjust_force_export(False, timec, timed)
+        self.adjust_force_export(True, timea, timeb)
+        self.adjust_force_export(False)
+        self.base.log("======= INVERTER CONTROL SELF TEST END ========")
+        exit
+
+    def sleep(self, seconds):
+        """
+        Sleep for x seconds
+        """
+        time.sleep(seconds)
+
+    def inverter_source_active(self):
+        """
+        Whether some component is supplying this inverter's state, even if it has no data yet.
+
+        Separates "a source is configured but hasn't answered this cycle" - transient, so fall
+        back to safe defaults and retry - from "no source is configured at all", a setup gap that
+        will never resolve on its own and is reported as an error instead.
+
+        Asked of the component registry's "inverter" tag rather than of individual config keys.
+        The previous test was "givtcp_rest or ge_cloud_direct", which was not a statement about
+        inverters so much as the two sources that happened to exist when it was written: every
+        component added since (Fox, Solis, SolaX, DEYE, Sunsynk, AlphaESS, Enphase, Sigenergy,
+        Teslemetry, Gateway) fell through it into the permanent-setup-gap branch and raised on a
+        fetch hiccup.
+        """
+        components = getattr(self.base, "components", None)
+        return bool(components) and components.inverter_source_active()
+
+    def inverter_source_name(self):
+        """
+        The name of the component supplying this inverter, for a user-facing message.
+
+        Reports this inverter's own type rather than a fleet-wide label: more than one inverter
+        component can be active at once, so naming whichever happened to be checked first sends
+        the user to look at credentials for hardware they may not even own. Falls back to the
+        active component names when the type has no display name.
+
+        An unset type is not a statement about the hardware. With inverter_type absent from
+        apps.yaml the type is "GE" only because nothing said otherwise, so naming GivEnergy told
+        the Solis owner in #4990 to go and check credentials for hardware they do not own. The
+        active components are the better answer there, and INVERTER_DEF is consulted only if there
+        are none - a defaulted type with no component is a bare apps.yaml setup, where "GivEnergy"
+        at least matches the behaviour Predbat is actually using.
+
+        Whether the type is unset is re-derived at message time rather than taken from a
+        constructor snapshot: a component's automatic_config() writes inverter_type into
+        base.args once discovery succeeds, and Inverter objects outlive that, so a startup-time
+        flag goes stale in both directions (#4990).
+        """
+        components = getattr(self.base, "components", None)
+        names = components.inverter_source_names() if components else []
+        if self.inverter_type_is_assumed() and names:
+            return ", ".join(names)
+        name = INVERTER_DEF.get(self.inverter_type, {}).get("name", None)
+        if name:
+            return name
+        return ", ".join(names) if names else self.inverter_type
+
+    def inverter_type_is_assumed(self):
+        """Whether inverter_type is currently unset, so GE is Predbat's assumption not a choice.
+
+        Deliberately re-derived from base.args every time rather than remembered from Inverter
+        construction: components write inverter_type into base.args after discovery (each one's
+        automatic_config()), while Inverter objects persist across cycles, so a snapshot taken at
+        construction would keep asserting "no inverter_type is set" long after Solis had been
+        discovered and configured (#4990).
+        """
+        return "inverter_type" not in self.base.args
+
+    def inverter_type_assumed_name(self):
+        """Display name of the assumed inverter type, for user-facing messages."""
+        return INVERTER_DEF.get(self.inverter_type, {}).get("name", None) or self.inverter_type
+
+    def inverter_source_hint(self):
+        """
+        What the user should go and check when a configured source returns no data.
+
+        Normally that is the named source's credentials. When inverter_type was never set there is
+        no credential Predbat can point at with any confidence, so it says so and lists the
+        inverter components that ARE configured together with whether each is in error - on #4990
+        a SolisCloud comms failure surfaced as "check the GivEnergy credentials", naming neither
+        the real component nor the real fault. The assumed type is named from INVERTER_DEF rather
+        than hardcoded, so the wording follows whatever the default actually is.
+        """
+        components = getattr(self.base, "components", None)
+        status = components.inverter_source_status() if components else []
+        if self.inverter_type_is_assumed() and status:
+            listed = "; ".join(status)
+            return "no inverter_type is set in apps.yaml so {} ({}) is assumed - configured inverter components: {} - set inverter_type to match your inverter, and check any component reported above as in error".format(
+                self.inverter_type_assumed_name(), self.inverter_type, listed
+            )
+        return "check the {} credentials and that the account still has this inverter attached".format(self.inverter_source_name())
+
+    def _poll_after_write(self, entity_id, matched, refresh=True, required_unit=None):
+        """
+        Spend one write_and_poll_sleep interval waiting for a written value, and return the last read.
+
+        inv_write_and_poll_sleep is a timeout, not a known duration: the HA service call returns as
+        soon as Home Assistant has accepted it, and the value appears only once whatever owns the
+        entity has actually applied it. Sleeping the whole interval before the first look charged
+        every write the worst case - a GivTCP REST write lands in well under a second, so switching
+        to export (about five entity writes at 10s each) took roughly 50s of which almost all was
+        spent waiting for work that was already finished.
+
+        A read that matches is trusted immediately, whatever owns the entity. This is only ever
+        reached once the caller has established that the entity did NOT already hold the target,
+        so a matching read is a transition observed after our own write rather than a stale value
+        that happened to agree.
+
+        matched(state) decides whether a read is the value that was written - each caller compares
+        differently (fuzzy numeric, exact string, on/off).
+        """
+        waited = 0.0
+        delay = INVERTER_WRITE_POLL_INTERVAL
+        while True:
+            state = self.base.get_state_wrapper(entity_id, refresh=refresh, required_unit=required_unit)
+            remaining = self.inv_write_and_poll_sleep - waited
+            if matched(state) or remaining <= 0:
+                return state
+            step = min(delay, remaining)
+            self.sleep(step)
+            waited += step
+            delay = min(delay * 2, INVERTER_WRITE_POLL_MAX_INTERVAL)
+
+    def check_clock_skew(self, tdiff, now_utc):
+        """
+        Act on the measured inverter clock skew in minutes, warning (and restarting) on a large skew and warning periodically on a moderate one
+        """
+        if abs(tdiff) >= INVERTER_CLOCK_SKEW_RESTART_MINUTES:
+            skew_message = "Inverter time is {}, Predbat computer time {}, this is {} minutes skewed".format(self.inverter_time, now_utc, tdiff)
+            message = "Warn: {}, Predbat may not function correctly, please fix this by updating your inverter time, checking HA is synchronising with your inverter, or fixing Predbat computer time zone".format(skew_message)
+            self.base.log(message)
+            self.base.record_status(message, had_errors=True)
+            # Trigger restart
+            self.auto_restart("Clock skew >= {} minutes".format(INVERTER_CLOCK_SKEW_RESTART_MINUTES))
+            return
+
+        # Below the restart threshold nothing is restarted, but a steady moderate skew still shifts every
+        # charge and export slot Predbat writes, so say so periodically rather than every cycle (#4989)
+        self.base.restart_active = False
+        if abs(tdiff) >= INVERTER_CLOCK_SKEW_WARN_MINUTES:
+            last_warn = self.base.clock_skew_warn_time.get(self.id, None)
+            if (last_warn is None) or ((now_utc - last_warn) >= timedelta(minutes=INVERTER_CLOCK_SKEW_WARN_REPEAT_MINUTES)):
+                self.base.clock_skew_warn_time[self.id] = now_utc
+                skew_message = "Inverter time is {}, Predbat computer time {}, this is {} minutes skewed".format(self.inverter_time, now_utc, tdiff)
+                self.base.log(
+                    "Warn: Inverter {}: {}. This is below the {} minute restart threshold but will still shift every charge and export slot Predbat writes - correct the inverter clock, or compensate for it with inverter_clock_skew_start/inverter_clock_skew_end and inverter_clock_skew_discharge_start/inverter_clock_skew_discharge_end in apps.yaml".format(
+                        self.id, skew_message, INVERTER_CLOCK_SKEW_RESTART_MINUTES
+                    )
+                )
+        else:
+            # Back within tolerance, forget the last warning so a recurrence is reported promptly
+            self.base.clock_skew_warn_time.pop(self.id, None)
+
+    def auto_restart(self, reason):
+        """
+        Attempt to restart the services required
+        """
+        if self.base.restart_active:
+            self.base.log("Warn: Inverter control auto restart already active, waiting...")
+            return
+
+        # Trigger restart
+        restart_command = self.base.get_arg("auto_restart", [])
+        self.base.log("Warn: Inverter control auto restart trigger: {} command {}".format(reason, restart_command))
+        if restart_command:
+            self.base.restart_active = True
+            if isinstance(restart_command, dict):
+                restart_command = [restart_command]
+            for command in restart_command:
+                shell = command.get("shell", None)
+                service = command.get("service", None)
+                app = command.get("app", None)
+                # retain addon service parameter for backwards compatibility with configs using the pre HA 2026.2 nomenclature
+                addon = command.get("addon", None)
+                if app:
+                    app = self.base.resolve_arg(service, app, indirect=False)
+                elif addon:
+                    addon = self.base.resolve_arg(service, addon, indirect=False)
+                entity_id = command.get("entity_id", None)
+                if entity_id:
+                    entity_id = self.base.resolve_arg(service, entity_id, indirect=False)
+                if shell:
+                    self.log("Warn: Inverter {} Calling restart shell command: {}".format(self.id, shell))
+                    os.system(shell)
+                if service:
+                    if app:
+                        self.log("Warn: Inverter {} Calling restart service {} with app {}".format(self.id, service, app))
+                        self.base.call_service_wrapper(service, app=app)
+                    elif addon:
+                        self.log("Warn: Inverter {} Calling restart service {} with addon {}".format(self.id, service, addon))
+                        self.base.call_service_wrapper(service, addon=addon)
+                    elif entity_id:
+                        self.log("Warn: Inverter {} Calling restart service {} with entity_id {}".format(self.id, service, entity_id))
+                        self.base.call_service_wrapper(service, entity_id=entity_id)
+                    else:
+                        self.log("Warn: Inverter {} Calling restart service {}".format(self.id, service))
+                        self.base.call_service_wrapper(service)
+                    if self.base.get_arg("set_system_notify"):
+                        self.base.call_notify(f"{self.base.prefix.capitalize()}: Auto-restart service {service} called due to: {reason}")
+                    self.sleep(15)
+            raise Exception("Auto-restart triggered")
+        else:
+            self.log("Info: Inverter {} auto_restart not defined in apps.yaml, Predbat can't auto-restart inverter control".format(self.id))
+
+    def create_missing_arg(self, arg, default):
+        """
+        Create a missing inverter argument which will be assigned to a dummy entity
+        """
+        if (arg not in self.base.args) or (not isinstance(self.base.args[arg], list)):
+            # Padded with None rather than the default, for the same reason as the short-list branch
+            # below: the caller overwrites [self.id] with its dummy entity straight afterwards, so a
+            # bare default left in another inverter's slot reads back as "configured" there too - and
+            # rate_controls() then takes a sibling's default number for a bound entity (#5359)
+            single_value = self.base.args.get(arg)
+            self.base.args[arg] = [default if i == self.id else None for i in range(4)]
+            if self.id > 0 and single_value is not None:
+                # A single apps.yaml value is inverter 0's (see user_configured_entity()), so another
+                # inverter making its dummy must not throw it away - inverter 0 would lose its own
+                # entity and read and write the default in its place
+                self.base.args[arg][0] = single_value
+        elif len(self.base.args[arg]) <= self.id:
+            # A list that stops short of this inverter is just as missing for it as no list at all,
+            # and every caller assigns into [self.id] straight afterwards - so a short one raised
+            # IndexError rather than getting its dummy entity. Reachable whenever apps.yaml or a
+            # component's auto-config names fewer inverters than num_inverters, which is now the
+            # normal shape of a mixed fleet: a component configures the inverters it discovered and
+            # leaves the rest of the list to the user (#5029).
+            #
+            # Padded with None rather than the default: the caller overwrites [self.id] with its
+            # dummy entity, so the padding is only ever read by some other inverter, for which this
+            # key is genuinely unconfigured. A bare value there reads back as an entity id and is
+            # then looked up as one.
+            self.base.args[arg] = self.base.args[arg] + [None] * (self.id + 1 - len(self.base.args[arg]))
+
+    def user_configured_entity(self, arg):
+        """
+        The entity id the user gave this inverter for arg in apps.yaml, or None.
+
+        "Set in apps.yaml" is judged from args_from_apps_yaml, the snapshot taken before Predbat's
+        own defaulting touches args: apps.yaml must name an entity (or a re: pattern) for this
+        inverter. The entity itself is read from the live args, which by now has any re: pattern
+        resolved, and is never Predbat's own dummy for this slot - so a dummy written on an earlier
+        refresh never counts, even behind a pattern that matched nothing. A bare placeholder such as
+        '00:00:00', an unmatched pattern, or a malformed value gives None.
+        """
+        raw = (getattr(self.base, "args_from_apps_yaml", None) or {}).get(arg)
+        if isinstance(raw, list):
+            # Per inverter: a list naming inverter 0 only says nothing about inverter 1, whose live
+            # slot may by now hold the dummy an earlier refresh wrote there
+            raw = raw[self.id] if self.id < len(raw) else None
+        elif self.id > 0:
+            # A single value is inverter 0's, which create_missing_arg() keeps in slot 0
+            raw = None
+        # Judged on what apps.yaml itself says, not just that it said something: a placeholder such as
+        # Sofar's '00:00:00' is set, but the live slot holds Predbat's own dummy from the first cycle on
+        if not (isinstance(raw, str) and (is_entity_id(raw) or raw.startswith("re:"))):
+            return None
+        value = self.base.args.get(arg)
+        if isinstance(value, list):
+            value = value[self.id] if self.id < len(value) else None
+        if not is_entity_id(value) or value.startswith("re:"):
+            return None
+        # A re: pattern that matched nothing leaves the slot empty, so from the second cycle on it holds
+        # the dummy Predbat wrote there - under whichever inverter type was current at the time
+        if re.fullmatch(r"sensor\.{}_.+_{}_{}".format(re.escape(self.base.prefix), self.id, re.escape(arg)), value):
+            return None
+        return value
+
+    def __init__(self, base, id=0, quiet=False):
+        """
+        Inverter class
+
+        Only genuinely persistent state is set here - values this object accumulates over its
+        lifetime and that nothing ever unconditionally overwrites. Everything else is set to None
+        by _init_attribute_defaults() below: it is about to be replaced with real data by refresh_config()
+        or update_status() before anything reads it, so giving it a real-looking placeholder value
+        (a prior version of this code set reserve_percent = 4.0, battery_rate_max_raw = 2600.0, and
+        so on) is indistinguishable from a deliberately configured one and invites exactly the kind
+        of implicit "is this the placeholder or a real reading" sentinel check that
+        battery_size_tracking() below has to do on nominal_capacity. None cannot be mistaken for a
+        real value.
+        """
+        self.id = id
+        self.base = base
+        self.log = self.base.log
+
+        # Accumulated across the object's lifetime; never reset while it persists (#4712 - these
+        # used to be reseeded every cycle because the object itself was rebuilt every cycle).
+        self.count_register_writes = 0
+        self.created_attributes = {}
+        # Commit-once state, keyed by scope - see commit_needed(). Each entry is the last state that
+        # scope actually committed to this inverter; a scope absent from the dict has committed
+        # nothing yet in this run, so its next call commits once. commit_pending marks a scope whose
+        # writes or button press failed, so the next cycle retries even though the registers now read
+        # back as already correct. Both live here rather than as per-scope attributes so every
+        # press_and_poll_button() caller gets the same suppression and retry semantics - #4711
+        # guarded the export window alone and #4712 the charge window separately, with different key
+        # shapes and different retry ordering, and the target-SoC and window-disable presses had no
+        # guard at all and kept pressing every cycle (#2328).
+        self.last_committed = {}
+        self.commit_pending = {}
+        # Count of writes that moved a real register: it read something else beforehand and reads
+        # the new value back afterwards. Callers take the difference across their own writes to
+        # learn whether something outside Predbat had changed what they manage - see commit_needed().
+        self.registers_moved = 0
+        # Per-control write backoff state, keyed by entity_id - see _write_attempts().
+        self.write_backoff = {}
+
+        self._init_attribute_defaults()
+
+        # Everything below here is re-read every cycle, not just at construction - see
+        # refresh_config().
+        self.refresh_config(quiet=quiet)
+
+    def _init_attribute_defaults(self):
+        """
+        Establish the starting shape of every attribute refresh_config()/update_status() will own.
+
+        Construction-time only, and named to say so: calling this on a live object would null
+        charge_enable_time, soc_kw, battery_voltage and the window lists out from under a cycle that
+        is midway through using them. These attributes persist with the object and are reassigned in
+        place by refresh_config()/update_status() each cycle, so there is never a reason to re-run
+        this (#5126 review - the previous name, reset_cycle_state(), invited exactly that call).
+
+        They are seeded None rather than to a plausible-looking default because a real-looking
+        placeholder is indistinguishable from a configured value, which is what made in_calibration
+        and battery_voltage misbehave once the object stopped being rebuilt every cycle.
+        """
+        # Read every cycle by refresh_config().
+        self.soc_max = None
+        self.nominal_capacity = None
+        # inverter_limit/export_limit are deliberately not seeded here: refresh_config() assigns
+        # them their standing defaults unconditionally before anything can read them, so a seed
+        # would be dead code duplicating the same two constants (#5126 review).
+        self.inverter_time = None
+        self.reserve_percent = None
+        self.reserve_percent_current = None
+        self.battery_scaling = None
+        self.battery_scaling_config = None
+        self.reserve_max = None
+        self.battery_rate_max_raw = None
+        self.battery_rate_max_charge = None
+        self.battery_rate_max_charge_dc = None
+        self.battery_rate_max_discharge = None
+        self.battery_rate_max_export = None
+        self.battery_temperature = None
+        # refresh_config() now does a real two-way read of battery_calibration (see there), so this
+        # is only the starting shape before the first refresh_config() call inside __init__ runs.
+        self.in_calibration = None
+
+        # Read every cycle by update_status().
+        self.charge_enable_time = False
+        self.charge_start_time_minutes = self.base.forecast_minutes
+        self.charge_end_time_minutes = self.base.forecast_minutes
+        self.discharge_start_time_minutes = self.base.forecast_minutes
+        self.discharge_end_time_minutes = self.base.forecast_minutes
+        self.charge_window = []
+        self.export_window = []
+        self.export_limits = []
+        self.current_charge_limit = None
+        self.soc_kw = None
+        self.soc_percent = None
+        # battery_voltage is None, not a guessed default: get_arg() in update_status() already
+        # supplies the real fallback (52.0) whenever the entity is absent, so nothing here is a
+        # second source of truth for it - this seed is only "not read yet", and set_current_from_power()
+        # checks for that explicitly rather than silently dividing by a placeholder.
+        self.battery_power = 0
+        self.battery_power_valid = False  # True only when update_status() actually read battery_power
+        # The rates execute_plan() last wrote, in W, which the control-failure monitor judges against;
+        # None until written (and in Monitor mode, where nothing is)
+        self.requested_charge_w = None
+        self.requested_discharge_w = None
+        self.battery_voltage = None
+        self.pv_power = 0
+        self.load_power = 0
+        self.track_charge_start = "00:00:00"
+        self.track_charge_end = "00:00:00"
+        self.track_discharge_start = "00:00:00"
+        self.track_discharge_end = "00:00:00"
+        self.idle_start_minutes = 0
+        self.idle_end_minutes = 0
+
+    def refresh_config(self, quiet=False):
+        """
+        Read this inverter's configuration and current limits.
+
+        Split out of __init__ so the Inverter objects can persist across cycles. Everything here is
+        either live config a user can change at runtime (battery_min_soc, battery_scaling, the rate
+        limits, battery_calibration) or a per-cycle side effect (battery size tracking, clock skew
+        detection), so it has to keep running every cycle even though the object no longer does.
+        What stays in __init__ is the identity and the accumulated state that must survive - notably
+        the committed-schedule guard, which was being wiped by the rebuild (#4712).
+        """
+        self.reserve_percent = self.base.get_arg("battery_min_soc", default=4.0, index=self.id, required_unit="%")
+        self.reserve_percent_current = self.base.get_arg("battery_min_soc", default=4.0, index=self.id, required_unit="%")
+        self.battery_scaling = self.base.get_arg("battery_scaling", default=1.0, index=self.id)
+        if not self.battery_scaling or self.battery_scaling <= 0:
+            # A parsed value of exactly 0 (or negative) isn't safe to interpret either way - it could
+            # be a flaky/unavailable API response (e.g. Solis Cloud API returning batteryHealthSoh: 0
+            # during an outage) or a genuinely unhealthy battery, and asserting either "fully healthy"
+            # (1.0) or "no capacity" (0) would be guessing. Retain the last value that was actually
+            # read as valid, rather than inventing one; only fall back to 1.0 if nothing valid has
+            # ever been read for this inverter.
+            last_known = self.base.get_arg("battery_scaling_last_known", default=1.0, index=self.id)
+            self.log("Warn: Inverter {} battery_scaling read as {} which is not a valid scaling factor, retaining last known value {} for this cycle".format(self.id, self.battery_scaling, last_known))
+            self.battery_scaling = last_known
+        else:
+            self.base.set_arg("battery_scaling_last_known", self.battery_scaling, index=self.id)
+        self.battery_scaling_config = self.battery_scaling
+
+        self.inverter_type = self.base.get_arg("inverter_type", "GE", indirect=False, index=self.id)
+        # An assumed type is not a chosen one. The user-facing "source returned no data" warnings
+        # must not name it as though the user had picked it (#4990); those messages re-derive the
+        # fact at message time (inverter_type_is_assumed) because discovery can set the type later.
+        if self.inverter_type_is_assumed():
+            self.log(
+                "Warn: Inverter {}: inverter_type is not set in apps.yaml, assuming {} ({}) - if this is not correct, set inverter_type to match your inverter, see the documentation".format(self.id, self.inverter_type_assumed_name(), self.inverter_type)
+            )
+
+        # Read user defined inverter type
+        if "inverter" in self.base.args:
+            if self.inverter_type not in INVERTER_DEF:
+                INVERTER_DEF[self.inverter_type] = INVERTER_DEF["GE"].copy()
+                # GivEnergy's rate quantisation is a fact about its hardware, not a default for other inverters
+                INVERTER_DEF[self.inverter_type].pop("rate_step_percent_of_capacity", None)
+
+            inverter_def = self.base.args["inverter"]
+            if isinstance(inverter_def, list):
+                inverter_def = inverter_def[self.id]
+
+            if isinstance(inverter_def, dict):
+                for key in inverter_def:
+                    INVERTER_DEF[self.inverter_type][key] = inverter_def[key]
+            else:
+                self.log("Warn: Inverter {}: inverter definition is not a dictionary".format(self.id))
+
+        if self.inverter_type in INVERTER_DEF:
+            self.log(f"Inverter {self.id}: Type {self.inverter_type} {INVERTER_DEF[self.inverter_type]['name']}")
+        else:
+            raise ValueError("Inverter type {} not defined".format(self.inverter_type))
+
+        if self.inverter_type != "GE":
+            self.log("Note: Inverter {}: Using inverter type {} - not all features are available on all Inverter types".format(self.id, self.inverter_type))
+
+        # Load inverter brand definitions
+        self.reserve_max = self.base.get_arg("inverter_reserve_max", 100)
+        self.inv_has_mqtt_api = INVERTER_DEF[self.inverter_type]["has_mqtt_api"]
+        self.inv_mqtt_topic = self.base.get_arg("mqtt_topic", "Sofar2mqtt")
+        self.inv_output_charge_control = INVERTER_DEF[self.inverter_type]["output_charge_control"]
+        self.inv_charge_control_immediate = INVERTER_DEF[self.inverter_type]["charge_control_immediate"]
+        self.inv_current_dp = INVERTER_DEF[self.inverter_type].get("current_dp", 1)
+        self.inv_has_charge_enable_time = INVERTER_DEF[self.inverter_type]["has_charge_enable_time"]
+        self.inv_has_discharge_enable_time = INVERTER_DEF[self.inverter_type]["has_discharge_enable_time"]
+        self.inv_has_target_soc = INVERTER_DEF[self.inverter_type]["has_target_soc"]
+        self.inv_has_reserve_soc = INVERTER_DEF[self.inverter_type]["has_reserve_soc"]
+        self.inv_has_timed_pause = INVERTER_DEF[self.inverter_type]["has_timed_pause"]
+        self.inv_charge_time_format = INVERTER_DEF[self.inverter_type]["charge_time_format"]
+        self.inv_charge_time_entity_is_option = INVERTER_DEF[self.inverter_type]["charge_time_entity_is_option"]
+        self.inv_clock_time_format = INVERTER_DEF[self.inverter_type]["clock_time_format"]
+        self.inv_soc_units = INVERTER_DEF[self.inverter_type]["soc_units"]
+        self.inv_time_button_press = INVERTER_DEF[self.inverter_type]["time_button_press"]
+        self.inv_support_charge_freeze = INVERTER_DEF[self.inverter_type]["support_charge_freeze"]
+        self.inv_support_discharge_freeze = INVERTER_DEF[self.inverter_type]["support_discharge_freeze"]
+        # True only for inverters whose Freeze Export really is a "Feed-in First" mode (load, then
+        # export, then battery) - most just disable charging, so PV above the export limit is clipped
+        # rather than recaptured. Defaults False so an inverter type has to opt in explicitly.
+        self.inv_support_feedin_first = INVERTER_DEF[self.inverter_type].get("support_feedin_first", False)
+        self.inv_has_ge_inverter_mode = INVERTER_DEF[self.inverter_type]["has_ge_inverter_mode"]
+        self.inv_has_ge_eco_toggle = INVERTER_DEF[self.inverter_type].get("has_ge_eco_toggle", False)
+        self.inv_num_load_entities = INVERTER_DEF[self.inverter_type]["num_load_entities"]
+        self.inv_write_and_poll_sleep = INVERTER_DEF[self.inverter_type]["write_and_poll_sleep"]
+        # Only take effect when a row sets them explicitly - currently only GWMQTT does
+        self.inv_write_max_retry = INVERTER_DEF[self.inverter_type].get("write_max_retry", INVERTER_MAX_RETRY)
+        self.inv_write_backoff = INVERTER_DEF[self.inverter_type].get("write_backoff", False)
+        self.inv_has_idle_time = INVERTER_DEF[self.inverter_type]["has_idle_time"]
+        self.inv_can_span_midnight = INVERTER_DEF[self.inverter_type]["can_span_midnight"]
+        # A device can restrict its own profile via a can_span_midnight attribute on its charge
+        # start time entity, e.g. a same-day EMS behind a Hub whose other inverters can span
+        # midnight. It may only restrict: an attribute never loosens a profile that cannot span.
+        time_entity = self.base.get_arg("charge_start_time", indirect=False, index=self.id)
+        # Some templates give a fixed time rather than an entity, which has no attributes to read
+        if is_entity_id(time_entity) and self.base.get_state_wrapper(time_entity, attribute="can_span_midnight") is False:
+            self.inv_can_span_midnight = False
+        self.inv_charge_discharge_with_rate = INVERTER_DEF[self.inverter_type].get("charge_discharge_with_rate", False)
+        self.inv_target_soc_used_for_discharge = INVERTER_DEF[self.inverter_type].get("target_soc_used_for_discharge", True)
+        self.inv_has_solis_energy_control = INVERTER_DEF[self.inverter_type].get("has_solis_energy_control", False)
+        # The charge_rate entity can carry the step itself, for a type that covers more than one brand: the
+        # hub is GWMQTT whatever it drives, and marks only its GivEnergy inverters. The row's value stands otherwise
+        self.inv_rate_step_percent_of_capacity = INVERTER_DEF[self.inverter_type].get("rate_step_percent_of_capacity", 0)
+        rate_entity = self.base.get_arg("charge_rate", indirect=False, index=self.id)
+        if rate_entity:
+            try:
+                rate_step = float(self.base.get_state_wrapper(rate_entity, attribute="step_percent_of_capacity"))
+            except (ValueError, TypeError):
+                rate_step = 0
+            if 0 < rate_step <= 100:
+                self.inv_rate_step_percent_of_capacity = rate_step
+        # The rate entity can also say that its rate only limits charging from the grid, as on the GivEnergy
+        # 3-phase units: with no pause register either, a zero charge rate leaves PV filling the battery, so
+        # Freeze Export cannot be carried out and must not be planned (#5082)
+        for rate_arg in ["charge_rate", "charge_rate_percent"]:
+            grid_only_entity = self.base.get_arg(rate_arg, indirect=False, index=self.id)
+            if grid_only_entity and str(self.base.get_state_wrapper(grid_only_entity, attribute="grid_charge_only")).lower() in ["true", "on", "1"]:
+                if self.inv_support_discharge_freeze:
+                    self.log("Inverter {} charge rate only limits grid charging and cannot stop solar charging - Freeze Export is not supported".format(self.id))
+                self.inv_support_discharge_freeze = False
+                break
+
+        # If it's not a GE inverter then turn Quiet off
+        if self.inverter_type != "GE":
+            quiet = False
+
+        # Timed pause support?
+        if self.inv_has_timed_pause:
+            entity_mode = self.base.get_arg("pause_mode", indirect=False, index=self.id)
+            if entity_mode:
+                old_pause_mode = self.base.get_state_wrapper(entity_mode)
+                if old_pause_mode is None:
+                    self.inv_has_timed_pause = False
+                    self.log("Inverter {} does not have timed pause support enabled".format(self.id))
+                else:
+                    self.log("Inverter {} has timed pause support enabled".format(self.id))
+            else:
+                self.inv_has_timed_pause = False
+                self.log("Inverter {} does not have timed pause support enabled".format(self.id))
+
+        # Battery/capacity discovery is an ordinary entity read for every inverter type now. For
+        # GivTCP these entities are published by GivTCPComponent, which does the REST reading and
+        # the version normalisation (v2's Invertor_Details vs v3's serial-named block, the nominal
+        # capacity scaling, the per-pack temperature averaging) - see givtcp.py.
+        self.battery_temperature = self.base.get_arg("battery_temperature", default=20, index=self.id, required_unit="\u00b0C")
+        self.nominal_capacity = self.base.get_arg("soc_max", default=0.0, index=self.id)
+        self.soc_max = self.nominal_capacity * self.battery_scaling
+
+        if self.inverter_type in ["GE", "GEC", "GEE"]:
+            # Not every GivEnergy model has an absolute charge power register to read the maximum
+            # from - the 3-phase units rate the battery as a percentage instead. GECloud leaves
+            # charge_rate unset for those, so the attribute read below silently returns the 2600W
+            # default however capable the inverter really is, and every rate Predbat plans and
+            # writes is scaled against it. Fall back to battery_rate_max, which GECloud already
+            # populates from the device's own reported max_charge_rate (GH#4908).
+            if self.base.get_arg("charge_rate", indirect=False, index=self.id):
+                self.battery_rate_max_raw = self.base.get_arg("charge_rate", attribute="max", index=self.id, default=2600.0, required_unit="W")
+            else:
+                self.battery_rate_max_raw = self.base.get_arg("battery_rate_max", index=self.id, default=2600.0, required_unit="W")
+        elif "battery_rate_max" in self.base.args:
+            self.battery_rate_max_raw = self.base.get_arg("battery_rate_max", index=self.id, default=2600.0, required_unit="W")
+        else:
+            self.battery_rate_max_raw = 2600.0
+
+        ivtime = self.base.get_arg("inverter_time", index=self.id, default=None)
+
+        # A calibration cycle deliberately drives the battery outside its normal SoC range, so any
+        # plan made during one is wrong - Predbat disables itself for this inverter until it ends.
+        # Only inverters that report it configure battery_calibration; absent means never calibrating.
+        # A real two-way read, not "only ever set True": with the Inverter object persisting across
+        # cycles (#4712), this has to be the one place that clears it too, or a real device leaving
+        # calibration would leave Predbat stuck thinking it never did.
+        was_in_calibration = self.in_calibration
+        self.in_calibration = calibration_reported(self.base.get_arg("battery_calibration", default=None, index=self.id))
+        if self.in_calibration and not was_in_calibration:
+            self.log("Warn: Inverter {} is in calibration mode, Predbat will not function correctly and will be disabled".format(self.id))
+        elif was_in_calibration and not self.in_calibration:
+            self.log("Info: Inverter {} has left calibration mode".format(self.id))
+
+        # Battery rate max charge, discharge (all converted to kW/min)
+        inverter_limit_charge = self.base.get_arg("inverter_limit_charge", self.battery_rate_max_raw, index=self.id, required_unit="W")
+        inverter_limit_discharge = self.base.get_arg("inverter_limit_discharge", self.battery_rate_max_raw, index=self.id, required_unit="W")
+        inverter_limit_override = self.base.get_arg("inverter_limit_override", 0, index=self.id, required_unit="W")
+        if inverter_limit_override > 0:
+            self.log("Info: Inverter {} applying inverter_limit_override of {} W to charge and discharge limits".format(self.id, inverter_limit_override))
+            inverter_limit_charge = min(inverter_limit_override, inverter_limit_charge)
+            inverter_limit_discharge = min(inverter_limit_override, inverter_limit_discharge)
+        inverter_limit_charge_dc = self.base.get_arg("inverter_limit_charge_dc", inverter_limit_charge, index=self.id, required_unit="W")
+        self.battery_rate_max_charge = min(inverter_limit_charge, self.battery_rate_max_raw) / MINUTE_WATT
+        self.battery_rate_max_charge_dc = inverter_limit_charge_dc / MINUTE_WATT
+        self.battery_rate_max_discharge = min(inverter_limit_discharge, self.battery_rate_max_raw) / MINUTE_WATT
+        inverter_limit_export = self.base.get_arg("inverter_limit_export", inverter_limit_discharge, index=self.id, required_unit="W")
+        self.battery_rate_max_export = min(inverter_limit_export, self.battery_rate_max_raw) / MINUTE_WATT
+        self.battery_rate_min = min(self.base.get_arg("inverter_battery_rate_min", 0, index=self.id, required_unit="W"), self.battery_rate_max_raw) / MINUTE_WATT
+
+        # Track and update battery size (if automatic)
+        self.battery_size_tracking()
+
+        # Convert inverter time into timestamp.
+        # An absent or unavailable reading (e.g. the cloud API denied access because a GivEnergy
+        # Premium subscription is now required) is treated as "no reading" — skew detection is
+        # skipped rather than misreporting it as inverter clock skew or triggering an auto-restart.
+        if isinstance(ivtime, str) and ivtime.strip().lower() in ("", "unavailable", "unknown", "none"):
+            ivtime = None
+        # Reset every cycle, not just at construction (_init_attribute_defaults() only runs once on a
+        # persisted object) - otherwise a dropped/unavailable reading here leaves the previous
+        # cycle's stale timestamp in place, and the skew check below keeps comparing against a dead
+        # reading rather than treating the drop as "no reading" as intended (#5126 review).
+        self.inverter_time = None
+        if ivtime:
+            # The per-type clock_time_format is only a hint about the most likely shape - the same
+            # inverter can be read through different integrations that format the clock differently.
+            # A Growatt read over the Solax Modbus integration (inverter_type SA) publishes its rtc
+            # sensor as "2025-06-10 15:44:42", a space separator with no offset, which matched none
+            # of the formats tried here and cost that user skew detection entirely (GH#2444). Try
+            # every known shape rather than just the type's own, and localize whatever comes back
+            # naive to the configured timezone, as the per-type parse already did.
+            tz = pytz.timezone(self.base.get_arg("timezone", "Europe/London"))
+            formats = [TIME_FORMAT, TIME_FORMAT_OCTOPUS, TIME_FORMAT_SOLIS]
+            if self.inv_clock_time_format not in formats:
+                formats.append(self.inv_clock_time_format)
+            for time_format in formats:
+                try:
+                    parsed = datetime.strptime(ivtime, time_format)
+                except (ValueError, TypeError):
+                    continue
+                self.inverter_time = parsed if parsed.tzinfo else tz.localize(parsed)
+                break
+            if self.inverter_time is None:
+                self.base.log("Warn: Inverter {} unable to read inverter time string {} using formats {}".format(self.id, ivtime, formats))
+                self.auto_restart("Unable to read inverter time")
+
+        # Check inverter time and confirm skew
+        if self.inverter_time:
+            # Fetch current time again as it may have changed since we run this inverter update
+            local_tz = pytz.timezone(self.base.get_arg("timezone", "Europe/London"))
+            now_utc = datetime.now(local_tz)
+
+            tdiff = self.inverter_time - now_utc
+            tdiff = dp2(tdiff.seconds / 60 + tdiff.days * 60 * 24)
+            if not quiet:
+                self.base.log("Inverter time {}, Predbat computer time {}, difference {} minutes".format(self.inverter_time, now_utc, tdiff))
+            self.check_clock_skew(tdiff, now_utc)
+
+        # Get the expected minimum reserve value for the current inverter
+        reserve_min_postfix = "" if self.id == 0 else "_" + str(self.id)
+        self.reserve_min = int(self.base.get_arg("set_reserve_min" + reserve_min_postfix))
+
+        # Min soc setting
+        battery_min_soc = self.base.get_arg("battery_min_soc", default=max(self.reserve_min, 4), index=self.id)
+
+        # Get current reserve value. GivTCPComponent publishes the reserve entity's state straight
+        # from Battery_Power_Reserve, so this reads the same number the REST snapshot used to carry
+        # without a second source of truth for it. (Only the entity's "min" attribute is adjusted
+        # for battery_min_soc; its state is what the inverter is actually set to.)
+        self.reserve_percent_current = max(self.base.get_arg("reserve", default=battery_min_soc, index=self.id, required_unit="%"), battery_min_soc)
+        self.reserve_current = dp2(self.soc_max * self.reserve_percent_current / 100.0)
+
+        if self.reserve_min < battery_min_soc:
+            self.base.log("Inverter {} Increasing set_reserve_min{} from {}%  to battery_min_soc of {}%".format(self.id, reserve_min_postfix, self.reserve_min, battery_min_soc))
+            self.base.expose_config("set_reserve_min" + reserve_min_postfix, battery_min_soc)
+            self.reserve_min = battery_min_soc
+
+        device_min, device_max = self.reserve_device_bounds()
+        if device_min is None and device_max is None:
+            register_bounds = ""
+        else:
+            register_bounds = ", register accepts {} to {}".format("{}%".format(device_min) if device_min is not None else "any", "{}%".format(device_max) if device_max is not None else "any")
+        self.base.log("Inverter {} Reserve min: {}%, battery_min: {}%{}".format(self.id, self.reserve_min, dp0(battery_min_soc), register_bounds))
+        if (self.base.set_reserve_enable and self.inv_has_reserve_soc) or not self.inv_has_reserve_soc:
+            self.reserve_percent = self.reserve_min
+        else:
+            self.reserve_percent = self.reserve_percent_current
+
+        # adjust_reserve() already clamps what it writes to these same bounds (GH#4826), so they are
+        # what the inverter is actually holding. Model that floor too, rather than planning against a
+        # bottom of the battery the write path will never ask for and the battery will never release
+        # (GH#4953). Applies whichever branch above chose reserve_percent: the limit is the device's,
+        # not a policy, so set_reserve_enable does not change it.
+        if device_min is not None:
+            self.reserve_percent = max(self.reserve_percent, device_min)
+        if device_max is not None:
+            self.reserve_percent = min(self.reserve_percent, device_max)
+        self.reserve = dp3(self.soc_max * self.reserve_percent / 100.0)
+
+        # Max inverter rate override. Reset to the standing default before the conditional
+        # re-read, or a key removed at runtime (or popped by a test) would leave the previous
+        # cycle's override in place indefinitely instead of reverting.
+        self.inverter_limit = INVERTER_LIMIT_DEFAULT_W / MINUTE_WATT
+        self.export_limit = EXPORT_LIMIT_DEFAULT_W / MINUTE_WATT
+        if "inverter_limit" in self.base.args:
+            self.inverter_limit = self.base.get_arg("inverter_limit", self.inverter_limit * MINUTE_WATT, index=self.id, required_unit="W") / MINUTE_WATT
+        if "export_limit" in self.base.args:
+            self.export_limit = self.base.get_arg("export_limit", self.export_limit * MINUTE_WATT, index=self.id, required_unit="W") / MINUTE_WATT
+
+        # Log inverter details
+        if not quiet:
+            self.base.log(
+                "Inverter {} with soc_max {}kWh, nominal_capacity {}kWh, battery rate raw {}W, charge rate {}kW, charge rate DC {}kW, discharge rate {}kW, battery_rate_min {}W, AC limit {}kW, export limit {}kW, reserve {}%, current_reserve {}%, temperature {}°C".format(
+                    self.id,
+                    dp2(self.soc_max),
+                    dp2(self.nominal_capacity),
+                    dp2(self.battery_rate_max_raw),
+                    dp2(self.battery_rate_max_charge * 60.0),
+                    dp2(self.battery_rate_max_charge_dc * 60.0),
+                    dp2(self.battery_rate_max_discharge * 60.0),
+                    dp2(self.battery_rate_min * MINUTE_WATT),
+                    dp2(self.inverter_limit * 60),
+                    dp2(self.export_limit * 60),
+                    self.reserve_percent,
+                    self.reserve_percent_current,
+                    self.battery_temperature,
+                )
+            )
+
+        # Create some dummy entities if PredBat expects them but they don't exist for this Inverter Type:
+        # Args are also set for these so that no entries are needed for the dummies in the config file
+        if not self.inv_has_charge_enable_time:
+            self.create_missing_arg("scheduled_charge_enable", "on")
+            self.base.args["scheduled_charge_enable"][self.id] = self.create_entity("scheduled_charge_enable", "on")
+
+        if not self.inv_has_discharge_enable_time:
+            self.create_missing_arg("scheduled_discharge_enable", "on")
+            self.base.args["scheduled_discharge_enable"][self.id] = self.create_entity("scheduled_discharge_enable", "on")
+
+        if not self.inv_has_reserve_soc:
+            self.create_missing_arg("reserve", self.reserve)
+            self.base.args["reserve"][self.id] = self.create_entity("reserve", self.reserve, device_class=None, uom="%", icon="mdi:battery-lock")
+
+        if not self.inv_has_target_soc:
+            self.create_missing_arg("charge_limit", 100)
+            self.base.args["charge_limit"][self.id] = self.create_entity("charge_limit", 100, device_class=None, uom="%", icon="mdi:target")
+
+        if self.inv_output_charge_control != "power":
+            max_charge = self.battery_rate_max_charge * MINUTE_WATT
+            max_discharge = self.battery_rate_max_discharge * MINUTE_WATT
+            self.create_missing_arg("charge_rate", max_charge)
+            self.create_missing_arg("discharge_rate", max_discharge)
+            self.base.args["charge_rate"][self.id] = self.create_entity("charge_rate", max_charge, uom="W", device_class="power")
+            self.base.args["discharge_rate"][self.id] = self.create_entity("discharge_rate", max_discharge, uom="W", device_class="power")
+
+        if not self.inv_has_ge_inverter_mode and not self.inv_has_ge_eco_toggle:
+            self.create_missing_arg("inverter_mode", "Eco")
+            self.base.args["inverter_mode"][self.id] = self.create_entity("inverter_mode", "Eco")
+
+        if self.inv_charge_time_format != "HH:MM:SS":
+            # Some formats (H M) decompose the write into separate hour/minute entities and never
+            # expect the user to set this directly; others (no time window at all) ship a bare
+            # placeholder string. Either way Predbat needs somewhere to read/write for its own window
+            # bookkeeping. But if the user has genuinely pointed this at a real entity - a custom
+            # inverter definition using a non-HH:MM:SS format together with a real time window, e.g.
+            # #4738 - that's the one to use, not a self-created dummy that silently discards it.
+            for x in ["charge", "discharge"]:
+                for y in ["start", "end"]:
+                    entity_name = f"{x}_{y}_time"
+                    # Read before create_missing_arg(), which turns a single value into a list of defaults
+                    configured = self.user_configured_entity(entity_name)
+                    self.create_missing_arg(entity_name, "23:59:00")
+                    self.base.args[entity_name][self.id] = configured if configured else self.create_entity(entity_name, "23:59:00")
+
+        # Create dummy idle time entities
+        if not self.inv_has_idle_time:
+            self.create_missing_arg("idle_start_time", "00:00:00")
+            self.create_missing_arg("idle_end_time", "00:00:00")
+            self.base.args["idle_start_time"][self.id] = self.create_entity("idle_start_time", "00:00:00")
+            self.base.args["idle_end_time"][self.id] = self.create_entity("idle_end_time", "00:00:00")
+
+    def battery_size_tracking(self):
+        # Battery size determination: fused auto-scaling + find_battery_size logic
+        # If soc_max is unset, automatically enable battery_scaling_auto
+        if self.id > 0:
+            soc_max_sensor_name = "sensor.{}_soc_max_calculated_{}".format(self.base.prefix, self.id)
+        else:
+            soc_max_sensor_name = "sensor.{}_soc_max_calculated".format(self.base.prefix)
+
+        # Store nominal capacity.
+        # Only read the persisted arg when nominal_capacity was not already set from REST or config (i.e. still 0).
+        # This prevents a stale arg value from overwriting a real REST/config-provided nominal.
+        if not self.nominal_capacity or self.nominal_capacity <= 0:
+            self.nominal_capacity = self.base.get_arg("soc_max_nominal", index=self.id, default=0.0)
+        self.base.set_arg("soc_max_nominal", self.nominal_capacity, index=self.id)
+
+        # If the live soc_max read was invalid (e.g. the source sensor was momentarily unavailable)
+        # but we recovered a valid nominal from soc_max_nominal, recompute soc_max so the known-good
+        # capacity takes effect instead of falling through to the 8 kWh default below.
+        if (not self.soc_max or self.soc_max <= 0) and self.nominal_capacity and self.nominal_capacity > 0:
+            self.soc_max = dp3(self.nominal_capacity * self.battery_scaling)
+            self.log("Note: Inverter {} soc_max source unavailable this cycle, retained last known battery size {:.3f} kWh".format(self.id, self.soc_max))
+
+        if not self.nominal_capacity or self.nominal_capacity <= 0:
+            self.log("Note: Inverter {} battery size was not set, enabling battery_scaling_auto".format(self.id))
+            self.base.battery_scaling_auto = True
+
+        # Run find_battery_size at most once per calendar day, always update the history sensor
+        # Use load_previous_value_from_ha so the history survives a Home Assistant restart (the sensor
+        # state is ephemeral and is not restored by HA, but the recorder history is)
+        existing_history = self.base.load_previous_value_from_ha(soc_max_sensor_name, attribute="history") or {}
+        if not isinstance(existing_history, dict):
+            existing_history = {}
+        today_key = str(self.base.now_utc.date())
+
+        # Already calculated today - use stored mean from sensor state. Use load_previous_value_from_ha
+        # (same recorder fallback as existing_history above) so that after a mid-day HA restart the
+        # trimmed mean is recovered too; otherwise today_key is present in the recovered history (so the
+        # recalculation below is skipped) while the live-only state read returns None, silently disabling
+        # battery_scaling_auto for the rest of the day.
+        trimmed_mean_state = self.base.load_previous_value_from_ha(soc_max_sensor_name)
+        try:
+            trimmed_mean = float(trimmed_mean_state) if trimmed_mean_state is not None else None
+        except (ValueError, TypeError):
+            trimmed_mean = None
+
+        if today_key not in existing_history:
+            # Only calculate once per day to save compute resources
+            found_size = self.find_battery_size(self.nominal_capacity)
+            if found_size and found_size > 0:
+                trimmed_mean = self.update_soc_max_calculated_sensor(found_size, self.nominal_capacity)
+            else:
+                # Store None to prevent recalculation every cycle when data is unavailable
+                self.update_soc_max_calculated_sensor(None, self.nominal_capacity)
+        elif self.base.get_state_wrapper(soc_max_sensor_name) is None and all(isinstance(key, str) and (value is None or (type(value) in (int, float) and math.isfinite(value))) for key, value in existing_history.items()):
+            # Recorder has today's result, but a restart removed the live sensor.
+            # Preserve the recorded state as the planning mean; an all-None history
+            # publishes the nominal capacity but returns no newly calculated mean.
+            self.update_soc_max_calculated_sensor(existing_history[today_key], self.nominal_capacity)
+
+        if self.base.battery_scaling_auto and trimmed_mean and trimmed_mean > 0:
+            if self.nominal_capacity > 0:
+                # Clamp scaling to [80%, 100%] of the configured usable scaling.
+                # This preserves manual DoD/SOH correction (e.g. 0.8) while allowing measured degradation below it.
+                scaling_upper = self.battery_scaling_config
+                scaling_lower = self.battery_scaling_config * 0.8
+                new_scaling = max(scaling_lower, min(scaling_upper, trimmed_mean / self.nominal_capacity))
+                self.battery_scaling = new_scaling
+                self.soc_max = dp3(self.nominal_capacity * new_scaling)
+                self.log("Info: Inverter {} battery_scaling_auto set scaling {:.3f} (mean {:.2f} kWh, nominal {:.2f} kWh) resulting in soc_max {:.3f} kWh".format(self.id, new_scaling, trimmed_mean, self.nominal_capacity, self.soc_max))
+            else:
+                # No nominal configured - use trimmed mean directly without clamping
+                self.soc_max = dp3(trimmed_mean)
+                self.nominal_capacity = self.soc_max
+                self.battery_scaling = 1.0
+                self.base.set_arg("soc_max", self.soc_max, index=self.id)
+                self.base.set_arg("soc_max_nominal", 0.0, index=self.id)
+                self.log("Info: Inverter {} battery_scaling_auto using measured mean {:.2f} kWh (no nominal configured)".format(self.id, trimmed_mean))
+
+        # Final fallback if soc_max is still not determined
+        if not self.soc_max or self.soc_max <= 0:
+            self.log("Warn: Inverter {} unable to determine battery size, using 8 kWh default for this cycle, you must set soc_max in apps.yaml or wait until enough data is collected to estimate battery size".format(self.id))
+            self.soc_max = 8.0
+            self.nominal_capacity = self.soc_max
+            # Intentionally do NOT persist the fallback into the soc_max / soc_max_nominal args:
+            # caching 8.0 would override a configured (but momentarily unavailable) source and pin
+            # soc_max to 8 kWh until restart. Leaving the args intact lets the next cycle re-read the
+            # real source (or restore soc_max_nominal) and recover automatically.
+
+    def update_soc_max_calculated_sensor(self, found_size, nominal_capacity=0):
+        """
+        Update the soc_max_calculated sensor with a new data point and return the trimmed mean.
+
+        Stores one data point per calendar day (keyed by date string) and keeps the 7 most-recent days.
+        The sensor state is the trimmed mean (min and max dropped when >= 3 samples, plain average otherwise).
+        nominal_capacity is stored as a sensor attribute (0 if not configured).
+        Returns the trimmed mean or None if no data.
+        """
+        if self.id > 0:
+            sensor_name = "sensor.{}_soc_max_calculated_{}".format(self.base.prefix, self.id)
+        else:
+            sensor_name = "sensor.{}_soc_max_calculated".format(self.base.prefix)
+
+        history = self.base.load_previous_value_from_ha(sensor_name, attribute="history") or {}
+        if not isinstance(history, dict):
+            history = {}
+
+        today_key = str(self.base.now_utc.date())
+        history[today_key] = round(found_size, 3) if found_size is not None else None
+
+        # Prune to 7 most-recent days
+        sorted_keys = sorted(history.keys(), reverse=True)[:7]
+        history = {k: history[k] for k in sorted_keys}
+
+        # Filter out None entries (days where calculation failed) before computing the mean
+        values = [v for v in history.values() if v is not None]
+        if not values:
+            self.log("Inverter {} battery size tracking: found_size None, history {}, no valid data for mean calculation".format(self.id, history))
+            self.base.dashboard_item(
+                sensor_name,
+                state=nominal_capacity if nominal_capacity > 0 else "unknown",
+                attributes={
+                    "history": history,
+                    "nominal_capacity": round(nominal_capacity, 3),
+                    "degradation_percent": None,
+                    "configured_degradation": round((1 - self.battery_scaling) * 100, 2),
+                    "unit_of_measurement": "kWh",
+                    "device_class": "energy",
+                    "state_class": "measurement",
+                    "friendly_name": "Predbat calculated battery capacity{}".format(" inverter {}".format(self.id) if self.id > 0 else ""),
+                    "icon": "mdi:battery-charging",
+                },
+            )
+            return None
+
+        if len(values) >= 3:
+            trimmed = sorted(values)[1:-1]
+            trimmed_mean = sum(trimmed) / len(trimmed)
+        else:
+            trimmed_mean = sum(values) / len(values)
+
+        found_size_str = "{:.2f} kWh".format(found_size) if found_size is not None else "None"
+        degradation = (self.nominal_capacity - trimmed_mean) / self.nominal_capacity if self.nominal_capacity > 0 else 0
+        self.log(
+            "Inverter {} battery size tracking: found_size {}, history {}, trimmed_mean {:.2f} kWh, degradation {:.2%}, configured battery_scaling {:.0f}% (configured degradation {:.0f}%)".format(
+                self.id, found_size_str, history, trimmed_mean, degradation, self.battery_scaling * 100, (1 - self.battery_scaling) * 100
+            )
+        )
+
+        self.base.dashboard_item(
+            sensor_name,
+            state=dp2(trimmed_mean),
+            attributes={
+                "history": history,
+                "nominal_capacity": round(nominal_capacity, 3),
+                "degradation_percent": round(degradation * 100, 2),
+                "configured_degradation": round((1 - self.battery_scaling) * 100, 2),
+                "unit_of_measurement": "kWh",
+                "device_class": "energy",
+                "state_class": "measurement",
+                "friendly_name": "Predbat calculated battery capacity{}".format(" inverter {}".format(self.id) if self.id > 0 else ""),
+                "icon": "mdi:battery-charging",
+            },
+        )
+        return trimmed_mean
+
+    def find_battery_size(self, nominal_capacity=0):
+        """
+        Given SOC Percent and battery power figure out the approximate battery size in kWh
+        """
+        soc_percent_sensor = self.base.get_arg("soc_percent", indirect=False, index=self.id)
+        soc_kw_sensor = self.base.get_arg("soc_kw", indirect=False, index=self.id)
+        battery_power_sensor = self.base.get_arg("battery_power", indirect=False, index=self.id)
+        battery_power_invert = self.base.get_arg("battery_power_invert", False, index=self.id)
+
+        if (soc_percent_sensor or soc_kw_sensor) and battery_power_sensor:
+            if soc_percent_sensor:
+                soc_percent_data = self.base.get_history_wrapper(entity_id=soc_percent_sensor, days=self.base.max_days_previous, required=False)
+                if soc_percent_data:
+                    soc_percent, _ = minute_data(
+                        soc_percent_data[0],
+                        self.base.max_days_previous,
+                        self.base.now_utc,
+                        "state",
+                        "last_updated",
+                        backwards=True,
+                        clean_increment=False,
+                        smoothing=False,
+                        divide_by=1.0,
+                        scale=1.0,
+                        required_unit="%",
+                        can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
+                    )
+                else:
+                    soc_percent = {}
+            else:
+                soc_kw_data = self.base.get_history_wrapper(entity_id=soc_kw_sensor, days=self.base.max_days_previous, required=False)
+                soc_percent = {}
+                if soc_kw_data:
+                    # Parse kWh history into a clean minute dict then convert to percent
+                    soc_kw_minute, _ = minute_data(
+                        soc_kw_data[0],
+                        self.base.max_days_previous,
+                        self.base.now_utc,
+                        "state",
+                        "last_updated",
+                        backwards=True,
+                        clean_increment=False,
+                        smoothing=False,
+                        divide_by=1.0,
+                        scale=1.0,
+                        required_unit="kWh",
+                        can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
+                    )
+                    # Determine soc_max from nominal_capacity or the observed maximum
+                    if nominal_capacity and nominal_capacity > 0:
+                        soc_max = nominal_capacity
+                    else:
+                        soc_max = max(soc_kw_minute.values()) if soc_kw_minute else 0
+                    if soc_max > 0:
+                        soc_percent = {minute: (kw / soc_max) * 100.0 for minute, kw in soc_kw_minute.items()}
+            battery_power_data = self.base.get_history_wrapper(entity_id=battery_power_sensor, days=self.base.max_days_previous, required=False)
+
+            if not soc_percent or not battery_power_data:
+                self.log("Warn: Inverter {} unable to estimate battery size - no history data available".format(self.id))
+                return None
+
+            battery_power, _ = minute_data(
+                battery_power_data[0],
+                self.base.max_days_previous,
+                self.base.now_utc,
+                "state",
+                "last_updated",
+                backwards=True,
+                clean_increment=False,
+                smoothing=False,
+                divide_by=1.0,
+                scale=1.0,
+                required_unit="W",
+                can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
+            )
+            if battery_power_invert:
+                # Invert the battery power if required
+                for minute in battery_power:
+                    battery_power[minute] = -battery_power[minute]
+            min_len = min(len(soc_percent), len(battery_power))
+            self.log("Inverter {} Find battery size has {} days of data, max days {}".format(self.id, dp0(min_len / 60 / 24.0), self.base.max_days_previous))
+
+            estimate_battery_sizes = []
+            rejected_battery_sizes = {}
+
+            # Find continuous charging periods and calculate battery size from energy/SoC relationship
+            # Data is indexed backwards: minute 0 = now, minute N = N minutes ago
+            max_charge_power_w = max(self.battery_rate_max_charge * MINUTE_WATT, 0)
+            max_power_threshold = max(250, max_charge_power_w * 0.2)
+            loss_factor = self.base.battery_loss * self.base.inverter_loss
+            size_hint = self.soc_max if self.soc_max and self.soc_max > 0 else 0
+            capacity_reference = nominal_capacity if nominal_capacity and nominal_capacity > 0 else 0
+            plausible_min = capacity_reference * 0.65 if capacity_reference else 0
+            plausible_max = capacity_reference * 1.20 if capacity_reference else 0
+            reference_for_energy = capacity_reference or size_hint
+            min_power_added_kwh = max(0.5, min(1.0, reference_for_energy * 0.04)) if reference_for_energy else 0.5
+
+            def reject_battery_sample(reason):
+                rejected_battery_sizes[reason] = rejected_battery_sizes.get(reason, 0) + 1
+
+            # Scan backwards through time to find charging periods
+            in_charge = False
+            charge_start_minute = None  # Higher minute = older = start of charge
+
+            for minute in range(min_len - 1, -1, -1):
+                power = battery_power.get(minute, 0)
+                is_charging = power < -max_power_threshold
+
+                if is_charging and not in_charge:
+                    # Start of a charging period (going forward in real time, backwards in minute index)
+                    in_charge = True
+                    charge_start_minute = minute
+
+                elif not is_charging and in_charge:
+                    # End of a charging period
+                    charge_end_minute = minute + 1  # Previous minute was still charging
+                    in_charge = False
+
+                    if charge_start_minute is not None and charge_end_minute < charge_start_minute:
+                        # We have a valid charge period (start_minute > end_minute because of backwards indexing)
+                        # charge_start_minute is OLDER (beginning of charge, lower SoC)
+                        # charge_end_minute is NEWER (end of charge, higher SoC)
+
+                        start_soc = soc_percent.get(charge_start_minute, 0)
+                        end_soc = soc_percent.get(charge_end_minute, 0)
+
+                        self.log(
+                            "Charge start {} soc {} end {} soc {}".format(
+                                charge_start_minute,
+                                start_soc,
+                                charge_end_minute,
+                                end_soc,
+                            )
+                        )
+
+                        # Clip to 10-90% range and align to percentage boundaries
+                        # to avoid partial energy from transition minutes
+                        # A "transition minute" is one where the SoC changed from the previous minute
+                        # We want to start AFTER a transition and end BEFORE a transition
+                        clipped_start_minute = charge_start_minute
+                        clipped_end_minute = charge_end_minute
+
+                        # Find first stable minute ≥10% (where SoC didn't just change)
+                        # Search forward in real time (decreasing minute index)
+                        found_start = False
+                        for m in range(charge_start_minute, charge_end_minute - 1, -1):
+                            curr_soc = int(soc_percent.get(m, 0))
+                            prev_soc = int(soc_percent.get(m + 1, 0))  # m+1 is older
+                            # Check if this is a stable minute (no transition) and within range
+                            if curr_soc >= 10 and curr_soc <= 90 and curr_soc != prev_soc:
+                                clipped_start_minute = m
+                                found_start = True
+                                break
+                        if not found_start:
+                            # No stable minute found in 10-90% range, skip this period
+                            continue
+
+                        # Find last stable minute ≤90% (where SoC won't change next minute)
+                        # Search backward in real time (increasing minute index)
+                        found_end = False
+                        for m in range(charge_end_minute, charge_start_minute + 1):
+                            curr_soc = int(soc_percent.get(m, 0))
+                            next_soc = int(soc_percent.get(m + 1, 0))  # m+1 is older
+                            # Check if this is a stable minute (no upcoming transition) and within range
+                            if curr_soc >= 10 and curr_soc <= 90 and curr_soc != next_soc:
+                                clipped_end_minute = m
+                                found_end = True
+                                break
+                        if not found_end:
+                            # No stable minute found in 10-90% range, skip this period
+                            continue
+
+                        # Validate the clipped range is still valid
+                        if clipped_start_minute <= clipped_end_minute:
+                            continue  # Invalid range after clipping
+
+                        # Get the clipped SoC values (as integers for consistent percentage)
+                        clipped_start_soc = int(soc_percent.get(clipped_start_minute, 0))
+                        clipped_end_soc = int(soc_percent.get(clipped_end_minute, 0))
+                        percent_change = clipped_end_soc - clipped_start_soc
+
+                        self.log(
+                            "Charging clipped start at {} with SoC {}%, end at {} with SoC {}%; SoC change {}%".format(
+                                clipped_start_minute,
+                                clipped_start_soc,
+                                clipped_end_minute,
+                                clipped_end_soc,
+                                percent_change,
+                            )
+                        )
+
+                        if percent_change < 10:
+                            reject_battery_sample("soc_change_too_small")
+                            continue
+
+                        if percent_change > 80:
+                            reject_battery_sample("soc_change_too_large")
+                            continue
+
+                        # Need enough real charge data to avoid SoC telemetry jumps being mistaken for capacity.
+                        if clipped_start_minute - clipped_end_minute < 20:
+                            reject_battery_sample("charge_period_too_short")
+                            continue
+
+                        if percent_change >= clipped_start_minute - clipped_end_minute:
+                            reject_battery_sample("soc_jump_too_fast")
+                            continue
+
+                        # Calculate energy added during this period (using clipped range)
+                        power_added = 0.0
+                        sample_count = 0
+                        for power_minute in range(clipped_start_minute, clipped_end_minute - 1, -1):
+                            minute_power = -battery_power.get(power_minute, 0)
+                            power_added += minute_power / 60.0  # W to Wh
+                            sample_count += 1
+
+                        power_added_kwh = power_added / 1000.0
+                        self.log("Inverter {} power added over {} samples is {}kWh".format(self.id, sample_count, dp1(power_added_kwh)))
+
+                        if power_added_kwh < min_power_added_kwh:
+                            reject_battery_sample("energy_too_small")
+                            continue
+
+                        estimated_battery_size = (power_added / percent_change) * 100.0 / 1000.0  # Convert Wh to kWh
+                        adjusted_battery_size = estimated_battery_size * loss_factor
+
+                        if plausible_min and adjusted_battery_size < plausible_min:
+                            reject_battery_sample("capacity_too_low")
+                            continue
+
+                        if plausible_max and adjusted_battery_size > plausible_max:
+                            reject_battery_sample("capacity_too_high")
+                            continue
+
+                        estimate_battery_sizes.append(
+                            {
+                                "size": estimated_battery_size,
+                                "adjusted_size": adjusted_battery_size,
+                                "soc_change": percent_change,
+                                "sample_count": sample_count,
+                                "power_added_kwh": power_added_kwh,
+                            }
+                        )
+
+                        self.log(
+                            "  Battery size sample accepted raw {}kWh adjusted {}kWh from {}% SoC over {} minutes".format(
+                                dp2(estimated_battery_size),
+                                dp2(adjusted_battery_size),
+                                percent_change,
+                                sample_count,
+                            )
+                        )
+
+            # Average the estimated battery sizes
+            if len(estimate_battery_sizes) > 0:
+                strong_battery_sizes = [sample for sample in estimate_battery_sizes if sample["soc_change"] >= 20 and sample["sample_count"] >= 60 and sample["power_added_kwh"] >= max(min_power_added_kwh * 4, 4.0)]
+                selected_battery_sizes = strong_battery_sizes if len(strong_battery_sizes) >= 3 else estimate_battery_sizes
+                selected_values = sorted([sample["adjusted_size"] for sample in selected_battery_sizes])
+
+                if len(selected_values) >= 5:
+                    trim_count = max(1, int(len(selected_values) * 0.1))
+                    trimmed_values = selected_values[trim_count:-trim_count]
+                elif len(selected_values) >= 3:
+                    trimmed_values = selected_values[1:-1]
+                else:
+                    trimmed_values = selected_values
+
+                average_battery_size = dp2(sum(trimmed_values) / len(trimmed_values))
+                median_battery_size = selected_values[len(selected_values) // 2] if len(selected_values) % 2 else (selected_values[len(selected_values) // 2 - 1] + selected_values[len(selected_values) // 2]) / 2
+                self.log(
+                    "Estimated battery size is {}kWh from {} selected samples, {} accepted samples, {} rejected samples, median {}kWh (assumed charging loss factor {}, rejects {})".format(
+                        dp2(average_battery_size),
+                        len(selected_battery_sizes),
+                        len(estimate_battery_sizes),
+                        sum(rejected_battery_sizes.values()),
+                        dp2(median_battery_size),
+                        dp1(loss_factor),
+                        rejected_battery_sizes,
+                    )
+                )
+                return average_battery_size
+            else:
+                self.log("Warn: Inverter {} Unable to find any suitable charge periods to estimate battery size, rejected samples {}".format(self.id, rejected_battery_sizes))
+                return None
+        else:
+            self.log("Warn: Inverter {} unable to estimate battery size from soc_percent and battery_power data".format(self.id))
+        return None
+
+    def find_charge_curve(self, discharge):
+        """
+        Find expected charge curve
+        """
+        curve_type = "charge"
+        if discharge:
+            curve_type = "discharge"
+
+        predbat_status_sensor = self.base.prefix + ".status"
+
+        if "soc_percent" in self.base.args:
+            soc_kwh_sensor = self.base.get_arg("soc_percent", indirect=False, index=self.id)
+            soc_kwh_percent = True
+            soc_label = "soc_percent"
+        else:
+            soc_kwh_percent = False
+            soc_label = "soc_kw"
+            soc_kwh_sensor = self.base.get_arg("soc_kw", indirect=False, index=self.id)
+
+        if discharge:
+            charge_rate_sensor = self.base.get_arg("discharge_rate", indirect=False, index=self.id)
+            curve_label = "empty"
+        else:
+            charge_rate_sensor = self.base.get_arg("charge_rate", indirect=False, index=self.id)
+            curve_label = "full"
+
+        battery_power_sensor = self.base.get_arg("battery_power", indirect=False, index=self.id)
+        battery_power_invert = self.base.get_arg("battery_power_invert", False, index=self.id)
+
+        final_curve = {}
+        final_curve_count = {}
+
+        if discharge:
+            max_power = int(self.battery_rate_max_discharge * MINUTE_WATT)
+        else:
+            max_power = int(self.battery_rate_max_charge * MINUTE_WATT)
+
+        max_power_scaled = max_power * 0.95
+
+        if soc_kwh_sensor and charge_rate_sensor and battery_power_sensor and predbat_status_sensor:
+            battery_power_sensor = battery_power_sensor.replace("number.", "sensor.")  # Workaround as old template had number.
+            self.log("Inverter {} Looking for {} curve with sensors {}, {}, {} and {}".format(self.id, curve_type, soc_kwh_sensor, charge_rate_sensor, predbat_status_sensor, battery_power_sensor))
+            if soc_kwh_percent:
+                soc_kwh_data = self.base.get_history_wrapper(entity_id=soc_kwh_sensor, days=self.base.max_days_previous, required=False)
+            else:
+                soc_kwh_data = self.base.get_history_wrapper(entity_id=soc_kwh_sensor, days=self.base.max_days_previous, required=False)
+            charge_rate_data = self.base.get_history_wrapper(entity_id=charge_rate_sensor, days=self.base.max_days_previous, required=False)
+            battery_power_data = self.base.get_history_wrapper(entity_id=battery_power_sensor, days=self.base.max_days_previous, required=False)
+            predbat_status_data = self.base.get_history_wrapper(entity_id=predbat_status_sensor, days=self.base.max_days_previous, required=False)
+
+            if soc_kwh_data and charge_rate_data and battery_power_data and predbat_status_data:
+                if soc_kwh_percent:
+                    # If its in percent convert to kWh
+                    soc_kwh, ignore_io = minute_data(
+                        soc_kwh_data[0],
+                        self.base.max_days_previous,
+                        self.base.now_utc,
+                        "state",
+                        "last_updated",
+                        backwards=True,
+                        clean_increment=False,
+                        smoothing=False,
+                        divide_by=1.0,
+                        scale=self.battery_scaling,
+                        required_unit="%",
+                        can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
+                    )
+                    for entry in soc_kwh:
+                        soc_kwh[entry] = dp4(soc_kwh[entry] * self.soc_max / 100.0)
+                else:
+                    soc_kwh, ignore_io = minute_data(
+                        soc_kwh_data[0],
+                        self.base.max_days_previous,
+                        self.base.now_utc,
+                        "state",
+                        "last_updated",
+                        backwards=True,
+                        clean_increment=False,
+                        smoothing=False,
+                        divide_by=1.0,
+                        scale=self.battery_scaling,
+                        required_unit="kWh",
+                        can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
+                    )
+                charge_rate, ignore_io = minute_data(
+                    charge_rate_data[0],
+                    self.base.max_days_previous,
+                    self.base.now_utc,
+                    "state",
+                    "last_updated",
+                    backwards=True,
+                    clean_increment=False,
+                    smoothing=False,
+                    divide_by=1.0,
+                    scale=1.0,
+                    required_unit="W",
+                    can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
+                )
+                predbat_status = minute_data_state(predbat_status_data[0], self.base.max_days_previous, self.base.now_utc, "state", "last_updated")
+                for minute in predbat_status:
+                    status = predbat_status[minute]
+                    if "," in status:
+                        # If there are multiple statuses take the first one
+                        predbat_status[minute] = status.split(",")[0].strip()
+                battery_power, ignore_io = minute_data(
+                    battery_power_data[0],
+                    self.base.max_days_previous,
+                    self.base.now_utc,
+                    "state",
+                    "last_updated",
+                    backwards=True,
+                    clean_increment=False,
+                    smoothing=False,
+                    divide_by=1.0,
+                    scale=1.0,
+                    required_unit="W",
+                    can_modify_history=True,  # history is not accessed after this point, so minute_data can freely modify it
+                )
+                if battery_power_invert:
+                    # Invert the battery power if required
+                    for minute in battery_power:
+                        battery_power[minute] = -battery_power[minute]
+                min_len = min(len(soc_kwh), len(charge_rate), len(predbat_status), len(battery_power))
+                self.log("Inverter {} Looking for {} curve, have found {} days of history data, max days {}".format(self.id, curve_type, dp1(min_len / 60 / 24.0), self.base.max_days_previous))
+
+                soc_percent = {}
+                for minute in range(0, min_len):
+                    soc_percent[minute] = calc_percent_limit(soc_kwh.get(minute, 0), self.soc_max)
+
+                if discharge:
+                    search_range = range(5, 20, 1)
+                else:
+                    search_range = range(99, 85, -1)
+
+                # Find 100% end points. The exact-match checks below ("Charging" / "Exporting",
+                # "Discharging") deliberately exclude "Cross-charging" minutes - during genuine
+                # cross-charging another inverter is simultaneously drawing/feeding power at the
+                # same time, so this inverter's battery_power reading isn't a clean single-inverter
+                # charge/discharge sample and would corrupt the learned curve if included.
+                for data_point in search_range:
+                    for minute in range(1, min_len):
+                        # Start trigger is when the SoC just increased above the data point
+                        previous_point = soc_percent.get(minute - 1, 0)
+                        if (
+                            not discharge
+                            and previous_point > data_point
+                            and soc_percent.get(minute, 0) == data_point
+                            and predbat_status.get(minute - 1, "") == "Charging"
+                            and predbat_status.get(minute, "") == "Charging"
+                            and predbat_status.get(minute + 1, "") == "Charging"
+                            and charge_rate.get(minute - 1, 0) >= max_power_scaled
+                            and charge_rate.get(minute, 0) >= max_power_scaled
+                            and battery_power.get(minute, 0) < 0
+                        ) or (
+                            discharge
+                            and previous_point < data_point
+                            and soc_percent.get(minute, 0) == data_point
+                            and predbat_status.get(minute - 1, "") in ["Exporting", "Discharging"]
+                            and predbat_status.get(minute, "") in ["Exporting", "Discharging"]
+                            and predbat_status.get(minute + 1, "") in ["Exporting", "Discharging"]
+                            and charge_rate.get(minute - 1, 0) >= max_power_scaled
+                            and charge_rate.get(minute, 0) >= max_power_scaled
+                            and battery_power.get(minute, 0) > 0
+                        ):
+                            total_power = 0
+                            total_count = 0
+                            # Find a period where charging was at full rate and the SoC just drops below the data point
+                            for target_minute in range(minute, min_len):
+                                this_soc = soc_percent.get(target_minute, 0)
+                                if not discharge and (predbat_status.get(target_minute, "") != "Charging" or charge_rate.get(target_minute, 0) < max_power_scaled or battery_power.get(target_minute, 0) >= 0):
+                                    break
+                                if discharge and (predbat_status.get(target_minute, "") not in ["Exporting", "Discharging"] or charge_rate.get(target_minute, 0) < max_power_scaled or battery_power.get(target_minute, 0) <= 0):
+                                    break
+
+                                if (discharge and (this_soc > data_point)) or (not discharge and (this_soc < data_point)):
+                                    if total_power == 0:
+                                        # No power data, so skip this data point
+                                        break
+                                    if target_minute not in soc_kwh or abs(previous_point - data_point) > CHARGE_CURVE_MAX_SOC_STEP or abs(data_point - this_soc) > CHARGE_CURVE_MAX_SOC_STEP:
+                                        # Missing or implausible SoC reading at either end of the step, skip this sample (#5259)
+                                        break
+                                    if discharge:
+                                        this_soc -= 1
+                                    else:
+                                        this_soc += 1
+                                    # So the power for this data point average has been stored, it's possible we spanned more than one data point
+                                    # if not all SoC %'s are represented for this battery size
+                                    from_soc = soc_kwh.get(minute, 0)
+                                    to_soc = soc_kwh.get(target_minute, 0)
+                                    soc_charged = from_soc - to_soc
+                                    average_power = total_power / total_count
+                                    charge_curve = round(min(average_power / max_power / self.base.battery_loss, 1.0), 2)
+                                    if self.base.debug_enable:
+                                        self.log(
+                                            "Curve Percent: {}-{} at {} took {} minutes charged {} curve {} average_power {}".format(
+                                                data_point,
+                                                this_soc,
+                                                self.base.time_abs_str(self.base.minutes_now - minute),
+                                                total_count,
+                                                round(soc_charged, 2),
+                                                charge_curve,
+                                                average_power,
+                                            )
+                                        )
+                                    # Store data points
+                                    if discharge:
+                                        store_range = range(this_soc, previous_point, -1)
+                                    else:
+                                        store_range = range(this_soc, previous_point)
+
+                                    for point in store_range:
+                                        if point not in final_curve:
+                                            final_curve[point] = charge_curve
+                                            final_curve_count[point] = 1
+                                        else:
+                                            final_curve[point] += charge_curve
+                                            final_curve_count[point] += 1
+
+                                    break
+                                else:
+                                    # Store data for this minute of the period, so total_power/total_count
+                                    # below is the mean power across the whole SoC step rather than the
+                                    # reading at the single minute the step was triggered on
+                                    total_power += abs(battery_power.get(target_minute, 0))
+                                    total_count += 1
+                if final_curve:
+                    # Average the data points
+                    for index in final_curve:
+                        if final_curve_count[index] > 0:
+                            final_curve[index] = dp2(final_curve[index] / final_curve_count[index])
+
+                    self.log("Inverter {} {} curve before adjustment is: {}".format(self.id, curve_type, final_curve))
+
+                    # Find info for gap filling
+                    found_required = False
+                    if discharge:
+                        fill_range = range(4, 21, 1)
+                        value = min(final_curve.values())
+                    else:
+                        value = max(final_curve.values())
+                        fill_range = range(85, 101)
+
+                    # Pick the first value point for fill below
+                    for point in fill_range:
+                        if point in final_curve:
+                            value = final_curve[point]
+                            break
+
+                    # Fill gaps
+                    for point in fill_range:
+                        if point not in final_curve:
+                            final_curve[point] = value
+                            found_required = True
+                        else:
+                            value = final_curve[point]
+
+                    if found_required:
+                        # Scale curve to 1.0
+                        rate_scaling = 0
+
+                        # Work out the maximum power to use as a scale factor
+                        for index in final_curve:
+                            rate_scaling = max(final_curve[index], rate_scaling)
+
+                        # Scale the curve
+                        if rate_scaling > 0:
+                            for index in final_curve:
+                                final_curve[index] = round(final_curve[index] / rate_scaling, 2)
+
+                        # If we have the correct data then output it
+                        if rate_scaling > 0:
+                            if discharge:
+                                text = "  battery_discharge_power_curve:\n"
+                            else:
+                                text = "  battery_charge_power_curve:\n"
+                            keys = sorted(final_curve.keys())
+                            keys.reverse()
+                            first = True
+                            for key in keys:
+                                if (final_curve[key] < 1.0 or first) and final_curve[key] > 0.0:
+                                    text += "    {} : {}\n".format(key, final_curve[key])
+                                    first = False
+                            if self.base.battery_charge_power_curve_auto:
+                                self.log("Info: Inverter {} curve automatically computed as:\n".format(self.id) + text)
+                            else:
+                                self.log("Info: Inverter {} {} curve can be entered into apps.yaml or set to auto:\n".format(self.id, curve_type) + text)
+                            rate_scaling = round(rate_scaling, 2)
+                            if discharge:
+                                if rate_scaling != self.base.battery_rate_max_scaling_discharge:
+                                    self.log("Info: Inverter {} Consider setting in HA: input_number.battery_rate_max_scaling_discharge: {} - currently {}".format(self.id, rate_scaling, self.base.battery_rate_max_scaling_discharge))
+                            else:
+                                if rate_scaling != self.base.battery_rate_max_scaling:
+                                    self.log("Info: Inverter {} Consider setting in HA: input_number.battery_rate_max_scaling: {} - currently {}".format(self.id, rate_scaling, self.base.battery_rate_max_scaling))
+                            return final_curve
+                        else:
+                            self.log("Info: Inverter {} Found incorrect battery {} curve (was 0), maybe try again when you have more data.".format(self.id, curve_type))
+                    else:
+                        self.log("Warn: Inverter {} Found incomplete battery {} curve (no data points), maybe try again when you have more data.".format(self.id, curve_type))
+                else:
+                    self.log(
+                        "Info: Cannot find battery {} curve (no full rate {} cycle to {} found in history), battery may not have been fully charged/discharged at max rate recently - this is normal in cost-optimised operation".format(
+                            curve_type, curve_type, curve_label
+                        )
+                    )
+            else:
+                history_checks = [
+                    (soc_label, soc_kwh_sensor, soc_kwh_data),
+                    ("{}_rate".format(curve_type), charge_rate_sensor, charge_rate_data),
+                    ("battery_power", battery_power_sensor, battery_power_data),
+                    ("predbat.status", predbat_status_sensor, predbat_status_data),
+                ]
+                no_history = ["{} ({})".format(setting, entity_id) for setting, entity_id, data in history_checks if not data]
+                self.log("Warn: Inverter {} Cannot find battery {} curve (missing history), no history found for {} - check the entity name in apps.yaml and that Home Assistant is recording its history".format(self.id, curve_type, ", ".join(no_history)))
+                self.log("Warn: Inverter {} Sensor history record counts: {}".format(self.id, ", ".join("{} {}".format(setting, len(data[0]) if data else 0) for setting, entity_id, data in history_checks)))
+        else:
+            missing_settings = [setting for setting, entity_id in [(soc_label, soc_kwh_sensor), ("{}_rate".format(curve_type), charge_rate_sensor), ("battery_power", battery_power_sensor)] if not entity_id]
+            self.log("Warn: Inverter {} Cannot find battery {} curve (settings missing), {} not set in apps.yaml".format(self.id, curve_type, ", ".join(missing_settings)))
+        return {}
+
+    def create_entity(self, entity_name, value, uom=None, device_class=None, icon=None):
+        """
+        Create dummy entities required by non GE inverters to mimic GE behaviour
+        """
+        prefix = self.base.prefix
+        entity_id = f"sensor.{prefix}_{self.inverter_type}_{self.id}_{entity_name}"
+
+        attributes = {
+            "state_class": "measurement",
+        }
+        if uom is not None:
+            attributes["unit_of_measurement"] = uom
+        if device_class is not None:
+            attributes["device_class"] = device_class
+        if icon is not None:
+            attributes["icon"] = icon
+
+        self.created_attributes[entity_id] = attributes
+
+        if self.base.get_state_wrapper(entity_id) is None:
+            self.log("Inverter {} **** Creating dummy entity {} with value {} and attributes {}".format(self.id, entity_id, value, attributes))
+            self.base.set_state_wrapper(entity_id, state=value, attributes=attributes)
+        return entity_id
+
+    def update_status(self, minutes_now, quiet=False):
+        """
+        Update the following with inverter status.
+
+        Inverter Class Parameters
+        =========================
+
+            Parameter                          Type    Units
+            ---------                          ----    -----
+            self.charge_enable_time            bool
+            self.discharge_enable_time         bool
+            self.charge_rate_now               float
+            self.discharge_rate_now            float
+            self.soc_kw                        float   kWh
+            self.soc_percent                   float   %
+            self.battery_power                 float   W
+            self.pv_power                      float   W
+            self.load_power                    float   W
+            self.charge_start_time_minutes     int
+            self.charge_end_time_minutes       int
+            self.charge_window                 list of dicts
+            self.discharge_start_time_minutes  int
+            self.discharge_end_time_minutes    int
+            self.export_window              list of dicts
+            self.battery_voltage               float   V
+
+        Output Entities:
+        ================
+
+            Config arg                         Type          Units
+            ----------                         ----          -----
+            None
+        """
+
+        self.battery_power = 0
+        self.battery_power_valid = False
+        self.pv_power = 0
+        self.load_power = 0
+        self.grid_power = 0
+
+        # Deliberately no REST read here, and none anywhere else in this class: GivTCPComponent
+        # owns the REST client and publishes everything it reads as entities, which the ordinary
+        # get_arg path below picks up. A read here cost a blocking GET per inverter per cycle on
+        # top of the component's own poll, and read_data()'s retry ladder put 20s + 40s + 40s of
+        # sleep inside the main planning loop whenever GivTCP was slow.
+        self.charge_rate_now = self.get_current_charge_rate() / MINUTE_WATT
+        self.discharge_rate_now = self.get_current_discharge_rate() / MINUTE_WATT
+
+        self.charge_enable_time = self.base.get_arg("scheduled_charge_enable", "on", index=self.id) == "on"
+        self.discharge_enable_time = self.base.get_arg("scheduled_discharge_enable", "off", index=self.id) == "on"
+
+        # Scale charge and discharge rates with battery scaling
+        self.charge_rate_now = max(self.charge_rate_now * self.base.battery_rate_max_scaling, self.battery_rate_min)
+        self.discharge_rate_now = max(self.discharge_rate_now * self.base.battery_rate_max_scaling_discharge, self.battery_rate_min)
+
+        if "soc_percent" in self.base.args:
+            self.soc_kw = dp3(self.base.get_arg("soc_percent", default=0.0, index=self.id, required_unit="%") * self.soc_max / 100.0)
+        else:
+            self.soc_kw = dp3(self.base.get_arg("soc_kw", default=0.0, index=self.id, required_unit="kWh") * self.battery_scaling)
+
+        if self.soc_max <= 0.0:
+            self.soc_percent = 0
+        else:
+            self.soc_percent = calc_percent_limit(self.soc_kw, self.soc_max)
+
+        # Battery power. Read with no default so a reading that is not there can be told apart from a
+        # real 0W: an unconfigured or unavailable sensor still becomes 0W as it always has (with the
+        # same warning get_arg gives for an unparseable value), but battery_power_valid is False, so
+        # the control-failure monitor does not judge that 0W as an idle battery.
+        battery_power = self.base.get_arg("battery_power", default=None, index=self.id, required_unit="W")
+        try:
+            self.battery_power = float(battery_power)
+            self.battery_power_valid = math.isfinite(self.battery_power)
+        except (TypeError, ValueError):
+            if battery_power is not None:
+                self.base.log("Warn: Return bad float value {} from {} using default {}".format(battery_power, "battery_power", 0.0))
+                self.base.record_status("Warn: Return bad float value {} from {}".format(battery_power, "battery_power"), had_errors=True)
+            self.battery_power = 0.0
+            self.battery_power_valid = False
+        if self.base.get_arg("battery_power_invert", default=False, index=self.id):
+            # If battery power is inverted then invert it
+            self.battery_power = -self.battery_power
+
+        # PV Power
+        self.pv_power = self.base.get_arg("pv_power", default=0.0, index=self.id, required_unit="W")
+
+        # Grid Power
+        self.grid_power = self.base.get_arg("grid_power", default=0.0, index=self.id, required_unit="W")
+        if self.base.get_arg("grid_power_invert", default=False, index=self.id):
+            # If grid power is inverted then invert it
+            self.grid_power = -self.grid_power
+
+        # Load Power
+        self.load_power = self.base.get_arg("load_power", default=0.0, index=self.id, required_unit="W")
+        for i in range(1, self.inv_num_load_entities):
+            self.load_power += self.base.get_arg(f"load_power_{i}", default=0.0, index=self.id, required_unit="W")
+        if self.base.get_arg("load_power_invert", default=False, index=self.id):
+            # If load power is inverted then invert it
+            self.load_power = -self.load_power
+
+        # Battery Voltage
+        self.battery_voltage = self.base.get_arg("battery_voltage", default=52.0, index=self.id, required_unit="V")
+
+        if not quiet:
+            self.base.log(
+                "Inverter {} SoC: {}kWh {}%, current charge rate {}W, current discharge rate {}W, current battery power {}W, current battery voltage {}V, grid power {}W, load power {}W, PV Power {}W".format(
+                    self.id,
+                    dp2(self.soc_kw),
+                    self.soc_percent,
+                    dp0(self.charge_rate_now * MINUTE_WATT),
+                    dp0(self.discharge_rate_now * MINUTE_WATT),
+                    dp0(self.battery_power),
+                    dp1(self.battery_voltage),
+                    dp0(self.grid_power),
+                    dp0(self.load_power),
+                    dp0(self.pv_power),
+                )
+            )
+
+        # If the battery is being charged then find the charge window
+        if self.charge_enable_time or not self.inv_has_charge_enable_time:
+            # Find current charge window
+            if "charge_start_time" in self.base.args:
+                charge_start_time = time_string_to_stamp(self.base.get_arg("charge_start_time", index=self.id))
+                charge_end_time = time_string_to_stamp(self.base.get_arg("charge_end_time", index=self.id))
+            elif self.inverter_source_active():
+                # A data source IS configured but hasn't returned anything this cycle - genuinely
+                # transient (a fetch hiccup, or before the first poll on a fresh start), so fall
+                # through to the same safe-defaults/retry-next-update handling below as a
+                # configured-but-currently-unusable value, rather than crashing the whole plan for
+                # something that should resolve itself.
+                charge_start_time = None
+                charge_end_time = None
+            else:
+                # No data source is configured at all - a permanent setup gap, not something that
+                # will resolve on its own. Retrying every cycle forever would be misleading, so
+                # don't pretend to make a plan Predbat can't actually deliver (maintainer call on
+                # #4288/#4179 - see PR review discussion).
+                message = "Error: Inverter {} unable to read charge window time - no source is configured (configure an inverter component, or set charge_start_time/charge_start_hour in apps.yaml)".format(self.id)
+                self.log(message)
+                self.base.record_status(message, had_errors=True)
+                raise ValueError(message)
+
+            if charge_start_time is None or charge_end_time is None:
+                # Name the source that came back empty. This is the message a user now actually
+                # sees when a configured source is failing, so "charge_start_time is None" on its
+                # own sends them looking at apps.yaml - which is the one thing that is fine. The
+                # real cause is upstream: a cloud account with no devices attached, revoked or
+                # rotated API credentials, or a lapsed entitlement, none of which Predbat can tell
+                # apart from here beyond naming where the data should have come from.
+                if "charge_start_time" in self.base.args:
+                    # A configured apps.yaml entity that has stopped reporting is the user's own
+                    # setup to fix, not a component outage - the same distinction the export
+                    # window makes, so the component listing does not point past a broken entity
+                    # at hardware that is fine.
+                    source = "charge_start_time"
+                    hint = "check the charge_start_time/charge_end_time entities in apps.yaml are reporting"
+                else:
+                    source = self.inverter_source_name()
+                    hint = self.inverter_source_hint()
+                self.log("Warn: Inverter {} unable to read charge window time - {} returned no data, {}, will retry next update".format(self.id, source, hint))
+                self.base.record_status("Warn: Inverter {} unable to read charge window time - {} returned no data, {}".format(self.id, source, hint), had_errors=True)
+                # Set safe defaults to allow graceful recovery on next update
+                self.charge_enable_time = False
+                self.charge_start_time_minutes = self.base.forecast_minutes
+                self.charge_end_time_minutes = self.base.forecast_minutes
+                self.track_charge_start = "00:00:00"
+                self.track_charge_end = "00:00:00"
+            else:
+                # Update simulated charge enable time to match the charge window time.
+                if not self.inv_has_charge_enable_time:
+                    if charge_start_time == charge_end_time:
+                        self.charge_enable_time = False
+                    else:
+                        self.charge_enable_time = True
+                    self.write_and_poll_switch("scheduled_charge_enable", self.base.get_arg("scheduled_charge_enable", indirect=False, index=self.id), self.charge_enable_time)
+
+                # Track charge start/end
+                if charge_start_time and charge_end_time:
+                    self.track_charge_start = charge_start_time.strftime(TIME_FORMAT_HMS)
+                    self.track_charge_end = charge_end_time.strftime(TIME_FORMAT_HMS)
+                else:
+                    self.track_charge_start = "00:00:00"
+                    self.track_charge_end = "00:00:00"
+
+                # Reverse clock skew
+                charge_start_time -= timedelta(seconds=self.base.inverter_clock_skew_start * 60)
+                charge_end_time -= timedelta(seconds=self.base.inverter_clock_skew_end * 60)
+
+                # Compute charge window minutes start/end just for the next charge window
+                self.charge_start_time_minutes, self.charge_end_time_minutes = compute_window_minutes(charge_start_time, charge_end_time, minutes_now)
+
+                # Charge is off due to start/end time being same
+                if not self.inv_has_charge_enable_time and not self.charge_enable_time:
+                    self.charge_start_time_minutes = self.base.forecast_minutes
+                    self.charge_end_time_minutes = self.base.forecast_minutes
+                    self.track_charge_start = "00:00:00"
+                    self.track_charge_end = "00:00:00"
+        else:
+            # If charging is disabled set a fake window outside
+            self.charge_start_time_minutes = self.base.forecast_minutes
+            self.charge_end_time_minutes = self.base.forecast_minutes
+            self.track_charge_start = "00:00:00"
+            self.track_charge_end = "00:00:00"
+
+        # Construct charge window from the GivTCP settings
+        self.charge_window = []
+
+        if not quiet:
+            self.base.log("Inverter {} scheduled charge enable is {}".format(self.id, self.charge_enable_time))
+
+        if self.charge_enable_time:
+            minute = max(0, self.charge_start_time_minutes)  # Max is here is start could be before midnight now
+            minute_end = self.charge_end_time_minutes
+            while minute < (self.base.forecast_minutes + minutes_now):
+                window = {}
+                window["start"] = minute
+                window["end"] = minute_end
+                window["average"] = 0  # Rates are not known yet
+                self.charge_window.append(window)
+                minute += 24 * 60
+                minute_end += 24 * 60
+
+        if not quiet:
+            self.base.log("Inverter {} charge windows currently {}".format(self.id, self.charge_window))
+
+        # Work out existing charge limits and percent
+        if self.charge_enable_time:
+            self.current_charge_limit = float(self.base.get_arg("charge_limit", index=self.id, default=100.0, required_unit="%"))
+        else:
+            self.current_charge_limit = 0.0
+
+        if not quiet:
+            if self.charge_enable_time:
+                self.base.log(
+                    "Inverter {} Charge settings: {}-{}, limit {}%, power {}kW".format(
+                        self.id,
+                        self.base.time_abs_str(self.charge_start_time_minutes),
+                        self.base.time_abs_str(self.charge_end_time_minutes),
+                        self.current_charge_limit,
+                        dp2(self.charge_rate_now * 60.0),
+                    )
+                )
+            else:
+                self.base.log("Inverter {} Charge settings: timed charged is disabled, power {}kW".format(self.id, round(self.charge_rate_now * 60.0, 2)))
+
+        # Construct discharge window from GivTCP settings
+        self.export_window = []
+
+        # Record which source we read from, rather than re-deriving it below - both branches
+        # reach the empty-value handling and only one of them came from a component.
+        if "discharge_start_time" in self.base.args:
+            export_source = "discharge_start_time"
+            discharge_start = time_string_to_stamp(self.base.get_arg("discharge_start_time", index=self.id))
+            discharge_end = time_string_to_stamp(self.base.get_arg("discharge_end_time", index=self.id))
+        elif self.inverter_source_active():
+            export_source = self.inverter_source_name()
+            # Same reasoning as the charge window above, and it has to be here too or that fix is
+            # defeated: on a cloud fetch failure the charge window degrades gracefully and then
+            # this branch crashes the whole update loop on the very same cycle, so the inverter
+            # never recovers either way. A configured-but-empty source is transient, so fall
+            # through to the safe-defaults/retry handling below.
+            discharge_start = None
+            discharge_end = None
+        else:
+            # No data source configured at all - a permanent setup gap, handled as such.
+            message = "Error: Inverter {} unable to read Export window - no source is configured (configure an inverter component, or set discharge_start_time in apps.yaml)".format(self.id)
+            self.log(message)
+            self.base.record_status(message, had_errors=True)
+            raise ValueError(message)
+
+        if discharge_start is None or discharge_end is None:
+            # Name the source that came back empty, as the charge window does - "discharge_start is
+            # None" sends users to apps.yaml, which is the one thing that is fine here.
+            if export_source == "discharge_start_time":
+                hint = "check the discharge_start_time/discharge_end_time entities in apps.yaml are reporting"
+            else:
+                hint = self.inverter_source_hint()
+            self.log("Warn: Inverter {} unable to read Export window - {} returned no data, {}, will retry next update".format(self.id, export_source, hint))
+            self.base.record_status("Warn: Inverter {} unable to read Export window - {} returned no data, {}".format(self.id, export_source, hint), had_errors=True)
+            # Safe defaults must be INERT, not merely disabled. forecast_minutes parks the window
+            # beyond the horizon, exactly as the charge window does. The previous 0/0 is midnight,
+            # i.e. in the PAST: execute.py takes `discharge_start_time_minutes <= minutes_now` as
+            # "the window has begun", which is trivially true at 0, so a discharge command gets
+            # backdated to the start of the day. That was survivable while this path was reached
+            # only rarely; the transient branch above makes it reachable on any cloud hiccup, so
+            # the landing state has to be genuinely inert or this trades a crash for a bad write.
+            self.discharge_enable_time = False
+            self.discharge_start_time_minutes = self.base.forecast_minutes
+            self.discharge_end_time_minutes = self.base.forecast_minutes
+            self.track_discharge_start = "00:00:00"
+            self.track_discharge_end = "00:00:00"
+        else:
+            # Update simulated discharge enable time to match the discharge window time.
+            if not self.inv_has_discharge_enable_time and not self.inv_has_ge_inverter_mode:
+                if discharge_start == discharge_end:
+                    self.discharge_enable_time = False
+                else:
+                    self.discharge_enable_time = True
+                entity_id = self.base.get_arg("scheduled_discharge_enable", indirect=False, index=self.id)
+                self.write_and_poll_switch("scheduled_discharge_enable", entity_id, self.discharge_enable_time)
+                self.log("Inverter {} {} set to {}".format(self.id, entity_id, self.discharge_enable_time))
+
+            # Tracking for idle time
+            if self.discharge_enable_time:
+                self.track_discharge_start = discharge_start.strftime(TIME_FORMAT_HMS)
+                self.track_discharge_end = discharge_end.strftime(TIME_FORMAT_HMS)
+            else:
+                self.track_discharge_start = "00:00:00"
+                self.track_discharge_end = "00:00:00"
+
+            # Reverse clock skew
+            discharge_start -= timedelta(seconds=self.base.inverter_clock_skew_discharge_start * 60)
+            discharge_end -= timedelta(seconds=self.base.inverter_clock_skew_discharge_end * 60)
+
+            # Compute discharge window minutes start/end just for the next discharge window
+            self.discharge_start_time_minutes, self.discharge_end_time_minutes = compute_window_minutes(discharge_start, discharge_end, minutes_now)
+
+        if not quiet:
+            self.base.log("Inverter {} scheduled discharge enable is {}".format(self.id, self.discharge_enable_time))
+        # Pre-fill current discharge window
+        # Store it even when discharge timed isn't enabled as it won't be outside the actual slot
+        if self.discharge_start_time_minutes != self.discharge_end_time_minutes:
+            minute = max(0, self.discharge_start_time_minutes)  # Max is here is start could be before midnight now
+            minute_end = self.discharge_end_time_minutes
+            while minute < self.base.forecast_minutes:
+                window = {}
+                window["start"] = minute
+                window["end"] = minute_end
+                window["average"] = 0  # Rates are not known yet
+                self.export_window.append(window)
+                minute += 24 * 60
+                minute_end += 24 * 60
+
+        # Pre-fill best discharge enables
+        if self.discharge_enable_time:
+            self.export_limits = [pack_export_limit(EXPORT_MODE_TARGET, 0, FULL_EXPORT_POWER) for i in range(len(self.export_window))]
+        else:
+            self.export_limits = [pack_export_limit(EXPORT_MODE_IDLE) for i in range(len(self.export_window))]
+
+        # Idle time?
+        # Get previous idle start and end
+        idle_start = self.base.get_arg("idle_start_time", index=self.id)
+        idle_end = self.base.get_arg("idle_end_time", index=self.id)
+
+        # Convert to minutes using helper function
+        try:
+            idle_start_time = time_string_to_stamp(idle_start)
+            idle_end_time = time_string_to_stamp(idle_end)
+            self.idle_start_minutes, self.idle_end_minutes = compute_window_minutes(idle_start_time, idle_end_time, minutes_now)
+        except (ValueError, TypeError):
+            self.base.log("Warn: Inverter {} unable to read idle start/end time, check your setting of idle_start_time/idle_end_time".format(self.id))
+            self.idle_start_minutes = 0
+            self.idle_end_minutes = 0
+
+        self.base.log("Inverter {} idle time is {}-{}".format(self.id, self.base.time_abs_str(self.idle_start_minutes), self.base.time_abs_str(self.idle_end_minutes)))
+
+        if not quiet:
+            self.base.log("Inverter {} discharge windows currently {}".format(self.id, self.export_window))
+
+        if INVERTER_TEST:
+            self.self_test(minutes_now)
+
+    def mimic_target_soc(self, current_charge_limit, discharge=False):
+        """
+        Function to turn on/off charging based on the current SoC and the set charge limit
+
+        Parameters:
+            current_charge_limit (float): The target SoC (State of Charge) limit for charging.
+
+        Returns:
+            None
+        """
+        charge_power = self.base.get_arg("charge_rate", index=self.id, default=2600.0, required_unit="W")
+        discharge_power = self.base.get_arg("discharge_rate", index=self.id, default=2600.0, required_unit="W")
+
+        if discharge:
+            if current_charge_limit == 100:
+                self.alt_charge_discharge_enable("eco", True)  # ECO Mode
+                if self.inv_output_charge_control == "current":
+                    self.set_current_from_power("discharge", discharge_power)
+            elif self.soc_percent < float(current_charge_limit):
+                self.base.log(f"Inverter {self.id} Current SoC {self.soc_percent}% is less than Target SoC {current_charge_limit}. Grid Discharge disabled.")
+                self.alt_charge_discharge_enable("discharge", False)
+            elif self.soc_percent == float(current_charge_limit):  # If SoC target is reached
+                if self.inv_output_charge_control == "current":
+                    self.alt_charge_discharge_enable("discharge", True)
+                    self.set_current_from_power("discharge", (0))  # Set charge current to zero (i.e hold SoC)
+                else:
+                    self.alt_charge_discharge_enable("discharge", False)
+            else:
+                self.base.log(f"Inverter {self.id} Current SoC {self.soc_percent}% is greater than Target SoC {current_charge_limit}. Grid Discharge enabled.")
+                self.alt_charge_discharge_enable("discharge", True)
+                if self.inv_output_charge_control == "current":
+                    self.set_current_from_power("discharge", discharge_power)
+                    self.base.log(f"Inverter {self.id} Current SoC {self.soc_percent}% is greater than Target SoC {current_charge_limit}. Grid Discharge enabled, amp rate written to inverter.")
+        else:
+            if current_charge_limit == 0:
+                self.alt_charge_discharge_enable("eco", True)  # ECO Mode
+                if self.inv_output_charge_control == "current":
+                    self.set_current_from_power("charge", charge_power)  # Write previous current setting to inverter
+                if self.inv_output_charge_control == "current":
+                    self.set_current_from_power("discharge", discharge_power)  # Reset discharge power too
+            elif self.soc_percent > float(current_charge_limit):
+                # If current SoC is above Target SoC, turn Grid Charging off
+                self.alt_charge_discharge_enable("charge", False)
+                if self.inv_output_charge_control == "current":
+                    self.set_current_from_power("charge", (0))  # Set charge current to zero (i.e hold SoC)
+                self.base.log(f"Inverter {self.id} Current SoC {self.soc_percent}% is greater than Target SoC {current_charge_limit}. Grid Charge disabled.")
+            elif self.soc_percent == float(current_charge_limit):  # If SoC target is reached
+                self.alt_charge_discharge_enable("charge", True)  # Make sure charging is on
+                if self.inv_output_charge_control == "current":
+                    self.set_current_from_power("charge", (0))  # Set charge current to zero (i.e hold SoC)
+                    self.base.log(f"Inverter {self.id} Current SoC {self.soc_percent}% is same as Target SoC {current_charge_limit}. Grid Charge enabled, Amps rate set to 0.")
+            else:
+                # If we drop below the target, turn grid charging back on and make sure the charge current is correct
+                self.alt_charge_discharge_enable("charge", True)
+                if self.inv_output_charge_control == "current":
+                    self.set_current_from_power("charge", charge_power)  # Write previous current setting to inverter
+                    self.base.log(f"Inverter {self.id} Current SoC {self.soc_percent}% is less than Target SoC {current_charge_limit}. Grid Charge enabled, amp rate written to inverter.")
+                self.base.log(
+                    f"Inverter {self.id} Current SoC {self.soc_percent}% is less than Target SoC {current_charge_limit}. Grid charging enabled with charge current set to {self.base.get_arg('timed_charge_current', index=self.id, default=65):0.2f}"
+                )
+
+    def reserve_device_bounds(self):
+        """
+        Return the (min, max) reserve percentages the inverter will accept, as whole percent, or
+        None for either bound the component does not publish.
+
+        Components publish the bounds onto the reserve entity's min/max attributes. They are not
+        always discovered from the device: where an API reports no bound the component publishes the
+        model's known floor instead (GivTCP does this with GE's 4%), so a user who has configured
+        battery_min_soc lower has that reflected in what is published.
+
+        reserve does not have to be an entity at all - the huawei and sofar templates ship a literal
+        percentage, because those inverters have no reserve register to point at. A literal carries
+        no attributes, so the reads below warn and come back with nothing and there are no bounds to
+        honour, rather than the state lookup on a number that used to raise (GH#5003).
+
+        The rounding is the caller's contract as much as this one's: reserve is written as a whole
+        percent, so a floor takes the ceiling and a ceiling takes the floor and the value returned is
+        always one the register accepts. Rounding to nearest instead would turn a published floor of
+        4.2 into 4 - under the bound, so the write is clamped-and-confirmed to something else and
+        retries forever, which is the GH#4826 failure this is meant to prevent. Both the write
+        (GH#4826) and the modelled reserve (GH#4953) go through here so the two cannot disagree about
+        what the battery will hold.
+        """
+        reserve_entity = self.base.get_arg("reserve", indirect=False, index=self.id, required_unit="%")
+        if not reserve_entity:
+            return None, None
+
+        bounds = []
+        for attribute, round_towards_accepted in (("min", math.ceil), ("max", math.floor)):
+            value = self.base.get_state_wrapper(reserve_entity, attribute=attribute, default=None)
+            try:
+                bounds.append(round_towards_accepted(float(value)))
+            except (ValueError, TypeError):
+                # Absent, empty or unparseable - no bound to honour rather than a bound of zero
+                bounds.append(None)
+        return bounds[0], bounds[1]
+
+    def adjust_reserve(self, reserve):
+        """
+        Adjust the output reserve target %
+
+        Inverter Class Parameters
+        =========================
+
+            None
+
+        Output Entities:
+        ================
+
+            Config arg                         Type          Units
+            ----------                         ----          -----
+            reserve                            int           %
+
+        """
+
+        current_reserve = self.base.get_arg("reserve", index=self.id, default=0.0, required_unit="%")
+
+        # Round to integer and clamp to minimum
+        reserve = int(reserve + 0.5)
+        if reserve < self.reserve_percent:
+            reserve = self.reserve_percent
+
+        # Clamp reserve at max setting
+        reserve = min(reserve, self.reserve_max)
+
+        reserve_entity = self.base.get_arg("reserve", indirect=False, index=self.id, required_unit="%")
+        device_min, device_max = self.reserve_device_bounds()
+        if device_min is not None:
+            reserve = max(reserve, device_min)
+        if device_max is not None:
+            reserve = min(reserve, device_max)
+
+        if current_reserve != reserve:
+            self.base.log("Inverter {} Current Reserve is {}% and new target is {}%".format(self.id, dp0(current_reserve), dp0(reserve)))
+            self.write_and_poll_value("reserve", reserve_entity, reserve)
+            if self.base.set_inverter_notify:
+                self.base.call_notify(f"{self.base.prefix.capitalize()}: Inverter {self.id} Target Reserve has been changed to {dp0(reserve)}% at {self.base.time_now_str()}")
+            self.mqtt_message(topic="set/reserve", payload=reserve)
+        else:
+            self.base.log("Inverter {} Current reserve is {}%, already at target".format(self.id, dp0(current_reserve)))
+
+    def rate_controls(self, rate_arg):
+        """
+        Which of a rate's two controls this inverter uses: (watts, percent) for "charge_rate" or "discharge_rate".
+
+        Asked of this inverter's own entry rather than of whether the setting exists at all: a fleet can mix
+        inverters with a power register and ones with only the percentage (GivEnergy 3-phase), leaving each
+        setting bound for some inverters and empty for the rest (#5359). An inverter bound to neither keeps
+        the answer the setting's presence used to give, so a missing entity is still reported when written.
+        """
+        percent_arg = rate_arg + "_percent"
+        has_watts = rate_arg in self.base.args
+        has_percent = percent_arg in self.base.args
+        bound_watts = bool(has_watts and self.base.get_arg(rate_arg, indirect=False, index=self.id))
+        bound_percent = bool(has_percent and self.base.get_arg(percent_arg, indirect=False, index=self.id))
+        if bound_watts != bound_percent:
+            return bound_watts, bound_percent
+        return has_watts, has_percent
+
+    def get_current_discharge_rate(self):
+        """
+        Get the current discharge rate in watts
+        """
+
+        if self.rate_controls("discharge_rate")[1]:
+            current_rate = int(self.base.get_arg("discharge_rate_percent", index=self.id, default=100.0, required_unit="%") * self.battery_rate_max_raw / 100)
+        else:
+            current_rate = self.base.get_arg("discharge_rate", index=self.id, default=self.battery_rate_max_raw, required_unit="W")
+
+        try:
+            current_rate = int(current_rate)
+        except (ValueError, TypeError):
+            self.base.log("Error: Inverter {} charge discharge {} is not a number, setting to {}W".format(current_rate, self.id, self.battery_rate_max_raw))
+            current_rate = self.battery_rate_max_raw
+
+        return current_rate
+
+    def get_current_charge_rate(self):
+        """
+        Get the current charge rate in watts
+        """
+        if self.rate_controls("charge_rate")[1]:
+            current_rate = self.base.get_arg("charge_rate_percent", index=self.id, default=100.0, required_unit="%") * self.battery_rate_max_raw / 100
+        else:
+            current_rate = self.base.get_arg("charge_rate", index=self.id, default=self.battery_rate_max_raw, required_unit="W")
+        try:
+            current_rate = int(current_rate)
+        except (ValueError, TypeError):
+            self.base.log("Error: Inverter {} charge rate {} is not a number, setting to {}W".format(current_rate, self.id, self.battery_rate_max_raw))
+            current_rate = self.battery_rate_max_raw
+
+        return current_rate
+
+    def rate_tolerances(self, rate_max):
+        """
+        (fuzzy, fuzzy_below) in watts for checking a charge/discharge rate read-back against the rate written.
+
+        fuzzy is 5% of rate_max - the rate ceiling, battery_rate_max_charge/discharge per minute. On an
+        inverter that stores the rate coarsely, fuzzy_below widens a read-back SHORT of the rate to one
+        hardware step. GivEnergy holds it as a whole percent of nominal battery capacity, rounded down:
+        1300W on a 13.41kWh battery reads back 1206W, a 94W miss that a 1300W ceiling's 65W tolerance
+        rejected - re-writing it ten times every cycle (#5324). A read-back over the rate is never that
+        rounding, so it keeps fuzzy: a rate held one step up (134W) is still written down to a 0W hold.
+
+        Deliberately relaxed rather than predicting the exact read-back, which would need Predbat's
+        capacity to match the inverter's to the watt. The cost is a ~1W boundary: a short read-back can
+        miss by just under one step plus 1W of read-back truncation, so a request landing exactly one step
+        above the held rate is taken as already set and the rate stays one step low - the same error the
+        rounding makes anyway. The step is only as right as nominal_capacity; GivTCP supplies its own.
+        """
+        fuzzy = rate_max * MINUTE_WATT / 20
+        fuzzy_below = None
+        if self.inv_rate_step_percent_of_capacity and self.nominal_capacity:
+            step = self.nominal_capacity * 1000 * self.inv_rate_step_percent_of_capacity / 100
+            fuzzy_below = max(fuzzy, step + 1)
+        return fuzzy, fuzzy_below
+
+    def adjust_charge_rate(self, new_rate, notify=True):
+        """
+        Adjust charging rate
+
+        Inverter Class Parameters
+        =========================
+
+            None
+
+        Output Entities:
+        ================
+
+            Config arg                         Type          Units
+            ----------                         ----          -----
+            charge_rate                        float         W
+            *timed_charge_current              float         A
+
+
+        *If the inverter uses current rather than power we create a dummy entity for the power anyway but also write to the current entity
+        """
+
+        new_rate = int(new_rate + 0.5)
+        current_rate = self.get_current_charge_rate()
+
+        fuzzy, fuzzy_below = self.rate_tolerances(self.battery_rate_max_charge)
+        if not within_fuzzy(current_rate, new_rate, fuzzy, fuzzy_below):
+            self.base.log("Inverter {} current charge rate is {}W and new target is {}W".format(self.id, current_rate, new_rate))
+            write_watts, write_percent = self.rate_controls("charge_rate")
+            if write_watts:
+                self.write_and_poll_value(
+                    "charge_rate",
+                    self.base.get_arg("charge_rate", indirect=False, index=self.id, required_unit="W"),
+                    new_rate,
+                    fuzzy=fuzzy,
+                    required_unit="W",
+                    fuzzy_below=fuzzy_below,
+                )
+            if write_percent:
+                self.write_and_poll_value("charge_rate_percent", self.base.get_arg("charge_rate_percent", indirect=False, index=self.id, required_unit="%"), min(int(new_rate / self.battery_rate_max_raw * 100), 100), fuzzy=5, required_unit="%")
+
+            if notify and self.base.set_inverter_notify:
+                self.base.call_notify(f"{self.base.prefix.capitalize()}: Inverter {self.id} charge rate changes to {new_rate}W at {self.base.time_now_str()}")
+            self.mqtt_message(topic="set/charge_rate", payload=new_rate)
+
+        # Re-assert the timed current register on every call, not just when charge_rate itself
+        # changes - it's a separate register that can drift/reset independently (#4415). Mirrors
+        # the pattern used for the charge window time registers in adjust_charge_window(): call
+        # every cycle and let write_and_poll_value()'s own read-compare decide whether a write is
+        # actually needed, which is a no-op when nothing has drifted.
+        if self.inv_output_charge_control == "current":
+            self.set_current_from_power("charge", new_rate)
+
+    def adjust_discharge_rate(self, new_rate, notify=True):
+        """
+        Adjust discharging rate
+
+        Inverter Class Parameters
+        =========================
+
+            None
+
+        Output Entities:
+        ================
+
+            Config arg                         Type          Units
+            ----------                         ----          -----
+            discharge_rate                        float         W
+            *timed_discharge_current              float         A
+
+        *If the inverter uses current rather than power we create a dummy entity for the power anyway but also write to the current entity
+        """
+        new_rate = int(new_rate + 0.5)
+        current_rate = self.get_current_discharge_rate()
+
+        fuzzy, fuzzy_below = self.rate_tolerances(self.battery_rate_max_discharge)
+        if not within_fuzzy(current_rate, new_rate, fuzzy, fuzzy_below):
+            self.base.log("Inverter {} current discharge rate is {}W and new target is {}W".format(self.id, current_rate, new_rate))
+            write_watts, write_percent = self.rate_controls("discharge_rate")
+            if write_watts:
+                self.write_and_poll_value(
+                    "discharge_rate",
+                    self.base.get_arg("discharge_rate", indirect=False, index=self.id),
+                    new_rate,
+                    fuzzy=fuzzy,
+                    required_unit="W",
+                    fuzzy_below=fuzzy_below,
+                )
+            if write_percent:
+                self.write_and_poll_value("discharge_rate_percent", self.base.get_arg("discharge_rate_percent", indirect=False, index=self.id, required_unit="%"), min(int(new_rate / self.battery_rate_max_raw * 100), 100), fuzzy=5, required_unit="%")
+
+            if notify and self.base.set_inverter_notify:
+                self.base.call_notify(f"{self.base.prefix.capitalize()}: Inverter {self.id} discharge rate changes to {new_rate}W at {self.base.time_now_str()}")
+            self.mqtt_message(topic="set/discharge_rate", payload=new_rate)
+
+        # Re-assert the timed current register on every call, not just when discharge_rate itself
+        # changes - it's a separate register that can drift/reset independently (#4415). Mirrors
+        # the pattern used for the charge window time registers in adjust_charge_window(): call
+        # every cycle and let write_and_poll_value()'s own read-compare decide whether a write is
+        # actually needed, which is a no-op when nothing has drifted.
+        if self.inv_output_charge_control == "current":
+            self.set_current_from_power("discharge", new_rate)
+
+    def adjust_battery_target(self, soc, isCharging=False, isExporting=False):
+        """
+        Adjust the battery charging target SoC % in GivTCP
+
+        Inverter Class Parameters
+        =========================
+
+            None
+
+        Output Entities:
+        ================
+
+            Config arg                         Type          Units
+            ----------                         ----          -----
+            charge_limit                       int           %
+
+        """
+        # SoC has no decimal places and clamp in min
+        soc = int(max(soc, self.reserve_percent))
+
+        if isExporting and self.inv_has_target_soc and not self.inv_target_soc_used_for_discharge:
+            self.log("Inverter {} Exporting, not adjusting SoC target".format(self.id))
+            return
+
+        # Check current setting and adjust
+        current_soc = int(float(self.base.get_arg("charge_limit", index=self.id, default=100.0, required_unit="%")))
+
+        if current_soc != soc:
+            self.base.log("Inverter {} Current charge limit is {}% and new target is {}%".format(self.id, current_soc, soc))
+            self.current_charge_limit = soc
+            moved_before = self.registers_moved
+            self.write_and_poll_value("charge_limit", self.base.get_arg("charge_limit", indirect=False, index=self.id, required_unit="%"), soc)
+            # Only the limit itself counts - the enable switch below is left out, as in adjust_charge_window()
+            limit_moved = self.registers_moved != moved_before
+            charge_limit_enable_entity_id = self.base.get_arg("charge_limit_enable", indirect=False, index=self.id)
+            if charge_limit_enable_entity_id:
+                # If we have a separate enable for the charge limit then make sure it's enabled when we set the charge limit
+                self.write_and_poll_switch("charge_limit_enable", charge_limit_enable_entity_id, True)
+
+            # For inverters that need a button press to apply changes (e.g., Fox), press the button now.
+            # Guarded on the target being written: the current_soc != soc check above is an observed
+            # comparison, so on hardware that never reads the limit back it is pinned true and this
+            # pressed every cycle (#2328). A write that really moved the limit back from something
+            # else set it still commits, so an external reset to 100% is not left uncommitted.
+            if self.inv_time_button_press:
+                self.press_and_poll_button(side="charge", scope="target_soc", commit_key=soc, moved=limit_moved)
+
+            if self.base.set_inverter_notify:
+                self.base.call_notify(f"{self.base.prefix.capitalize()}: Inverter {self.id} Target SoC has been changed to {soc}% at {self.base.time_now_str()}")
+            self.mqtt_message(topic="set/target_soc", payload=soc)
+        else:
+            self.base.log("Inverter {} Current Target SoC is {}%, already at target".format(self.id, current_soc))
+
+        # Inverters that need on/off controls rather than target SoC
+        if not self.inv_has_target_soc:
+            if isCharging:
+                self.mimic_target_soc(soc)
+            elif isExporting:
+                self.mimic_target_soc(soc, discharge=True)
+            else:
+                self.mimic_target_soc(0)
+
+    def _ledger_generation(self, entity_id):
+        """Return the entity's observation generation, or None if it exposes no timing metadata.
+
+        The ledger requires a divergent read to be NEWER than the confirmation, not merely
+        from a later cycle - GivEnergy serves bulk settings reads from cache, so a read taken
+        before our write propagated shows the old value and is indistinguishable from a
+        reversion. Where an entity exposes no timing metadata the ledger falls back to the
+        cycle counter alone, which is weaker but never wrong in the unsafe direction.
+        """
+        try:
+            return generation_from_state(self.base.get_state_wrapper(entity_id, raw=True))
+        except Exception:
+            return None
+
+    def _ledger_observe(self, ledger, name, entity_id, value):
+        """Classify a control read and log every verdict that is not a plain owned/unowned.
+
+        observe()'s verdict is otherwise discarded at all three call sites, which makes the
+        whole suppression ladder invisible. When a customer reports interference and the
+        entity reads 0 there is then no way to tell whether the ledger owned nothing,
+        suppressed on the freshness gate, refused the read as implausible, saw a dropout, or is
+        holding a divergence pending a repeat - five completely different problems that look
+        identical from outside. This line is the feature's only diagnostic.
+        """
+        owned = ledger.owned_value(entity_id)
+        verdict = ledger.observe(entity_id, name, value, now=time.time(), generation=self._ledger_generation(entity_id))
+        if verdict not in (OWNED, UNOWNED):
+            self.base.log("Inverter {} control ledger: {} ({}) verdict {} - Predbat set {}, inverter now reads {}".format(self.id, name, entity_id, verdict, owned, value))
+        return verdict
+
+    def check_write_entity(self, caller, name, entity_id, new_value):
+        """
+        Whether a control can be written to, warning if it is missing or is a fixed value.
+
+        apps.yaml settings may hold a literal rather than an entity id - the huawei and sofar
+        templates ship one for reserve, because those inverters have no register to point at - and a
+        literal is not somewhere a value can be written. Every write path used to split it as though
+        it were an entity id, so a control configured that way raised instead of reporting that
+        Predbat cannot set it (GH#5003).
+        """
+        if is_entity_id(entity_id):
+            return True
+        if entity_id:
+            message = "Warn: Inverter {} {}: {} for {} is a fixed value, not an entity id, so {} can not be written".format(self.id, caller, entity_id, name, new_value)
+        else:
+            message = "Warn: Inverter {} {}: No entity_id for {} to write {}".format(self.id, caller, name, new_value)
+        self.base.log(message)
+        self.base.record_status(message, had_errors=True)
+        return False
+
+    def _write_attempts(self, name, entity_id, new_value):
+        """
+        How many times to send a write of new_value to this control before giving up on it.
+
+        Normally inv_write_max_retry. For inverter types with write_backoff set, a control whose
+        write of this same target has failed INVERTER_WRITE_BACKOFF_FAILURES times in a row is
+        degraded: re-sending a burst every cycle can swamp a device that applies writes slowly and
+        one at a time, which only makes the read-back lag further behind. A degraded control gets a
+        single attempt, at most once per INVERTER_WRITE_DEGRADED_INTERVAL seconds; in between it
+        gets 0, so the caller only checks the read it already took and, if that still differs,
+        reports the failure as usual. A different target is new work and gets the full ladder at once.
+        """
+        if not self.inv_write_backoff:
+            return self.inv_write_max_retry
+        state = self.write_backoff.get(entity_id)
+        if state is not None and state["value"] != new_value:
+            if state["failures"] >= INVERTER_WRITE_BACKOFF_FAILURES:
+                self.base.log(f"Inverter {self.id} {name} target changed to {new_value}, retrying writes normally again")
+            del self.write_backoff[entity_id]
+            state = None
+        if state is None or state["failures"] < INVERTER_WRITE_BACKOFF_FAILURES:
+            return self.inv_write_max_retry
+        now = time.monotonic()
+        if state.get("published_at") is not None and now - state["published_at"] < INVERTER_WRITE_DEGRADED_INTERVAL:
+            return 0
+        state["published_at"] = now
+        return 1
+
+    def _write_backoff_result(self, name, entity_id, new_value, verified):
+        """
+        Record whether a write to this control verified, for _write_attempts().
+
+        Logged once when a control drops to a single attempt per write and once when it recovers.
+        """
+        if not self.inv_write_backoff:
+            return
+        state = self.write_backoff.get(entity_id)
+        if verified:
+            if state is not None and state["failures"] >= INVERTER_WRITE_BACKOFF_FAILURES:
+                self.base.log(f"Inverter {self.id} {name} write verified, retrying writes normally again")
+            self.write_backoff.pop(entity_id, None)
+            return
+        if state is None or state["value"] != new_value:
+            state = {"value": new_value, "failures": 0}
+            self.write_backoff[entity_id] = state
+        state["failures"] += 1
+        if state["failures"] == INVERTER_WRITE_BACKOFF_FAILURES:
+            # This failing call has just published, so the degraded interval runs from now
+            state["published_at"] = time.monotonic()
+            self.base.log(f"Warn: Inverter {self.id} write of {new_value} to {name} has failed {state['failures']} times in a row, sending it at most once every {INVERTER_WRITE_DEGRADED_INTERVAL} seconds until it verifies")
+
+    def write_and_poll_switch(self, name, entity_id, new_value):
+        """
+        GivTCP Workaround, keep writing until correct
+        """
+        # Re-written to minimise writes
+        if not self.check_write_entity("write_and_poll_switch", name, entity_id, new_value):
+            return False
+        domain, entity_name = entity_id.split(".")
+
+        def switch_state(state):
+            """
+            The on/off value a switch read represents.
+
+            Maps "unavailable" to False, which is a perfectly valid switch position - which is
+            exactly why the control ledger below is handed the raw read instead of this: a routine
+            integration dropout would otherwise pass every suppression rung and be reported to the
+            customer as somebody else turning their charging off.
+            """
+            if isinstance(state, str):
+                return state.lower() in ["on", "enable", "true"]
+            return state
+
+        def switch_matched(state):
+            """Whether a switch read reports the on/off value being written."""
+            return switch_state(state) == new_value
+
+        raw_state = self.base.get_state_wrapper(entity_id=entity_id)
+
+        ledger = self.base.control_ledger
+        if ledger is not None:
+            self._ledger_observe(ledger, name, entity_id, raw_state)
+            if not switch_matched(raw_state):
+                ledger.note_write_attempt(entity_id)
+
+        if switch_matched(raw_state):
+            self.base.log("Inverter {} write_and_poll_switch: No write needed for {} as {} == {}".format(self.id, name, new_value, switch_state(raw_state)))
+            # Re-arm. Once an EXTERNAL event (or a clear) has dropped ownership, a control already
+            # sitting at Predbat's target reaches this early return on every cycle from now on, so
+            # record_write() below is never called again and the control is silently unwatched for
+            # the rest of the process. record_ownership_from_read() refuses to touch a live record,
+            # so this only ever fills that gap - see its docstring for why a matching read is
+            # weaker but sufficient evidence.
+            if ledger is not None:
+                ledger.record_ownership_from_read(entity_id, name, raw_state, now=time.time(), generation=self._ledger_generation(entity_id))
+            self._write_backoff_result(name, entity_id, new_value, True)
+            return True
+
+        attempts = self._write_attempts(name, entity_id, new_value)
+        retry = 0
+        while not switch_matched(raw_state) and retry < attempts:
+            retry += 1
+            if domain == "sensor":
+                if new_value:
+                    self.base.set_state_wrapper(state="on", entity_id=entity_id, attributes=self.created_attributes.get(entity_id, {}))
+                else:
+                    self.base.set_state_wrapper(state="off", entity_id=entity_id, attributes=self.created_attributes.get(entity_id, {}))
+            else:
+                base_entity = entity_id.split(".")[0]
+                service = base_entity + "/turn_" + ("on" if new_value else "off")
+                self.base.call_service_wrapper(service, entity_id=entity_id)
+
+            raw_state = self._poll_after_write(entity_id, switch_matched, refresh=domain != "sensor")
+
+        if switch_matched(raw_state):
+            self.base.log("Inverter {} Wrote {} to {} successfully and got {}".format(self.id, name, new_value, self.base.get_state_wrapper(entity_id=entity_id)))
+            if domain != "sensor":
+                self.count_register_writes += 1
+                self.registers_moved += 1
+            # The owned value must be the same SHAPE as the reads it will later be compared
+            # against, so record_write gets the raw read too. Storing the coerced bool while
+            # observing the raw string would make every subsequent read ("on" vs True) look
+            # like a change - PredBat accusing somebody else of its own successful write.
+            if ledger is not None:
+                ledger.record_write(entity_id, name, raw_state, now=time.time(), generation=self._ledger_generation(entity_id))
+            self._write_backoff_result(name, entity_id, new_value, True)
+            return True
+        else:
+            self.base.log("Warn: Inverter {} Trying to write {} to {} didn't complete got {}".format(self.id, name, new_value, self.base.get_state_wrapper(entity_id=entity_id)))
+            self.base.record_status("Warn: Inverter {} write to {} failed".format(self.id, name), had_errors=True)
+            # The write never verified, so we cannot claim this value - and holding the PREVIOUS
+            # confirmation would report the next read of a control we have just failed to set.
+            if ledger is not None:
+                ledger.clear(entity_id)
+            self._write_backoff_result(name, entity_id, new_value, False)
+            return False
+
+    def write_and_poll_value(self, name, entity_id, new_value, fuzzy=0, ignore_fail=False, required_unit=None, fuzzy_below=None):
+        # Modified to cope with sensor entities and writing strings
+        # Re-written to minimise writes
+        # fuzzy_below, when given, replaces fuzzy for a read short of new_value - for a value the device rounds down
+        if not self.check_write_entity("write_and_poll_value", name, entity_id, new_value):
+            return False
+        domain, entity_name = entity_id.split(".")
+
+        def value_state(state, warn=False):
+            """
+            A read coerced into the shape new_value is compared in - a float, or a plain string.
+
+            A failed read - "unavailable", "unknown", a missing entity - becomes 0.0, a
+            real-looking number that passes every suppression rung. Reported to a customer that
+            reads as "a third party set your charge rate to 0 W", produced by nothing more than a
+            routine integration dropout - which is why the control ledger below is handed the raw
+            read instead of this. Only the first read of the cycle warns, so a poll cannot repeat
+            the message on every look.
+            """
+            if isinstance(new_value, str):
+                return state
+            try:
+                return float(state)
+            except (ValueError, TypeError):
+                if warn:
+                    self.log("Warn: Inverter {} write_and_poll_value: Current state for {} is {}".format(self.id, name, state))
+                return 0.0
+
+        def value_matched(state):
+            """Whether a read is the value being written, within the fuzzy tolerance."""
+            state = value_state(state)
+            if isinstance(new_value, str):
+                return state == new_value
+            return within_fuzzy(state, new_value, fuzzy, fuzzy_below)
+
+        raw_state = self.base.get_state_wrapper(entity_id, required_unit=required_unit)
+        current_state = value_state(raw_state, warn=True)
+        matched = value_matched(raw_state)
+
+        ledger = self.base.control_ledger
+        if ledger is not None:
+            self._ledger_observe(ledger, name, entity_id, raw_state)
+            if not matched:
+                ledger.note_write_attempt(entity_id)
+
+        attempts = self._write_attempts(name, entity_id, new_value) if not matched else 0
+        retry = 0
+        while (not matched) and (retry < attempts):
+            retry += 1
+            if domain == "sensor":
+                self.base.set_state_wrapper(entity_id, state=new_value, attributes=self.created_attributes.get(entity_id, {}), required_unit=required_unit)
+            else:
+                entity_base = entity_id.split(".")[0]
+                service = entity_base + "/set_value"
+                new_value_conv = self.base.unit_conversion(entity_id, new_value, None, required_unit, going_to=True)
+                self.base.call_service_wrapper(service, value=new_value_conv, entity_id=entity_id)
+
+            if ignore_fail:
+                # Returns success without ever polling, so nothing has been proved about what
+                # the inverter now holds - drop ownership rather than claim it.
+                if ledger is not None:
+                    ledger.clear(entity_id)
+                return True
+
+            raw_state = self._poll_after_write(entity_id, value_matched, refresh=domain != "sensor", required_unit=required_unit)
+            current_state = value_state(raw_state)
+            matched = value_matched(raw_state)
+
+        if retry == 0 and matched:
+            self.base.log(f"Inverter {self.id} write_and_poll_value: No write needed for {name}: {new_value} == {current_state} fuzzy {fuzzy}")
+            # Re-arm - see write_and_poll_switch() for why this early return would otherwise leave
+            # the control unwatched for good once ownership had been dropped.
+            if ledger is not None:
+                ledger.record_ownership_from_read(entity_id, name, raw_state, fuzzy=fuzzy, now=time.time(), generation=self._ledger_generation(entity_id))
+            self._write_backoff_result(name, entity_id, new_value, True)
+            return True
+        elif matched:
+            self.base.log(f"Inverter {self.id} write_and_poll_value: Wrote {new_value} to {name}, successfully now {current_state}")
+            if domain != "sensor":
+                self.count_register_writes += 1
+                self.registers_moved += 1
+            # Raw again, for the same reason as observe() above: both sides of every later
+            # comparison must be reads of the same entity in the same shape, and a coerced
+            # 0.0 read-back would otherwise be stored as a confirmed owned value.
+            if ledger is not None:
+                ledger.record_write(entity_id, name, raw_state, fuzzy=fuzzy, now=time.time(), generation=self._ledger_generation(entity_id))
+            self._write_backoff_result(name, entity_id, new_value, True)
+            return True
+        else:
+            self.base.log(f"Warn: Inverter {self.id} Trying to write {new_value} to {name} didn't complete got {current_state}")
+            self.base.record_status(f"Warn: Inverter {self.id} write to {name} failed", had_errors=True)
+            if ledger is not None:
+                ledger.clear(entity_id)
+            self._write_backoff_result(name, entity_id, new_value, False)
+            return False
+
+    def write_and_poll_option(self, name, entity_id, new_value, ignore_fail=False):
+        """
+        GivTCP Workaround, keep writing until correct
+        """
+        if not self.check_write_entity("write_and_poll_option", name, entity_id, new_value):
+            return False
+        entity_base = entity_id.split(".")[0]
+
+        if entity_base not in ["input_select", "select", "time", "input_datetime"]:
+            return self.write_and_poll_value(name, entity_id, new_value, ignore_fail=ignore_fail)
+
+        old_value = self.base.get_state_wrapper(entity_id, refresh=True)
+
+        # Ensure new_value is a string for string operations (e.g. when an integer hour/minute is passed for a time entity)
+        if not isinstance(new_value, str):
+            new_value = str(new_value)
+
+        # If time format of the selector is %H:%M and we pass in %H:%M:%S then we need to strip the seconds
+        if old_value and (":" in old_value) and (":" in new_value) and (len(old_value) == 5) and (len(new_value) == 8):
+            new_value = new_value[:5]
+
+        # This path writes even when the value already matches, so remember whether it did not.
+        value_before = old_value
+
+        ledger = self.base.control_ledger
+        if ledger is not None:
+            self._ledger_observe(ledger, name, entity_id, old_value)
+            if old_value != new_value:
+                ledger.note_write_attempt(entity_id)
+
+        attempts = self._write_attempts(name, entity_id, new_value)
+        if attempts == 0 and old_value == new_value:
+            # A degraded control between publishes that already reads back as wanted
+            self.base.log("Inverter {} {} already reads {}".format(self.id, name, new_value))
+            if ledger is not None:
+                ledger.record_ownership_from_read(entity_id, name, old_value, now=time.time(), generation=self._ledger_generation(entity_id))
+            self._write_backoff_result(name, entity_id, new_value, True)
+            return True
+        for _retry in range(attempts):
+            if entity_base == "time":
+                service = entity_base + "/set_value"
+                self.base.call_service_wrapper(service, time=new_value, entity_id=entity_id)
+            elif entity_base == "input_datetime":
+                # input_datetime uses set_datetime (not set_value) with a time= parameter for time-only entities
+                self.base.call_service_wrapper("input_datetime/set_datetime", time=new_value, entity_id=entity_id)
+            else:
+                service = entity_base + "/select_option"
+                self.base.call_service_wrapper(service, option=new_value, entity_id=entity_id)
+            if ignore_fail:
+                # Same as write_and_poll_value: success without a poll proves nothing.
+                if ledger is not None:
+                    ledger.clear(entity_id)
+                return True
+            old_value = self._poll_after_write(entity_id, lambda state: state == new_value)
+            if old_value == new_value:
+                self.base.log("Inverter {} Wrote {} to {} successfully".format(self.id, name, new_value))
+                self.count_register_writes += 1
+                if value_before != new_value:
+                    self.registers_moved += 1
+                if ledger is not None:
+                    ledger.record_write(entity_id, name, old_value, now=time.time(), generation=self._ledger_generation(entity_id))
+                self._write_backoff_result(name, entity_id, new_value, True)
+                return True
+        self.base.log("Warn: Inverter {} Trying to write {} to {} didn't complete got {}".format(self.id, name, new_value, self.base.get_state_wrapper(entity_id, refresh=True)))
+        self.base.record_status("Warn: Inverter {} write to {} failed".format(self.id, name), had_errors=True)
+        if ledger is not None:
+            ledger.clear(entity_id)
+        self._write_backoff_result(name, entity_id, new_value, False)
+        return False
+
+    def write_hm_time_part(self, name, new_time):
+        """
+        Write the hour or minute half of an H M schedule time, e.g. charge_start_minute.
+
+        A time entity (FB00 firmware) takes the whole "HH:MM:SS" string; anything else takes the
+        integer part. Returns whether the schedule can still be committed: False only when a real
+        write failed. An unmapped entity is skipped, and a literal value where an entity id is
+        expected is warned about, but neither counts as a failed write - the guard would otherwise
+        keep the commit pending and press the update button on every cycle (#2328).
+        """
+        entity_id = self.base.get_arg(name, indirect=False, index=self.id)
+        if entity_id is None:
+            return True
+        if not is_entity_id(entity_id):
+            self.check_write_entity("write_hm_time_part", name, entity_id, new_time)
+            return True
+        if entity_id.startswith("time."):
+            return self.write_and_poll_option(name, entity_id, new_time)
+        part = new_time[:2] if name.endswith("_hour") else new_time[3:5]
+        return self.write_and_poll_option(name, entity_id, int(part))
+
+    def adjust_pause_mode(self, pause_charge=False, pause_discharge=False):
+        """
+        Inverter control for Pause mode
+        """
+
+        # Ignore if inverter doesn't have pause mode
+        if not self.inv_has_timed_pause:
+            return
+
+        # For now we have to use the pause start/end entity to know if we have a pause time window (must be a better way)
+        entity_start = self.base.get_arg("pause_start_time", indirect=False, index=self.id)
+        entity_end = self.base.get_arg("pause_end_time", indirect=False, index=self.id)
+
+        entity_mode = self.base.get_arg("pause_mode", indirect=False, index=self.id)
+        old_pause_mode = None
+        old_start_time = None
+        old_end_time = None
+
+        # As not all inverters have these options we need to gracefully give up if its missing
+        if entity_mode:
+            old_pause_mode = self.base.get_state_wrapper(entity_mode)
+            if old_pause_mode is None:
+                entity_mode = None
+
+        if entity_start:
+            old_start_time = self.base.get_state_wrapper(entity_start)
+            if old_start_time is None:
+                entity_start = None
+                self.log("Note: Inverter {} does not have pause_start_time entity".format(self.id))
+
+        if entity_end:
+            old_end_time = self.base.get_state_wrapper(entity_end)
+            if old_end_time is None:
+                self.log("Note: Inverter {} does not have pause_end_time entity".format(self.id))
+                entity_end = None
+
+        if not entity_mode:
+            self.log("Warn: Inverter {} does not have pause_mode entity configured correctly".format(self.id))
+            return
+
+        # Some inverters have start/end time registers
+        new_start_time = "00:00:00"
+        new_end_time = "23:59:00"
+
+        # GE Cloud has different pause names. GivTCP's own spelling (Disabled/PauseCharge/...) is
+        # what the GivTCPComponent publishes, so a GivTCP-backed entity lands on the False side here
+        # exactly as the old REST branch did.
+        if old_pause_mode in ["Not Paused", "Pause Charge", "Pause Discharge", "Pause Charge & Discharge"]:
+            pause_cloud = True
+        else:
+            pause_cloud = False
+
+        # Not Paused, Pause Charge, Pause Discharge, Pause Charge & Discharge
+        if pause_charge and pause_discharge:
+            new_pause_mode = "Pause Charge & Discharge" if pause_cloud else "PauseBoth"
+        elif pause_charge:
+            new_pause_mode = "Pause Charge" if pause_cloud else "PauseCharge"
+        elif pause_discharge:
+            new_pause_mode = "Pause Discharge" if pause_cloud else "PauseDischarge"
+        else:
+            new_pause_mode = "Not Paused" if pause_cloud else "Disabled"
+
+        if old_start_time and old_start_time != new_start_time:
+            # Don't poll as inverters with no registers will fail
+            self.write_and_poll_option("pause_start_time", entity_start, new_start_time, ignore_fail=True)
+            self.base.log("Inverter {} set pause start time to {}".format(self.id, new_start_time))
+
+        if old_end_time and old_end_time != new_end_time:
+            # Don't poll as inverters with no registers will fail
+            self.write_and_poll_option("pause_end_time", entity_end, new_end_time, ignore_fail=True)
+            self.base.log("Inverter {} set pause end time to {}".format(self.id, new_end_time))
+
+        # Set the mode
+        if new_pause_mode != old_pause_mode:
+            self.write_and_poll_option("pause_mode", entity_mode, new_pause_mode)
+
+            if self.base.set_inverter_notify:
+                self.base.call_notify(f"{self.base.prefix.capitalize()}: Inverter {self.id} pause mode to set {new_pause_mode} at time {self.base.time_now_str()}")
+
+            self.base.log("Inverter {} set pause mode to {}".format(self.id, new_pause_mode))
+
+    def adjust_inverter_mode(self, force_export, changed_start_end=False):
+        """
+        Adjust inverter mode between force export and Demand mode (ECO)
+
+        Inverter Class Parameters
+        =========================
+
+            None
+
+        Output Entities:
+        ================
+
+            Config arg                         Type          Units
+            ----------                         ----          -----
+            inverter_mode                      string
+
+        """
+        inverter_mode_configured = "inverter_mode" in self.base.args
+        if changed_start_end:
+            # XXX: Workaround for GivTCP window state update time to take effort
+            self.base.log("Sleeping (workaround) as start/end of discharge window was just adjusted")
+            self.sleep(30)
+        old_inverter_mode = self.base.get_arg("inverter_mode", index=self.id)
+
+        if self.inv_has_ge_eco_toggle:
+            # GE has an eco toggle rather than a mode, so exporting means eco off
+            if force_export:
+                new_inverter_mode = "off"
+            else:
+                new_inverter_mode = "on"
+        else:
+            # For the purpose of this function consider Eco Paused as the same as Eco (it's a difference in reserve setting)
+            if old_inverter_mode == "Eco (Paused)":
+                old_inverter_mode = "Eco"
+
+            # Force export or Eco mode?
+            if force_export:
+                new_inverter_mode = "Timed Export"
+            else:
+                new_inverter_mode = "Eco"
+
+        # Change inverter mode
+        if old_inverter_mode != new_inverter_mode:
+            self.log("Inverter {} current mode is {} and new target is {} has_ge_eco_toggle {}".format(self.id, old_inverter_mode, new_inverter_mode, self.inv_has_ge_eco_toggle))
+            entity_id = self.base.get_arg("inverter_mode", indirect=False, index=self.id)
+            if self.inv_has_ge_eco_toggle:
+                # GE has an eco toggle rather than a mode, so we write the opposite of the force export to the eco toggle
+                if entity_id:
+                    self.write_and_poll_switch("inverter_mode", entity_id, new_inverter_mode == "on")
+                else:
+                    if not inverter_mode_configured:
+                        self.log("Warn: Inverter {} adjust_inverter_mode: No entity_id for ECO Toggle, inverter_mode should be set to xxx_enable_eco_mode".format(self.id))
+                    return
+            else:
+                self.write_and_poll_option("inverter_mode", entity_id, new_inverter_mode)
+
+            # Notify
+            if self.base.set_inverter_notify:
+                self.base.call_notify(f"{self.base.prefix.capitalize()}: Inverter {self.id} Force export set to {force_export} at time {self.base.time_now_str()}")
+
+            self.base.log("Inverter {} set force export to {}".format(self.id, force_export))
+
+    def adjust_idle_time(self, charge_start=None, charge_end=None, discharge_start=None, discharge_end=None):
+        """
+        Adjust inverter idle time based on charge/discharge times
+        """
+        if charge_start:
+            self.track_charge_start = charge_start
+        if charge_end:
+            self.track_charge_end = charge_end
+        if discharge_start:
+            self.track_discharge_start = discharge_start
+        if discharge_end:
+            self.track_discharge_end = discharge_end
+
+        self.log("Inverter {} Adjust idle time, charge {}-{} discharge {}-{}".format(self.id, self.track_charge_start, self.track_charge_end, self.track_discharge_start, self.track_discharge_end))
+
+        minutes_now = self.base.minutes_now
+        charge_start_minutes, charge_end_minutes = window2minutes(self.track_charge_start, self.track_charge_end, minutes_now)
+        discharge_start_minutes, discharge_end_minutes = window2minutes(self.track_discharge_start, self.track_discharge_end, minutes_now)
+
+        # Idle from now (or previous idle time) until midnight
+        idle_start_minutes = max(min(minutes_now, self.idle_start_minutes), 0)
+        idle_end_minutes = 2 * 24 * 60 - 1
+
+        if charge_start_minutes <= minutes_now and charge_end_minutes > minutes_now:
+            # We are in a charge window so move on the idle start
+            idle_start_minutes = max(idle_start_minutes, charge_end_minutes)
+            # self.log("Clamp idle start until after charge start - idle start now {}".format(idle_start_minutes))
+
+        if idle_end_minutes > charge_start_minutes and idle_start_minutes < charge_start_minutes:
+            # Avoid the end running over the charge start
+            idle_end_minutes = min(idle_end_minutes, charge_start_minutes)
+            # self.log("Clamp idle end until before start charge - idle end now {}".format(idle_end_minutes))
+
+        if discharge_start_minutes <= minutes_now and discharge_end_minutes > minutes_now:
+            # We are in a discharge window so move on the idle start
+            idle_start_minutes = max(idle_start_minutes, discharge_end_minutes)
+            # self.log("Clamp idle start until after discharge start - idle start now {}".format(idle_start_minutes))
+
+        if idle_end_minutes > discharge_start_minutes and idle_start_minutes < discharge_start_minutes:
+            # Avoid the end running over the discharge start
+            idle_end_minutes = min(idle_end_minutes, discharge_start_minutes)
+            # self.log("Clamp idle end until before discharge charge - idle end now {}".format(idle_end_minutes))
+
+        # Avoid midnight span
+        if idle_start_minutes < 24 * 60:
+            idle_end_minutes = min(24 * 60 - 1, idle_end_minutes)
+            # self.log("clamp idle end at midnight, now {}".format(idle_end_minutes))
+
+        if idle_start_minutes >= idle_end_minutes:
+            # Not until tomorrow so skip for now
+            idle_start_minutes = 0
+            idle_end_minutes = 0
+            # self.log("Reset idle start/end due to being no window")
+
+        # Work out new idle start/end time
+        idle_start_time = self.base.midnight_utc + timedelta(minutes=idle_start_minutes)
+        idle_end_time = self.base.midnight_utc + timedelta(minutes=idle_end_minutes)
+        idle_start = idle_start_time.strftime(TIME_FORMAT_HMS)
+        idle_end = idle_end_time.strftime(TIME_FORMAT_HMS)
+
+        self.base.log("Inverter {} Adjust demand (idle) time computed is {}-{}".format(self.id, idle_start, idle_end))
+
+        # Get previous start/end
+        old_start = self.base.get_arg("idle_start_time", index=self.id)
+        old_end = self.base.get_arg("idle_end_time", index=self.id)
+
+        # Write new idle start/end time
+        idle_start_time_id = self.base.get_arg("idle_start_time", indirect=False, index=self.id)
+        idle_end_time_id = self.base.get_arg("idle_end_time", indirect=False, index=self.id)
+
+        if idle_start_time_id and idle_end_time_id:
+            if old_start != idle_start:
+                self.base.log("Inverter {} set new demand (idle) start time to {} was {}".format(self.id, idle_start, old_start))
+                self.write_and_poll_option("idle_start_time", idle_start_time_id, idle_start)
+                self.idle_start_minutes = idle_start_minutes
+            if old_end != idle_end:
+                self.base.log("Inverter {} set new demand (idle) end time to {} was {}".format(self.id, idle_end, old_end))
+                self.write_and_poll_option("idle_end_time", idle_end_time_id, idle_end)
+                self.idle_end_minutes = idle_end_minutes
+
+    def adjust_force_export(self, force_export, new_start_time=None, new_end_time=None):
+        """
+        Adjust force export on/off and set the time window correctly
+
+        Inverter Class Parameters
+        =========================
+
+            None
+
+        Output Entities:
+        ================
+
+            Config arg                         Type          Units
+            ----------                         ----          -----
+            discharge_start_time               string
+            discharge_end_time                 string
+            *discharge_start_hour              int
+            *discharge_start_minute            int
+            *discharge_end_hour                int
+            *discharge_end_minute              int
+            *charge_discharge_update_button    button
+
+        """
+
+        if "discharge_start_time" in self.base.args:
+            old_start = self.base.get_arg("discharge_start_time", index=self.id)
+            old_end = self.base.get_arg("discharge_end_time", index=self.id)
+            if old_start is None:
+                old_start = "00:00:00"
+            if old_end is None:
+                old_end = "00:00:00"
+            if len(old_start) == 5:
+                old_start += ":00"
+            if len(old_end) == 5:
+                old_end += ":00"
+            old_discharge_enable = self.base.get_arg("scheduled_discharge_enable", "off", index=self.id) == "on"
+        else:
+            self.log("Warn: Inverter {} unable read discharge window as neither REST, discharge_start_time or discharge_start_hour are set".format(self.id))
+            return False
+
+        # Whether the caller asked us to manage the export times at all this cycle. execute.py calls
+        # adjust_force_export(False) with no times whenever nothing is being exported, which is a
+        # different thing from both an explicit caller-supplied window and the plain-GS midnight
+        # disable window synthesised below.
+        times_supplied = (new_start_time is not None) or (new_end_time is not None)
+
+        # Start time to correct format
+        if new_start_time:
+            new_start_time += timedelta(seconds=self.base.inverter_clock_skew_discharge_start * 60)
+            new_start = new_start_time.strftime(TIME_FORMAT_HMS)
+        else:
+            new_start = None
+
+        # End time to correct format
+        if new_end_time:
+            new_end_time += timedelta(seconds=self.base.inverter_clock_skew_discharge_end * 60)
+            new_end = new_end_time.strftime(TIME_FORMAT_HMS)
+        else:
+            new_end = None
+
+        # If the inverter doesn't have a discharge enable time then use midnight-midnight as an alternative disable
+        # GE Mode is a special case of timed discharge which we control at the time of export
+        if not self.inv_has_discharge_enable_time and not self.inv_has_ge_inverter_mode and not force_export:
+            new_start_time = self.base.midnight_utc
+            new_end_time = self.base.midnight_utc
+            new_start = new_start_time.strftime(TIME_FORMAT_HMS)
+            new_end = new_end_time.strftime(TIME_FORMAT_HMS)
+
+        # For GE Inverter mode as we use immediate controls no point in changing times before we enable export
+        if self.inv_has_ge_inverter_mode and not force_export:
+            new_start = None
+            new_end = None
+
+        # Eco mode, turn it on before we change the discharge window
+        if not force_export:
+            self.adjust_inverter_mode(force_export)
+            if not self.inv_has_charge_enable_time and (self.inv_output_charge_control == "current"):
+                if self.inv_charge_control_immediate:
+                    self.enable_charge_discharge_with_time_current("discharge", False)
+
+        schedule_write_ok = True
+
+        # Turn off scheduled discharge
+        if not force_export and old_discharge_enable:
+            schedule_write_ok = self.write_and_poll_switch("scheduled_discharge_enable", self.base.get_arg("scheduled_discharge_enable", indirect=False, index=self.id), False) and schedule_write_ok
+            self.log("Inverter {} Turning off scheduled export".format(self.id))
+
+        self.base.log("Inverter {} Adjust force export to {}, change times from {} - {} to {} - {}".format(self.id, force_export, old_start, old_end, new_start, new_end))
+        changed_start_end = False
+        is_hm_format = self.inv_charge_time_format in ["H M", "H:M-H:M"]
+
+        # Some inverters have an idle time setting
+        if force_export:
+            self.adjust_idle_time(discharge_start=new_start, discharge_end=new_end)
+        else:
+            self.adjust_idle_time(discharge_start="00:00:00", discharge_end="00:00:00")
+
+        # Change start time
+        if new_start and (new_start != old_start or is_hm_format):
+            self.base.log("Inverter {} set new export start time to {}".format(self.id, new_start))
+            if "discharge_start_time" in self.base.args:
+                # Always write to this as it is the GE default
+                changed_start_end = True
+                entity_discharge_start_time_id = self.base.get_arg("discharge_start_time", indirect=False, index=self.id)
+                schedule_write_ok = self.write_and_poll_option("discharge_start_time", entity_discharge_start_time_id, new_start) and schedule_write_ok
+
+                if self.inv_charge_time_format == "H M":
+                    # If the inverter uses hours and minutes then write to these entities too
+                    schedule_write_ok = self.write_hm_time_part("discharge_start_hour", new_start) and schedule_write_ok
+                    schedule_write_ok = self.write_hm_time_part("discharge_start_minute", new_start) and schedule_write_ok
+                elif self.inv_charge_time_format == "H:M-H:M":
+                    # If the inverter uses hours and minutes then write to these entities too
+                    discharge_time = new_start + "-" + new_end
+                    discharge_time_id = self.base.get_arg("discharge_time", indirect=False, index=self.id)
+                    if discharge_time_id:
+                        schedule_write_ok = self.write_and_poll_option("discharge_time", discharge_time_id, discharge_time) and schedule_write_ok
+            else:
+                self.log("Warn: Inverter {} unable write export start time as neither REST or discharge_start_time are set".format(self.id))
+
+        # Change end time
+        if new_end and (new_end != old_end or is_hm_format):
+            self.base.log("Inverter {} Set new export end time to {} was {}".format(self.id, new_end, old_end))
+            if "discharge_end_time" in self.base.args:
+                # Always write to this as it is the GE default
+                changed_start_end = True
+                entity_discharge_end_time_id = self.base.get_arg("discharge_end_time", indirect=False, index=self.id)
+                schedule_write_ok = self.write_and_poll_option("discharge_end_time", entity_discharge_end_time_id, new_end) and schedule_write_ok
+
+                # If the inverter uses hours and minutes then write to these entities too
+                if self.inv_charge_time_format == "H M":
+                    schedule_write_ok = self.write_hm_time_part("discharge_end_hour", new_end) and schedule_write_ok
+                    schedule_write_ok = self.write_hm_time_part("discharge_end_minute", new_end) and schedule_write_ok
+                elif self.inv_charge_time_format == "H:M-H:M":
+                    pass
+            else:
+                self.log("Warn: Inverter {} unable write export end time as neither REST or discharge_end_time are set".format(self.id))
+
+        # Export target, always set to the minimum reserve. This must track the reserve in *both*
+        # directions - a target left below the minimum reserve SoC (e.g. GE Cloud resets it to 4%)
+        # lets the inverter drain the battery past the reserve between Predbat cycles.
+        # A target we can not read is left alone - an inverter that does not expose the register
+        # reads back as None, and writing to it every cycle just produces errors.
+        if force_export:
+            target_soc = int(self.reserve_percent)
+            # A model with no working Discharge_Target_SOC_1 register (#4517) reaches here with no
+            # entity published for it, so the "cannot read it, leave it alone" branch below is what
+            # stops the every-cycle rewrite - see DISCHARGE_TARGET_UNSUPPORTED_MODELS in givtcp.py.
+            if "discharge_target_soc" in self.base.args:
+                current = self.base.get_arg("discharge_target_soc", index=self.id, required_unit="%")
+                try:
+                    current = float(current)
+                except (ValueError, TypeError):
+                    current = None
+                if current is None:
+                    self.log("Inverter {} No current discharge target to read, export target not written".format(self.id))
+                elif current != target_soc:
+                    self.write_and_poll_value("discharge_target_soc", self.base.get_arg("discharge_target_soc", indirect=False, index=self.id, required_unit="%"), target_soc)
+                else:
+                    self.log("Inverter {} Current discharge target is already set to {}".format(self.id, current))
+
+        # Change scheduled discharge enable
+        if force_export:
+            schedule_write_ok = self.write_and_poll_switch("scheduled_discharge_enable", self.base.get_arg("scheduled_discharge_enable", indirect=False, index=self.id), True) and schedule_write_ok
+            if not old_discharge_enable:
+                self.log("Inverter {} Turning on scheduled export".format(self.id))
+
+        # Whether the export schedule itself actually needs (re)committing to the inverter, as opposed
+        # to us merely having rewritten the time registers. For H M format those registers are rewritten
+        # every cycle as a write-reliability workaround (#1529), so changed_start_end is True on every
+        # cycle of a stable export window and must not be used to gate the commit - on Solis each button
+        # press zeroes the timed current registers (#4709), and it also triggers the 30s GivTCP sleep in
+        # adjust_inverter_mode. Tracking what we last committed keeps a stable window quiet while still
+        # committing once after a restart, when nothing has been committed yet (#4000).
+        # When neither side is managing times this cycle (e.g. idle cloud/GS_fb00 types), comparing None
+        # against the time the inverter still reports is never equal and would press the update button on
+        # every idle cycle for the rest of the day (#2328). Plain GS-style inverters still synthesise and
+        # manage a midnight disable window above, so their internally generated times must continue to count
+        # as a real schedule change that needs committing; GE's immediate-control disable path remains
+        # excluded from that synthetic-window rule, but still counts a caller-supplied window as managed.
+        times_managed = times_supplied or (not self.inv_has_discharge_enable_time and not self.inv_has_ge_inverter_mode and not force_export)
+        start_changed = times_managed and new_start != old_start
+        end_changed = times_managed and new_end != old_end
+        export_schedule = (new_start, new_end, force_export)
+        # Separately, whether the start/end times themselves actually moved - used below to gate the
+        # GivTCP settle sleep, which exists for the window write specifically ("start/end of discharge
+        # window was just adjusted"). schedule_changed alone is too broad for that: it also goes True on
+        # a bare scheduled_discharge_enable flip with the window untouched, which doesn't need settling.
+        times_changed = start_changed or end_changed
+        schedule_changed = times_changed or (force_export != old_discharge_enable)
+        if is_hm_format and self.commit_needed("export_window", export_schedule):
+            # Only the H M path rewrites unconditionally, so only it needs the extra commit-once-per-run
+            # safety net; every other format already commits on a real change alone. Treat it as a real
+            # window write too, so the settle sleep still runs on this first post-restart commit.
+            schedule_changed = True
+            times_changed = True
+
+        if schedule_changed:
+            button_committed = True
+            if self.inv_time_button_press:
+                button_committed = self.press_and_poll_button(side="discharge")
+            self.record_commit("export_window", export_schedule, schedule_write_ok and button_committed)
+
+        # Force export, turn it on after we change the window
+        if force_export:
+            self.adjust_inverter_mode(force_export, changed_start_end=times_changed)
+            if not self.inv_has_charge_enable_time and (self.inv_output_charge_control == "current"):
+                if self.inv_charge_control_immediate:
+                    self.enable_charge_discharge_with_time_current("discharge", True)
+
+        # Notify
+        if schedule_changed and changed_start_end:
+            if self.base.set_inverter_notify:
+                self.base.call_notify(f"{self.base.prefix.capitalize()}: Inverter {self.id} Export time slot set to {new_start} - {new_end} at time {self.base.time_now_str()}")
+
+    def disable_charge_window(self, notify=True):
+        """
+        Disable charge window
+        """
+        """
+
+        Inverter Class Parameters
+        =========================
+
+            Parameter                          Type          Units
+            ----------                         ----          -----
+            self.charge_enable_time            boole
+
+
+        Output Entities:
+        ================
+
+            Config arg                         Type          Units
+            ----------                         ----          -----
+            scheduled_charge_enable            bool
+            *charge_start_hour                 int
+            *charge_start_minute               int
+            *charge_end_hour                   int
+            *charge_end_minute                 int
+            *charge_discharge_update_button    button
+
+        """
+        old_charge_schedule_enable = self.base.get_arg("scheduled_charge_enable", "on", index=self.id)
+
+        self.adjust_idle_time(charge_start="00:00:00", charge_end="00:00:00")
+
+        if old_charge_schedule_enable == "on" or old_charge_schedule_enable == "enable":
+            # Enable scheduled charge if not turned on
+            self.write_and_poll_switch("scheduled_charge_enable", self.base.get_arg("scheduled_charge_enable", indirect=False, index=self.id), False)
+            # If there's no charge enable switch then we can enable using start and end time
+            if not self.inv_has_charge_enable_time and (self.inv_output_charge_control == "current"):
+                if self.inv_charge_control_immediate:
+                    self.enable_charge_discharge_with_time_current("charge", False)
+
+            if self.base.set_inverter_notify and notify:
+                self.base.call_notify(f"{self.base.prefix.capitalize()}: Inverter {self.id} Disabled scheduled charging at {self.base.time_now_str()}")
+
+            self.base.log("Inverter {} Turning off scheduled charge".format(self.id))
+
+            # Reset charge window to midnight if there is no charge enable time
+            if not self.inv_has_charge_enable_time:
+                self.adjust_charge_window(self.base.midnight_utc, self.base.midnight_utc, self.base.minutes_now)
+            else:
+                # Press button if needed - guarded so a disable that the inverter never reads back
+                # (old_charge_schedule_enable pinned "on") does not re-press every cycle (#2328).
+                # No moved= here: the enable switch is the one write that can land and then read back
+                # differently next cycle on this hardware, so it is not evidence of outside drift.
+                if self.inv_time_button_press:
+                    self.press_and_poll_button(side="charge", scope="charge_window", commit_key=("disabled",))
+
+        # Updated cached status to disabled
+        # Don't do it if notify is not set as this is just a temporary call when setting the charge window
+        if notify:
+            self.charge_enable_time = False
+            self.charge_start_time_minutes = self.base.forecast_minutes
+            self.charge_end_time_minutes = self.base.forecast_minutes
+
+    def alt_charge_discharge_enable(self, direction, enable):
+        """
+        Alternative enable and disable of timed charging for non-GE inverters
+        """
+
+        current_rate_charge = self.get_current_charge_rate()
+        current_rate_discharge = self.get_current_discharge_rate()
+
+        if self.inv_has_solis_energy_control:
+            # Reached from mimic_target_soc, so only for GS (no target SoC): on older firmware the switch's
+            # Timed Charge/Discharge bit is the enable itself, for both directions. FB00 is driven from
+            # adjust_charge_immediate / adjust_export_immediate instead.
+            solax_modes = SOLAX_SOLIS_MODES_NEW if self.base.get_arg("solax_modbus_new", True) else SOLAX_SOLIS_MODES
+            new_switch = 35 if (enable or direction == "eco") else 33
+            self.write_solis_energy_control(new_switch, solax_modes, f"{direction} {enable}", warn_missing=(direction == "charge" and enable))
+
+        # MQTT
+        if direction == "charge" and enable:
+            self.mqtt_message("set/charge", payload=int(current_rate_charge))
+        elif direction == "discharge" and enable:
+            self.mqtt_message("set/discharge", payload=int(current_rate_discharge))
+        elif current_rate_discharge == 0:
+            # Model disable discharge in eco mode with force discharge at rate 0
+            self.mqtt_message("set/discharge", payload=int(current_rate_discharge))
+        else:
+            self.mqtt_message("set/auto", payload="true")
+
+    def write_solis_energy_control(self, new_switch, solax_modes, reason, warn_missing=False):
+        """
+        Put the Solis Energy Storage Control Switch on mode value new_switch, writing only when it differs.
+
+        solax_modes maps the Solax Modbus plugin's option names to their values, which differ between the
+        pre-FB00 and FB00 plugins. A switch state the table does not know (e.g. unavailable) counts as a
+        difference. With no energy_control_switch configured nothing is written, and warn_missing says
+        whether that deserves a warning - only while charging, when a switch without grid charging stops it.
+        """
+        entity_id = self.base.get_arg("energy_control_switch", indirect=False, index=self.id)
+        if not entity_id:
+            if warn_missing:
+                self.base.log(f"Warn: Inverter {self.id} energy_control_switch is not set in apps.yaml, so Predbat cannot make sure the inverter allows grid charging")
+            return
+
+        old_mode = str(self.base.get_state_wrapper(entity_id, ""))
+        switch = solax_modes.get(old_mode, 0)
+        new_mode = {value: name for name, value in solax_modes.items()}[new_switch]
+
+        if new_switch != switch:
+            self.base.log(f"Inverter {self.id} Setting Solis Energy Control Switch to {new_switch} {new_mode} from {switch} {old_mode} for {reason}")
+            self.write_and_poll_option(name=entity_id, entity_id=entity_id, new_value=new_mode)
+        else:
+            self.base.log(f"Inverter {self.id} Solis Energy Control Switch setting {switch} {new_mode} unchanged for {reason}")
+
+    def mqtt_message(self, topic, payload):
+        """
+        Send an MQTT message via service
+        """
+        if self.inv_has_mqtt_api:
+            self.base.call_service_wrapper("mqtt/publish", qos=1, retain=True, topic=(self.inv_mqtt_topic + "/" + topic), payload=payload)
+            # No ledger call: this publishes to a broker topic and maps to no Home Assistant
+            # entity, so there is nothing here to record against one.
+
+    def enable_charge_discharge_with_time_current(self, direction, enable):
+        """
+        Enable or disable timed charge/discharge
+        """
+        # To enable we set the current based on the required power
+        if enable:
+            power = self.base.get_arg(f"{direction}_rate", index=self.id, default=2600.0)
+            self.set_current_from_power(direction, power)
+        else:
+            if self.inv_charge_time_format == "H M":
+                # To disable we set both times to 00:00
+                for x in ["start", "end"]:
+                    for y in ["hour", "minute"]:
+                        name = f"{direction}_{x}_{y}"
+                        self.write_and_poll_value(name, self.base.get_arg(name, indirect=False, index=self.id), 0)
+            elif self.inv_charge_time_format == "H:M-H:M":
+                # To disable we set both times to 00:00
+                name = f"{direction}_time"
+                self.write_and_poll_value(name, self.base.get_arg(name, indirect=False, index=self.id), "00:00-00:00")
+            else:
+                self.set_current_from_power(direction, 0)
+
+    def set_current_from_power(self, direction, power):
+        """
+        Set the timed charge/discharge current setting by converting power to current.
+
+        Called on every adjust_charge_rate()/adjust_discharge_rate() invocation, not just when
+        the power target itself changes - this register can drift or get reset independently
+        (#4415). write_and_poll_value() already no-ops when the live value already matches, so
+        this is cheap when nothing has drifted.
+        """
+        if not self.battery_voltage:
+            # None when update_status() has not run yet, so there is no real reading - a caller reached
+            # the charge/discharge rate path before the inverter's own state was ever fetched - or a 0
+            # from the integration or a unit conversion. Skip rather than divide by it; the next
+            # cycle's update_status() will supply a real value (or its own 52.0 fallback if the
+            # entity is genuinely absent).
+            self.log("Warn: Inverter {} battery_voltage is {}, skipping current calculation for {}".format(self.id, self.battery_voltage, direction))
+            return
+        new_current = round(power / self.battery_voltage, self.inv_current_dp)
+        self.write_and_poll_value(f"timed_{direction}_current", self.base.get_arg(f"timed_{direction}_current", indirect=False, index=self.id), new_current, fuzzy=1)
+
+    def call_service_template(self, service, data, domain="charge", extra_data=None):
+        """
+        Call a service template with data
+        """
+        if extra_data is None:
+            extra_data = {}
+        service_list = self.base.args.get(service, "")
+        if not service_list:
+            return False
+
+        if not isinstance(service_list, list):
+            service_list = [service_list]
+
+        hash_index = domain
+        last_service_hash = self.base.last_service_hash.get(hash_index, "")
+        this_service_hash = hash(str(service) + "_" + str(data) + "_" + str(extra_data))
+        service_repeat = last_service_hash == this_service_hash
+
+        # Whether every call this template actually made was accepted. The hash that suppresses a
+        # repeat is only recorded at the end, and only if this holds - see the note below.
+        service_calls_ok = True
+
+        for service_template in service_list:
+            service_data = {}
+            service_name = ""
+            service_always = False
+
+            if isinstance(service_template, str):
+                service_name = service_template
+                service_data = data
+            else:
+                full_data = {}
+                full_data.update(data)
+                full_data.update(extra_data)
+
+                for key in service_template:
+                    if key == "service":
+                        service_name = service_template[key]
+                    elif key in ["always", "repeat"]:
+                        service_always = service_template[key]
+                    else:
+                        value = service_template[key]
+                        use_index = None
+                        if isinstance(value, list):
+                            use_index = self.id
+                        value = self.base.resolve_arg(service_template, value, indirect=False, index=use_index, default="", extra_args=full_data)
+                        if value:
+                            service_data[key] = value
+
+            if service_name and service_repeat and not service_always:
+                self.log("Inverter {} Skipped service {} domain {} service_name {} as it was previously called.".format(self.id, service, domain, service_name))
+            elif service_name:
+                service_name = service_name.replace(".", "/")
+                self.log("Inverter {} Calling service {} domain {} service_name {} with data {}".format(self.id, service, domain, service_name, service_data))
+                if not self.base.call_service_wrapper(service_name, **service_data):
+                    self.log("Warn: Inverter {} service {} domain {} service_name {} was not accepted, it will be retried next cycle".format(self.id, service, domain, service_name))
+                    service_calls_ok = False
+            else:
+                self.log("Warn: Inverter {} unable to find service name for {}".format(self.id, service))
+
+        # Only remember the call once it has actually been accepted. Recording it up front - as this
+        # used to, before the calls were even made - meant a service that silently failed was
+        # deduplicated away on every subsequent cycle ("Skipped service ... as it was previously
+        # called"), so Predbat believed it had set a control it had not. #4876 saw predbat.status
+        # read Charging while the inverter's own display still showed its idle program, until the
+        # identical call was re-sent by hand. Dropping the record instead lets the next cycle reissue
+        # it naturally, without needing "repeat: True" on the template in apps.yaml.
+        if service_calls_ok:
+            self.base.last_service_hash[hash_index] = this_service_hash
+        else:
+            self.base.last_service_hash.pop(hash_index, None)
+
+        # Deliberately not reporting the call result here: callers use this return value to choose a
+        # fallback service (e.g. "if not charge_freeze_service: charge_stop_service"), so reporting a
+        # transient failure would silently downgrade a freeze into a stop rather than retrying it.
+        return True
+
+    def adjust_charge_immediate(self, target_soc, freeze=False):
+        """
+        Adjust from charging or not charging based on passed target soc
+        """
+        # A Solis with a target SoC (FB00) has its Energy Storage Control Switch driven from here on every cycle
+        # that is not exporting. It stays on Backup/Reserve - Self-Use with the Battery Reserve bit, which makes the
+        # reserve Predbat writes (the Reserved SOC) a real discharge floor, so the existing reserve holds work.
+        # A freeze or hold (car, iBoost, hold on reserve) also turns grid charging off - Backup/Reserve - No Grid
+        # Charging - or the inverter would import to reach a reserve raised to SoC + 1, and again each cycle as it
+        # is raised. Exporting cycles drive it from adjust_export_immediate, and GS from mimic_target_soc instead.
+        if self.inv_has_target_soc and self.inv_has_solis_energy_control:
+            reason = "freeze or hold" if freeze else "charge" if target_soc > 0 else "idle"
+            self.write_solis_energy_control(17 if freeze else 49, SOLAX_SOLIS_MODES_FB00, reason, warn_missing=(target_soc > 0 and not freeze))
+
+        service_data_stop = {"device_id": self.base.get_arg("device_id", index=self.id, default="")}
+        extra_data = {"charge_start_time": self.base.get_arg("charge_start_time", index=self.id, default="00:00:00"), "charge_end_time": self.base.get_arg("charge_end_time", index=self.id, default="00:00:00")}
+        if target_soc > 0:
+            current_rate = self.get_current_charge_rate()
+            service_data = {
+                "device_id": self.base.get_arg("device_id", index=self.id, default=""),
+                "target_soc": int(target_soc),
+                "power": int(current_rate),
+            }
+
+            # Stop discharge
+            if not self.call_service_template("discharge_stop_service", service_data_stop, domain="discharge"):
+                self.call_service_template("charge_stop_service", service_data_stop, domain="discharge")
+
+            # Start charge or charge freeze
+            if freeze:
+                # An explicit freeze request must never degrade into a real charge. When no
+                # charge_freeze_service is configured, fall back to a plain charge stop: the passive
+                # hold is already established by the caller before we get here (target SoC written to
+                # the current SoC, plus pause_discharge / discharge rate 0 / reserve), so stopping is
+                # a genuine hold. Falling back to charge_start_service instead issued a fresh active
+                # charge command, which some inverters briefly ramp to full power every cycle,
+                # producing repeated short full-rate import bursts (batpred#4424/#4432).
+                if not self.call_service_template("charge_freeze_service", service_data, domain="charge", extra_data=extra_data):
+                    self.call_service_template("charge_stop_service", service_data_stop, domain="charge")
+            elif target_soc == self.soc_percent:
+                if not self.call_service_template("charge_freeze_service", service_data, domain="charge", extra_data=extra_data):
+                    self.call_service_template("charge_start_service", service_data, domain="charge", extra_data=extra_data)
+            elif not self.inv_has_target_soc and target_soc < self.soc_percent:
+                # Software-controlled charging can overshoot between updates. Hold with the
+                # configured freeze service, as at equality, instead of resuming house discharge.
+                # Without a freeze service, preserve the existing stop fallback.
+                if not self.call_service_template("charge_freeze_service", service_data, domain="charge", extra_data=extra_data):
+                    self.call_service_template("charge_stop_service", service_data_stop, domain="charge")
+            else:
+                self.call_service_template("charge_start_service", service_data, domain="charge", extra_data=extra_data)
+        else:
+            self.call_service_template("charge_stop_service", service_data_stop, domain="charge")
+
+    def adjust_export_immediate(self, target_soc, freeze=False):
+        """
+        Adjust from exporting or not exporting based on passed target soc
+        """
+        # FB00's Energy Storage Control Switch on an exporting cycle: Feed-in priority - No Grid Charging for a freeze
+        # export (PV goes to the load then the grid ahead of the battery, which still covers the load - the plugin
+        # offers no Feed-in priority with the Battery Reserve bit, so the inverter's own minimum SoC is the floor), and
+        # Backup/Reserve for a real export. The idle call (target 100) comes on the same cycle as adjust_charge_immediate,
+        # which owns it then.
+        if self.inv_has_target_soc and self.inv_has_solis_energy_control and target_soc < 100:
+            self.write_solis_energy_control(64 if freeze else 49, SOLAX_SOLIS_MODES_FB00, "freeze export" if freeze else "export")
+
+        service_data_stop = {"device_id": self.base.get_arg("device_id", index=self.id, default="")}
+        extra_data = {"discharge_start_time": self.base.get_arg("discharge_start_time", index=self.id, default="00:00:00"), "discharge_end_time": self.base.get_arg("discharge_end_time", index=self.id, default="00:00:00")}
+        if target_soc < 100:
+            # Mirrors adjust_charge_immediate()'s charge_start_service payload just above - the
+            # actual (possibly low-power-scaled) rate already set via adjust_discharge_rate(), not
+            # always the inverter's maximum, which produced a full-power discharge_start_service
+            # call even during a planned low-power export (batpred#4619).
+            service_data = {
+                "device_id": self.base.get_arg("device_id", index=self.id, default=""),
+                "target_soc": int(target_soc),
+                "power": int(self.get_current_discharge_rate()),
+            }
+
+            # Stop charge
+            self.call_service_template("charge_stop_service", service_data_stop, domain="charge")
+
+            # Start discharge or discharge freeze
+            # Only the caller's explicit freeze request should invoke discharge_freeze_service -
+            # reaching the target by ordinary export (target_soc == self.soc_percent with no
+            # freeze) is not a deliberate freeze, it just means there's nothing left to discharge,
+            # so it belongs with the "target already at/above current SoC" stop case below.
+            # Conflating the two used to fire discharge_freeze_service (and any automation wired
+            # to it) whenever export naturally reached its target, regardless of set_export_freeze
+            # (batpred#4464).
+            if freeze:
+                # As in adjust_charge_immediate(): an explicit freeze request must never degrade into
+                # a real export. Without a discharge_freeze_service configured, fall back to a plain
+                # discharge stop - combined with the charge_stop_service issued just above, that is
+                # neither charging nor force-discharging, i.e. a genuine freeze export. Falling back
+                # to discharge_start_service instead began a real timed export the caller never asked
+                # for (batpred#4424/#4432).
+                if not self.call_service_template("discharge_freeze_service", service_data, domain="discharge", extra_data=extra_data):
+                    self.call_service_template("discharge_stop_service", service_data_stop, domain="discharge")
+            elif target_soc >= self.soc_percent:
+                self.call_service_template("discharge_stop_service", service_data_stop, domain="discharge")
+            else:
+                self.call_service_template("discharge_start_service", service_data, domain="discharge", extra_data=extra_data)
+        else:
+            if not self.call_service_template("discharge_stop_service", service_data_stop, domain="discharge"):
+                self.call_service_template("charge_stop_service", service_data_stop, domain="discharge")
+
+    def adjust_charge_window(self, charge_start_time, charge_end_time, minutes_now):
+        """
+        Adjust the charging window times (start and end) in GivTCP
+
+        Inverter Class Parameters
+        =========================
+
+            Parameter                          Type          Units
+            ----------                         ----          -----
+            self.charge_enable_time            boole
+
+
+        Output Entities:
+        ================
+
+            Config arg                         Type          Units
+            ----------                         ----          -----
+            scheduled_charge_enable            bool
+            charge_start_time                  string
+            charge_end_time                    string
+            *charge_start_hour                 int
+            *charge_start_minute               int
+            *charge_end_hour                   int
+            *charge_end_minute                 int
+            *charge_discharge_update_button    button
+
+        """
+
+        if "charge_start_time" in self.base.args:
+            old_start = self.base.get_arg("charge_start_time", index=self.id)
+            old_end = self.base.get_arg("charge_end_time", index=self.id)
+            if old_start is None:
+                old_start = "00:00:00"
+            if old_end is None:
+                old_end = "00:00:00"
+            if len(old_start) == 5:
+                old_start += ":00"
+            if len(old_end) == 5:
+                old_end += ":00"
+            old_charge_schedule_enable = self.base.get_arg("scheduled_charge_enable", "on", index=self.id)
+        else:
+            self.log("Warn: Inverter {} unable read charge window as neither REST or discharge_start_time".format(self.id))
+            old_charge_schedule_enable = "off"
+
+        # Normalize old charge schedule enable
+        if old_charge_schedule_enable in ["off", "disable"]:
+            old_charge_schedule_enable = "off"
+
+        # Store the new start/end minutes using helper to handle midnight-spanning windows
+        self.charge_start_time_minutes, self.charge_end_time_minutes = compute_window_minutes(charge_start_time, charge_end_time, minutes_now)
+
+        # Apply clock skew
+        charge_start_time += timedelta(seconds=self.base.inverter_clock_skew_start * 60)
+        charge_end_time += timedelta(seconds=self.base.inverter_clock_skew_end * 60)
+
+        # Convert to string
+        new_start = charge_start_time.strftime(TIME_FORMAT_HMS)
+        new_end = charge_end_time.strftime(TIME_FORMAT_HMS)
+
+        # Disable scheduled charge during change of window to avoid a blip in charging if not required
+        have_disabled = False
+
+        # If we are in the new window no need to disable
+        if minutes_now >= self.charge_start_time_minutes and minutes_now < self.charge_end_time_minutes:
+            in_new_window = True
+        else:
+            in_new_window = False
+
+        # Some inverters have an idle time setting
+        self.adjust_idle_time(charge_start=new_start, charge_end=new_end)
+
+        # Disable charging if required to avoid a blip while the start/end entities are written
+        if not in_new_window and ((new_start != old_start) or (new_end != old_end)) and self.inv_has_charge_enable_time:
+            self.disable_charge_window(notify=False)
+            have_disabled = True
+
+        # Whether every schedule time-register write this cycle actually landed. The commit below is
+        # only recorded as done when this holds, so a failed register write followed by a successful
+        # button press is not cached as applied - later cycles would keep rewriting the registers but
+        # never press again, leaving the new window programmed but uncommitted (the same failure mode
+        # reviewed on the export side in #4711). The scheduled_charge_enable switch is excluded - see
+        # the note at its write below.
+        schedule_write_ok = True
+        # Registers this cycle's writes actually moved, for commit_needed() below
+        moved_before = self.registers_moved
+
+        if new_start != old_start or (self.inv_charge_time_format in ["H M", "H:M-H:M"]):
+            if "charge_start_time" in self.base.args:
+                # Always write to this as it is the GE default
+                entity_id_start = self.base.get_arg("charge_start_time", indirect=False, index=self.id)
+                schedule_write_ok = self.write_and_poll_option("charge_start_time", entity_id_start, new_start) and schedule_write_ok
+
+                if self.inv_charge_time_format == "H M":
+                    # If the inverter uses hours and minutes then write to these entities too
+                    schedule_write_ok = self.write_hm_time_part("charge_start_hour", new_start) and schedule_write_ok
+                    schedule_write_ok = self.write_hm_time_part("charge_start_minute", new_start) and schedule_write_ok
+                elif self.inv_charge_time_format == "H:M-H:M":
+                    # If the inverter uses hours and minutes then write to these entities too
+                    charge_time = new_start + "-" + new_end
+                    schedule_write_ok = self.write_and_poll_option("charge_time", self.base.get_arg("charge_time", indirect=False, index=self.id), charge_time) and schedule_write_ok
+            else:
+                self.log("Warn: Inverter {} unable write charge window start as neither REST or charge_start_time are set".format(self.id))
+
+        # Program end slot
+        if new_end != old_end or (self.inv_charge_time_format in ["H M", "H:M-H:M"]):
+            if "charge_end_time" in self.base.args:
+                # Always write to this as it is the GE default
+                entity_id_end = self.base.get_arg("charge_end_time", indirect=False, index=self.id)
+                schedule_write_ok = self.write_and_poll_option("charge_end_time", entity_id_end, new_end) and schedule_write_ok
+
+                if self.inv_charge_time_format == "H M":
+                    schedule_write_ok = self.write_hm_time_part("charge_end_hour", new_end) and schedule_write_ok
+                    schedule_write_ok = self.write_hm_time_part("charge_end_minute", new_end) and schedule_write_ok
+                elif self.inv_charge_time_format == "H:M-H:M":
+                    pass
+            else:
+                self.log("Warn: Inverter {} unable write charge window end as neither REST, charge_end_hour or charge_end_time are set".format(self.id))
+
+        if new_start != old_start or new_end != old_end or (self.inv_charge_time_format in ["H M", "H:M-H:M"]):
+            if self.base.set_inverter_notify:
+                self.base.call_notify(f"{self.base.prefix.capitalize()}: Inverter {self.id} Charge window change to: {new_start} - {new_end} at {self.base.time_now_str()}")
+            self.base.log("Inverter {} Updated start and end charge window to {} - {} (old {} - {})".format(self.id, new_start, new_end, old_start, old_end))
+
+        # Taken before the enable write below, which is left out for the same reason it is left out
+        # of schedule_write_ok: on this hardware it can land and then read back "off" next cycle.
+        registers_moved = self.registers_moved != moved_before
+
+        if (old_charge_schedule_enable == "off" or have_disabled) and (new_start != new_end):
+            # Enable scheduled charge if not turned on, unless the start and end are the same (disabled)
+            if "scheduled_charge_enable" in self.base.args:
+                # Deliberately not folded into schedule_write_ok. On the hardware this issue is
+                # about, the enable switch accepts the write but never reports it back, so this
+                # returns False on every cycle - gating the commit on it would re-press the button
+                # forever, which is the very bug being fixed (#4712). The button commits the time
+                # registers; those are what schedule_write_ok has to cover.
+                self.write_and_poll_switch("scheduled_charge_enable", self.base.get_arg("scheduled_charge_enable", indirect=False, index=self.id), True)
+                if not self.inv_has_charge_enable_time and (self.inv_output_charge_control == "current"):
+                    if self.inv_charge_control_immediate:
+                        self.enable_charge_discharge_with_time_current("charge", True)
+            else:
+                self.log("Warn: Inverter {} unable write charge window enable as neither REST or scheduled_charge_enable are set".format(self.id))
+
+            # Only notify if it's a real change and not a temporary one
+            if old_charge_schedule_enable == "off" and self.base.set_inverter_notify:
+                self.base.call_notify(f"{self.base.prefix.capitalize()}: Inverter {self.id} Enabling scheduled charging at {self.base.time_now_str()}")
+
+            self.charge_enable_time = True
+
+            if old_charge_schedule_enable == "off":
+                self.base.log("Inverter {} Turning on scheduled charge".format(self.id))
+
+        # Whether this window still needs committing to the inverter - see commit_needed(). The
+        # observed-state comparisons this used to rely on ((new != old) or enable read back "off")
+        # stay true forever on hardware that does not read written values back, which re-pressed the
+        # commit button every 5 minute cycle for the life of the window. On Solis each press is a
+        # non-volatile write (#2328) and also zeroes the timed current registers (#4415/#4709).
+        # The third term is the enable state being *written* (the block above enables whenever the
+        # window is a real one), not the "off" the inverter read back - that read is pinned on the
+        # very hardware this guard exists for, which is also why the enable write is kept out of
+        # schedule_write_ok above.
+        charge_schedule = (new_start, new_end, new_start != new_end)
+        schedule_changed = self.commit_needed("charge_window", charge_schedule, moved=registers_moved)
+
+        if schedule_changed:
+            # For Solis inverters and fox we also have to press the update_charge_discharge button to send the times to the inverter
+            button_committed = True
+            if self.inv_time_button_press:
+                button_committed = self.press_and_poll_button(side="charge")
+            self.record_commit("charge_window", charge_schedule, schedule_write_ok and button_committed)
+
+    def commit_needed(self, scope, commit_key, moved=False):
+        """
+        Whether `scope` still needs its update button pressed to commit `commit_key`.
+
+        The single answer to "does this state still need committing to this inverter", asked by
+        every caller that presses an update button. True when a previous attempt is still pending,
+        when the state differs from the last one that scope committed, or when `moved` says one of
+        this scope's writes this cycle changed a register.
+
+        `moved` is how divergence from outside Predbat gets committed. The key only describes
+        Predbat's intent, so if the vendor app or a firmware reset puts a register back while the
+        plan stays the same, the key alone can never ask for another press. The caller passes
+        whether registers_moved went up across its own writes, which counts only a write that found
+        a real register reading something else and then read the new value back. That is the
+        opposite of the pinned "changed" flags described below: the #2328 hardware logs "No write
+        needed" for every register, so nothing moves, and a write that never reads back never
+        counts. It is ORed in, so it can only add a press, never suppress one.
+
+        `scope` names the thing being committed ("charge_window", "export_window", "target_soc"),
+        not the button used to commit it. Several scopes share one button - the charge-side button
+        commits the charge window, the target SoC and the window disable - so keying this memory by
+        button would let a target SoC commit mask a pending window commit and vice versa.
+
+        This is deliberately the whole decision, rather than one term a caller ANDs with its own
+        "did anything move this cycle" flag. Those flags cannot be trusted on the paths that matter:
+        the H M time formats rewrite their registers unconditionally every cycle (#1529), so their
+        "changed" signal is true forever, and on hardware that never reads a written value back the
+        observed-state comparisons behind those flags are pinned true just as permanently - which is
+        the #2328/#4712 spam. A caller that has genuinely nothing to commit simply does not call.
+
+        commit_key identifies the state being committed - the charge/export window tuple, a target
+        SoC, and so on. It must describe only what is being *written*, never what was *observed*
+        beforehand: an observed value necessarily differs on the cycle after a successful commit
+        (the registers now read back the new state), which would press a second time before the key
+        settled, and on non-reading hardware would never settle at all.
+
+        Pending is checked first and wins. Suppressing a retry because the failed state happens to
+        match a previously recorded key leaves the inverter programmed but uncommitted until the
+        schedule changes again on its own, which is precisely what pending exists to prevent; a
+        redundant press on an already-committed state is the cheaper error of the two (#5126 review).
+        """
+        if self.commit_pending.get(scope) or moved:
+            return True
+        return self.last_committed.get(scope, _NOT_COMMITTED) != commit_key
+
+    def record_commit(self, scope, commit_key, committed):
+        """
+        Record the outcome of committing `commit_key` for `scope` - see commit_needed() for what a
+        scope is.
+
+        `committed` must be True only when the register writes AND the button press both succeeded.
+        Recording a commit on the button result alone caches a state whose writes failed: later
+        cycles keep rewriting the registers but never press again, leaving the inverter programmed
+        and uncommitted (#4711). A failed attempt sets pending so the next cycle retries even once
+        the registers read back as already correct, and is cleared here on success rather than only
+        inside a "did anything change" branch, where a suppressed cycle would leave it set forever.
+        """
+        self.commit_pending[scope] = not committed
+        if committed:
+            self.last_committed[scope] = commit_key
+
+    def press_and_poll_button(self, side="both", scope=None, commit_key=None, moved=False):
+        """
+        Press charge/discharge update button(s) for the inverter.
+        Priority:
+        1. charge_discharge_update_button
+        2. charge_update_button and discharge_update_button
+
+        `side` is one of "charge", "discharge" or "both" - the side that actually changed and
+        needs its update pressed. A single combined button (schedule_write_button or
+        charge_discharge_update_button) always covers both sides regardless, so `side` only
+        matters when separate charge_update_button/discharge_update_button entities are
+        configured (e.g. some Solis setups) - pressing the unrelated side's button there writes
+        an unnecessary command to the inverter (and, on hardware that counts these towards flash/
+        EEPROM wear, batpred#2328).
+
+        `scope` and `commit_key` opt this press into the shared commit-once guard: the button is
+        pressed only when commit_needed() says that scope has not already committed that exact
+        state, and the outcome is recorded. Callers that accumulate their own register-write
+        results (the charge and export window paths) call commit_needed()/record_commit() directly
+        instead, so a failed write is not recorded as a successful commit; callers with nothing
+        else to gate on pass them here and let this handle both halves, with `moved` as described
+        in commit_needed().
+        """
+        if scope is not None:
+            if not self.commit_needed(scope, commit_key, moved=moved):
+                return True
+            success = self.press_and_poll_button(side=side)
+            self.record_commit(scope, commit_key, success)
+            return success
+
+        success = True
+
+        entity_id_schedule_write_button = self.base.get_arg("schedule_write_button", indirect=False, index=self.id)
+        entity_id_charge_discharge_updated_button = self.base.get_arg("charge_discharge_update_button", indirect=False, index=self.id)
+
+        # Try single combined button first
+        if entity_id_schedule_write_button:
+            success = self._press_single_toggle_button(entity_id_schedule_write_button)
+        elif entity_id_charge_discharge_updated_button:
+            success = self._press_single_button_and_poll(entity_id_charge_discharge_updated_button)
+        else:
+            # Try separate charge and discharge buttons - only press the one(s) relevant to `side`
+            if side in ("charge", "both"):
+                charge_button = self.base.get_arg("charge_update_button", indirect=False, index=self.id)
+                if charge_button:
+                    if not self._press_single_button_and_poll(charge_button):
+                        success = False
+
+            if side in ("discharge", "both"):
+                discharge_button = self.base.get_arg("discharge_update_button", indirect=False, index=self.id)
+                if discharge_button:
+                    if not self._press_single_button_and_poll(discharge_button):
+                        success = False
+
+        return success
+
+    def _press_single_toggle_button(self, entity_id):
+        """
+        This is just a switch we can toggle to on, it will turn off again automatically.
+        """
+        result = self.base.call_service_wrapper("switch/turn_on", entity_id=entity_id)
+        state = self.base.get_state_wrapper(entity_id=entity_id)
+        if result or (isinstance(state, str) and state.lower() in ["on", "enable", "true"]) or (state is True):
+            self.log(f"Inverter {self.id} pressed toggle button {entity_id}")
+            # A commit button press is a real write to the inverter - on Solis a non-volatile one -
+            # so it must be counted like any other. It was invisible to the register-write counter,
+            # so a cycle that pressed the button could still report "count register writes 0",
+            # hiding repeated presses from users entirely (batpred#4712).
+            self.count_register_writes += 1
+            return True
+        self.base.log(f"Warn: Inverter {self.id} Trying to press toggle button {entity_id} failed")
+        self.base.record_status(f"Warn: Inverter {self.id} Trying to press toggle button {entity_id} failed", had_errors=True)
+        return False
+
+    def _press_single_button_and_poll(self, entity_id):
+        """
+        Press a button and verify that its last_updated time changes.
+        Returns True on success.
+        """
+        local_tz = pytz.timezone(self.base.get_arg("timezone", "Europe/London"))
+
+        for _retry in range(INVERTER_MAX_RETRY):
+            self.base.call_service_wrapper("button/press", entity_id=entity_id)
+            self.sleep(self.inv_write_and_poll_sleep)
+            state = self.base.get_state_wrapper(entity_id, refresh=True)
+            try:
+                time_pressed = strptime_aware(state, TIME_FORMAT_SECONDS)
+            except Exception as e:
+                self.base.log(f"Inverter {self.id} Error parsing timestamp for {entity_id}: {e}")
+                continue
+
+            now_local = datetime.now(local_tz)
+            # total_seconds(), not .seconds: .seconds is normalised into [0, 86399], so a stamp a
+            # second ahead of our clock read as ~86399s stale and a days-old one read as fresh (batpred#5694).
+            if abs((now_local - time_pressed).total_seconds()) < 10:
+                self.base.log(f"Inverter {self.id} successfully pressed button {entity_id}")
+                # Counted for the same reason as the toggle-button path above (batpred#4712).
+                self.count_register_writes += 1
+                return True
+
+        self.base.log(f"Warn: Inverter {self.id} Trying to press {entity_id} didn't complete")
+        self.base.record_status(f"Warn: Inverter {self.id} Trying to press {entity_id} didn't complete", had_errors=True)
+        return False

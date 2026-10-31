@@ -1,34 +1,26 @@
 ---
-name: Predbat
-version: 1.7.1
+name: Predbat (kamien5 fork)
+version: 1.7.1-kamien5.1
 slug: predbat
-description: Home Battery Prediction and Control
-url: https://github.com/springfall2008/predbat_addon
-codenotary: tdlj@tdlj.net
+description: Hardened fork of Predbat Home Battery Prediction and Control (Predbat v9.5.0 pinned)
+url: https://github.com/kamien5/predbat_addon
 ingress: True
 ingress_port: 5052
 ingress_root: "/"
 panel_icon: mdi:bat
-ports:
-  8199/tcp: 8199
 arch:
   - aarch64
   - amd64
-  - armv7
 init: false
 homeassistant_api: true
-hassio_api: true
-hassio_role: admin
-auth_api: true
+hassio_api: false
 map:
   - addon_config:rw
-  - homeassistant_config:rw
-  - media:rw
-  - share:rw
-  - ssl
 options:
   dummy: []
+  notify_device: ""
 schema:
   log_level: list(trace|debug|info|notice|warning|error|fatal)?
   dummy:
     - str
+  notify_device: "match(^[a-z0-9_]*$)?"
