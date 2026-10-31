@@ -1,5 +1,9 @@
 # Predbat_addon CHANGELOG
 
+## 1.7.1-kamien5.2 (kamien5 fork)
+
+- Fix Dockerfile to use pinned Ubuntu base images regardless of BUILD_FROM arg passed by Supervisor (prevents fallback to Alpine base which lacks apt-get)
+
 ## 1.7.1-kamien5.1 (kamien5 fork)
 
 - Predbat v9.5.0 vendored into the image and verified against `MANIFEST.sha256` on every start; runtime download and self-update disabled

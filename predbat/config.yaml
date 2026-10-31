@@ -1,6 +1,6 @@
 ---
 name: Predbat (kamien5 fork)
-version: 1.7.1-kamien5.1
+version: 1.7.1-kamien5.2
 slug: predbat
 description: Hardened fork of Predbat Home Battery Prediction and Control (Predbat v9.5.0 pinned)
 url: https://github.com/kamien5/predbat_addon
