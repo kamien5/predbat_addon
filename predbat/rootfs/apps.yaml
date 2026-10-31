@@ -1,5 +1,5 @@
 # apps.yaml dla Predbat v9.5.0 (tag commit 0cfceaaa719b9ce3de1d10185578feffb008908b), na bazie templates/fox.yaml.
-# Instalacja docelowa: falownik FoxESS H3 przez foxess_modbus 1.15.0 (RS485), encje BEZ prefiksu "foxess_".
+# Instalacja docelowa: falownik FoxESS przez foxess_modbus 1.15.0 (RS485), encje BEZ prefiksu "foxess_".
 # Zmiany względem szablonu oznaczone [ZMIANA]. Eksport z baterii zablokowany (usługi -> Self Use).
 pred_bat:
   module: predbat
@@ -54,15 +54,15 @@ pred_bat:
   grid_power: [sensor.siec_moc_netto]          # [ZMIANA] suma grid_ct_* (dodatni = eksport) -> bez invert
   grid_power_invert: [False]
   soc_percent: [sensor.battery_soc]
-  soc_max: [input_number.bateria_pojemnosc_kwh] # [ZMIANA] 8,7 kWh (Mira-HV25 9,83 kWh x SoH 89%); bms_kwh_remaining nie jest pojemnością
+  soc_max: [8.2]                               # [ZMIANA -prio5] literał 8,2 kWh (wcześniej helper input_number.bateria_pojemnosc_kwh = 8,7); korekta po pomiarze Force Charge
   reserve: [number.min_soc_on_grid]
   battery_min_soc: [input_number.battery_min_soc]
   battery_temperature: [sensor.battery_temp]
 
   inverter_limit: [10000]                      # [ZMIANA] moc falownika 10 kW
-  battery_rate_max: [5500]                     # [ZMIANA] 26 A x ~213 V
-  inverter_limit_charge: [10000]
-  inverter_limit_discharge: [10000]
+  battery_rate_max: [5300]                     # [ZMIANA -prio5] ok. 26 A x napięcie nominalne baterii; korekta po pomiarze Force Charge
+  inverter_limit_charge: [5100]                # [ZMIANA -prio5] foxess_modbus: Predbat nie czyta limitu z falownika; ładowanie = min(to, battery_rate_max)
+  inverter_limit_discharge: [5300]             # [ZMIANA -prio5] rozładowanie = min(to, battery_rate_max)
   inverter_clock_skew_start: 0
   inverter_clock_skew_end: 0
   inverter_clock_skew_discharge_start: 0
