@@ -28,7 +28,7 @@ CONFIG_DIR = os.environ.get("PREDBAT_CONFIG_DIR", "/config")
 
 DISABLED_MESSAGE = (
     "Predbat self-update is disabled in the kamien5 fork "
-    "(pinned v9.5.0); ignoring request"
+    "(pinned v9.6.5); ignoring request"
 )
 
 # HA ingress proxy (Supervisor) plus local loopback for health checks.

@@ -93,20 +93,18 @@ Escalate to rollback if:
 
 ### Rollback Steps
 
-#### Method 1: Restore Previous Add-on Version
+**Before updating**: In Home Assistant Supervisor, enable **"Create backup before update"** for the Predbat add-on, OR manually create a partial backup that includes the Predbat add-on.
 
-1. **Settings → Add-ons → Predbat (kamien5 fork)** → version dropdown
-2. Select previous version (e.g., `1.7.1-kamien5.2` if rolling back from .3)
-3. Restart the add-on
-4. Verify `sensor.predbat_status` returns to previous Predbat version
-5. Verify operation per post-deployment checklist
-
-#### Method 2: Restore Full Backup
+#### Primary Rollback: Restore Add-on Backup
 
 1. **Settings → System → Backups**
-2. Select backup created in pre-deployment step
-3. Restore full backup
-4. After system restart, verify `sensor.predbat_status` and operation
+2. Select the backup created immediately before the update (partial add-on backup or full backup)
+3. **Restore** the backup:
+   - For partial backup: only the Predbat add-on is restored
+   - For full backup: entire system is restored (use only as last resort if partial backup unavailable)
+4. After restore completes and system restarts:
+   - Verify `sensor.predbat_status` shows the previous Predbat version
+   - Verify operation per post-deployment checklist (Section: Post-Deployment Verification)
 
 ## Emergency Fail-safe (Non-Predbat Issues)
 
