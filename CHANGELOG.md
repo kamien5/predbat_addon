@@ -1,5 +1,12 @@
 # Predbat_addon CHANGELOG
 
+## 1.7.1-kamien5.3 (kamien5 fork)
+
+- Vendor Predbat v9.6.5 (86b01646e09bdc1594a9ffd361e5880c05fd3089)
+- Self-update remains disabled (kamien5 fork policy); `select.predbat_update` stubs unchanged
+- MANIFEST.sha256 regenerated and verified; apps.yaml hash preserved (bfb291ea...)
+- See upstream release notes v9.5.1–v9.6.5 for Predbat engine improvements (plan stability, car charging, clock-change, load spike handling, Fox logging, marginal cost sensors)
+
 ## 1.7.1-kamien5.2 (kamien5 fork)
 
 - Fix Dockerfile to use pinned Ubuntu base images regardless of BUILD_FROM arg passed by Supervisor (prevents fallback to Alpine base which lacks apt-get)
