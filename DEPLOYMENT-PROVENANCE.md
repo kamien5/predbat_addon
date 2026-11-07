@@ -43,11 +43,12 @@ Files changed: 35 files, +4492/-363 lines
 
 ### Reviewed Content Fingerprint
 ```bash
-Tree SHA: 9319125dd545747bea335e5e1a7c7ae5e278db6f
-Config version: 1.7.1-kamien5.4 (from e620ac64:predbat/config.yaml)
+Reviewed HEAD SHA: [TO BE DETERMINED by Security/QA final approval]
+Config version: 1.7.1-kamien5.4
 Vendor commit: 4cbf633355525ea62ddf8e47e647ee215b38f1ca (upstream v9.7.0)
 Vendor files: 115 (verified against MANIFEST.sha256)
 ```
+**Tree equivalence check:** Merge commit tree must equal reviewed HEAD tree (resolved externally at deployment time)
 
 ---
 
@@ -163,35 +164,39 @@ After rebase merge:
 
 **After merge, before tag:**
 ```bash
+# APPROVED_HEAD determined externally by Security/QA at deployment time
+# (not hardcoded here to avoid self-referential commit hashes)
+
 # Get merge commit SHA (will be new main HEAD)
 MERGE_SHA=$(git rev-parse main)
 
 # Get tree SHA of merge commit
 MERGE_TREE=$(git rev-parse main^{tree})
 
-# Verify equals reviewed tree
-REVIEWED_TREE="9319125dd545747bea335e5e1a7c7ae5e278db6f"
+# Get tree SHA of approved HEAD (resolved externally)
+APPROVED_TREE=$(git rev-parse ${APPROVED_HEAD}^{tree})
 
-if [ "$MERGE_TREE" = "$REVIEWED_TREE" ]; then
+if [ "$MERGE_TREE" = "$APPROVED_TREE" ]; then
   echo "✅ Tree equivalence verified"
-  echo "Merge commit $MERGE_SHA contains approved content"
+  echo "Merge commit $MERGE_SHA contains approved content from $APPROVED_HEAD"
 else
   echo "❌ TREE MISMATCH - DO NOT PROCEED"
-  echo "Expected: $REVIEWED_TREE"
-  echo "Got: $MERGE_TREE"
+  echo "Expected tree from: $APPROVED_HEAD"
+  echo "Expected tree SHA: $APPROVED_TREE"
+  echo "Merge tree SHA: $MERGE_TREE"
   exit 1
 fi
 ```
 
 **Alternative: Direct diff (proves zero changes)**
 ```bash
-git diff --stat e620ac64 main
+git diff --stat ${APPROVED_HEAD} main
 # Expected output: (empty - no differences)
 ```
 
-**If merge changed anything (impossible unless concurrent main push):**
+**If merge changed anything:**
 ```bash
-git diff e620ac64 main
+git diff ${APPROVED_HEAD} main
 # Would show unexpected changes → REJECT merge
 ```
 
@@ -272,32 +277,36 @@ echo "Tag kamien5-v4 → $TAG_SHA"
 - Tag kamien5-v4: points to merge commit
 - Tree SHA: verified identical to reviewed e620ac64
 
-### Phase 2: Deployment
+### Phase 2: Deployment Provenance Gap
 
-**Option A: Deploy from main (DEFAULT, requires timing)**
-```
-1. Immediately after merge (before any other main commits)
-2. HA: Settings → Add-ons → Predbat → Check for updates
-3. Supervisor fetches latest main (merge commit)
-4. Risk: If someone pushes to main before deployment, wrong code fetched
-```
+**CRITICAL:** No proven method to guarantee Supervisor fetches approved commit.
 
-**Option B: Deploy from tag (RECOMMENDED)**
-```
-1. HA: Settings → Add-ons → Predbat
-2. Version dropdown → Select "kamien5-v4" (if available)
-3. Install
-4. Supervisor fetches tag commit
-5. Guaranteed: Approved code only
-```
+**Known Supervisor behavior:**
+- Local build from Dockerfile (no pre-published image)
+- Fetches from repository URL at installation/update
+- Default: main branch HEAD at fetch time
+- Version dropdown: MAY offer tags/branches (not documented/guaranteed)
 
-**Option C: Deploy from commit SHA (if supported)**
-```
-Some HA versions support direct SHA selection
-Check if version dropdown shows commit SHAs
-```
+**Deployment options and risks:**
 
-### Phase 3: Deployment Verification (LIVE EVIDENCE REQUIRED)
+**Option A: Deploy immediately after merge**
+- Timing-dependent: Must deploy before any other main push
+- Risk: Race condition if concurrent work
+- No cryptographic guarantee
+
+**Option B: Tag-based deployment**
+- Requires version dropdown shows tag (unverified assumption)
+- **Forbidden:** Deploy → hope dropdown appears → retroactively select tag
+- Must verify dropdown shows tag BEFORE initiating deployment
+
+**Option C: Wait for proven prebuild pin method**
+- Investigate: Supervisor support for exact commit SHA selection
+- OR: Pre-published image with attestation
+- OR: Documented tag precedence over branch
+
+**If no proven prebuild pin exists:** Deployment provenance unresolved. Fresh backup mandatory before any attempt; restoration mechanism required before proceeding.
+
+### Phase 3: Post-Deployment Evidence Collection (BEST EFFORT)
 
 **Immediately after installation:**
 ```bash
@@ -311,23 +320,22 @@ docker inspect addon_fc83ef65_predbat | jq '.[].Config.Labels'
 # Should show: Version 1.7.1-kamien5.4
 ```
 
-**Live evidence to collect:**
-1. **Screenshot:** Add-on info page showing version and source
-2. **Log excerpt:** Supervisor build log with fetched commit SHA
-3. **Container label:** `docker inspect` output with revision label
-4. **Verification:** `sensor.predbat_status` = 9.7.0 (engine version)
+**Post-deployment evidence (best effort, no guarantee of source SHA):**
+1. **Add-on info:** Version string `1.7.1-kamien5.4`
+2. **Engine version:** `sensor.predbat_status` version attribute = `9.7.0`
+3. **Vendor integrity:** Inside container (if shell available):
+   ```bash
+   sha256sum -c /opt/predbat/MANIFEST.sha256  # 115 files OK
+   cat /opt/predbat/VENDOR.txt                # commit 4cbf633...
+   ```
+4. **Container labels:** `docker inspect addon_fc83ef65_predbat` (may lack source SHA)
 
-**Post-deployment proof of source:**
-```bash
-# Inside add-on container (if accessible via shell)
-cat /opt/predbat/VENDOR.txt
-# Should show:
-# commit: 4cbf633355525ea62ddf8e47e647ee215b38f1ca
-# tag: v9.7.0
+**None of these prove which repository commit Supervisor fetched.** They verify:
+- Engine version matches expected v9.7.0
+- Vendor files match upstream MANIFEST
+- Addon version string matches config.yaml
 
-sha256sum -c /opt/predbat/MANIFEST.sha256
-# Should show: 115 files OK
-```
+**Missing:** Git commit SHA of sources Supervisor built from. No documented Supervisor API endpoint exposes this. Without proven prebuild pin OR post-build source SHA evidence, deployment provenance gap remains unresolved.
 
 ---
 

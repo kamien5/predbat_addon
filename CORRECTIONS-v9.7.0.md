@@ -2,8 +2,8 @@
 
 **Date:** 2026-11-07  
 **PR:** #5 https://github.com/kamien5/predbat_addon/pull/5  
-**HEAD SHA:** `3609e842137ea1ad84e87cd5e5fdac479fd53ce5` (full 40 chars)  
-**Status:** Documentation corrections before review/deploy
+**HEAD SHA:** Determined externally by Security/QA at deployment time  
+**Status:** Active guidance for deployment preparation
 
 ---
 
@@ -307,13 +307,15 @@ docker buildx build \
 **Step 8: Rollback if needed**
 - Settings → System → Backups → Restore
 
-### ✅ CORRECTED HEAD SHA
+### ✅ HEAD SHA Determination
 
-**Current PR head:** `3609e842137ea1ad84e87cd5e5fdac479fd53ce5` (full 40 chars)
+**PR HEAD:** Resolved externally by Security/QA at deployment approval time (not hardcoded in self-referential docs)
 
-**After merge:** HEAD SHA will change (merge commit on main)
+**After merge:** Main HEAD becomes merge commit SHA
 
-**After tag:** Tag `kamien5-v4` will point to merge commit SHA
+**After tag:** Tag `kamien5-v4` points to merge commit SHA
+
+**Tree equivalence:** Merge commit tree must equal approved PR HEAD tree
 
 ---
 
@@ -349,23 +351,24 @@ docker buildx build \
 - No new service calls
 - No new entity writes
 
-### ✅ ANSWER: NO NEW ALLOWLIST HASHES REQUIRED
+### ✅ ANSWER: NEW APPROVAL MECHANISM REQUIRED (W32/W33 CONSUMED)
 
 **Reasoning:**
-1. apps.yaml service calls unchanged
-2. No new write operations introduced
-3. billing.py only publishes sensors (HA dashboard items, not service calls)
-4. Existing allowlist sufficient
+1. apps.yaml service calls unchanged (same entities/payloads)
+2. W32/W33 allowlist entries consumed (one-shot, cannot be reactivated)
+3. Fresh approval identity required preserving consumed ledger
 
-**If allowlist was previously scoped by payload:**
-- `select.select_option` payloads (entity_id, option values) unchanged
-- `script.turn_on` target unchanged (script.bateria_force_charge)
-- No new entities written
+**What's needed:**
+- Separate deployment approval mechanism (NOT simple allowlist reuse)
+- Options:
+  - User manual confirmation before Supervisor rebuild
+  - Fresh one-shot approval with new scope identifier
+  - Pre-deployment verification script with explicit go/no-go
 
-**Recommendation:**
-- Deploy without allowlist changes
-- Monitor logs for any "hass_ws call rejected" errors (none expected)
-- If errors appear: they indicate pre-existing misconfiguration, not v9.7.0 requirement
+**NOT sufficient:**
+- Claiming "existing allowlists carry over" (W32/W33 permanently consumed)
+- Adding same payloads with new labels (canonical digest remains consumed)
+- Clearing/resetting consumed ledger (destroys audit trail)
 
 ---
 

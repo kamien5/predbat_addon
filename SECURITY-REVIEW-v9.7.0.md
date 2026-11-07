@@ -56,20 +56,22 @@
 ```
 MCP server nie startuje, port nie jest otwarty.
 
-#### Layer 2: MCP endpoints **BLOCKED** w launch.py
+#### Layer 2: Source-IP middleware w launch.py
 ```python
 # predbat/rootfs/opt/predbat/launch.py (kamien5 hardening)
-BLOCKED_PATHS = [
-    "/config",          # MCP: write config
-    "/plan/override",   # MCP: set plan override
-    "/oauth/",          # MCP: całe OAuth (register, authorize, token)
-    "/mcp/",            # MCP: tools/call, list
-    # ... inne admin endpoints
-]
-# Access policy: 403 dla wszystkich remote, nawet ingress/loopback
+ALLOWED_REMOTES = {"172.30.32.2", "127.0.0.1", "::1"}  # Supervisor ingress only
+
+# aiohttp middleware checks request.remote dla każdego /api/* request
+# Blokuje external IPs (403) before reaching any endpoint handler
+# Chroni ALL /api/* paths, nie tylko MCP
 ```
 
-Wszystkie MCP endpoints zwracają 403 **przed** osiągnięciem vendor kodu.
+**NIE jest to unconditional path blacklist.** Ochrona MCP to:
+- Default OFF (`mcp_enable: false` w apps.yaml, vendor default)
+- Fail-closed startup check (odmowa jeśli `mcp_enable` w zabronionych opcjach)
+- Source-IP middleware (tylko dozwolone Supervisor ingress IPs)
+
+MCP endpoints physically exist w vendor `web.py`, ale nie są osiągalne przez external IPs.
 
 #### Layer 3: Test coverage `test_web_hardening.py`
 ```python
