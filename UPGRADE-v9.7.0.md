@@ -66,17 +66,18 @@ Wszystkie testy bezpieczeństwa i vendor integrity przeszły.
 ### apps.yaml — BEZ ZMIAN
 
 Konfiguracja niezmieniona:
-- `battery_min_soc: [input_number.battery_min_soc]` — min SoC 11% przez guardian HA
-- `inverter_limit_charge: [5100]` — limit ładowania 5.1 kW
-- `battery_rate_max: [5300]` — max baterii 5.3 kW
-- `charge_start_service: script.bateria_force_charge` — guardian FC+PV 0.5kW
+- `battery_min_soc: [input_number.battery_min_soc]` — references HA helper (value set externally)
+- `inverter_limit_charge: [5100]` — MEASURED operational limit (5.1 kW)
+- `battery_rate_max: [5300]` — MEASURED battery/BMS maximum (5.3 kW)
+- `charge_start_service: script.bateria_force_charge` — EXTERNAL guardian, FC+PV logic
 - Wszystkie discharge services → "Self Use" (eksport zablokowany)
 
-**UWAGA DEPLOYMENT:** Obecna konfiguracja ma `inverter_limit_charge: [5100]` (5.1 kW).
-Według komentarza w apps.yaml, to "foxess_modbus: Predbat nie czyta limitu z falownika".
-Jeśli chcesz zwiększyć ten limit, zmień apps.yaml PRZED deploymentem i przelicz SHA256.
+**UWAGA:** Wartości `inverter_limit_charge: [5100]` i `battery_rate_max: [5300]` są
+ZMIERZONE ("korekta po pomiarze Force Charge"), nie są arbitralnymi software caps.
+Reprezentują rzeczywiste ograniczenia hardware/BMS.
 
-Guardian HA nadal egzekwuje limity przyłącza (15kW/25A per faza).
+**EXTERNAL guardian** (nie w repo): egzekwuje limity przyłącza/fazy (15kW, 25A per phase)
+przez throttling charge_rate_request. Nie weryfikowalne z repo.
 
 ## Ocena ryzyka
 
@@ -87,16 +88,22 @@ Guardian HA nadal egzekwuje limity przyłącza (15kW/25A per faza).
 - Zmiany w execute.py, sunsynk.py, gecloud.py **nie dotyczą FoxESS**
 - Usprawnienia plan.py i solcast.py **ogólne** — poprawa jakości planów
 
-### 🟡 Do obserwacji
+### 🟡 Do obserwacji (EXTERNAL behaviors, not repo-verifiable)
 
-1. **Zmienione zachowanie eksportów** — `export_gate_metric` (#5977)
-   - Monitoruj: czy Predbat nadal nie próbuje eksportować (wszystkie discharge services = Self Use)
+1. **Export gate behavior** — `export_gate_metric` (#5977)
+   - Monitoruj: czy Predbat nadal nie próbuje eksportować (discharge services = Self Use)
+   - EXTERNAL guardian enforcement: not verifiable from repo
    
-2. **Calibrated P10/P90** — Solcast/Forecast.Solar (#5974)
+2. **FC+PV guardian** (EXTERNAL: script.bateria_force_charge)
+   - OUTSIDE charge windows: FC exits when PV > 0.5kW + cost ≥ 0
+   - DURING Predbat charge windows: FC stays regardless of PV
+   - User policy, not repo code
+   
+3. **Calibrated P10/P90** — Solcast/Forecast.Solar (#5974)
    - Monitoruj: scenariusze pesymistyczne/optymistyczne w pierwszych 24h
 
-3. **Billing entity** — nowa encja `sensor.predbat_billing`
-   - Powinna pozostać nieaktywna (brak upstream API)
+4. **Billing entity** — nowa encja `sensor.predbat_billing`
+   - Powinna pozostać nieaktywna (brak config Octopus/Kraken)
 
 ## Weryfikacja po deployment
 
@@ -113,9 +120,11 @@ Guardian HA nadal egzekwuje limity przyłącza (15kW/25A per faza).
 
 ### Obserwacja (2-4h)
 
-1. Przejścia `work_mode` zgodne z planem + guardian
-2. SoC nie spada < 11% on-grid bez uzasadnienia
-3. FC nie utrzymuje się podczas PV > 0.5 kW z kosztem ≥ 0
+1. Przejścia `work_mode` zgodne z planem + guardian (EXTERNAL)
+2. SoC behavior (policy target, monitored externally)
+3. FC+PV guardian (EXTERNAL):
+   - OUTSIDE charge windows: FC exits when PV > 0.5 kW + cost ≥ 0
+   - DURING charge windows: FC maintained regardless of PV
 4. Import z sieci podczas tanich okien G13 zgodny z planem
 5. Brak flood w logu (Fox warnings, download attempts)
 6. `sensor.predbat_billing` nieaktywny (brak danych)

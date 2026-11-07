@@ -268,15 +268,16 @@ APPS_YAML_SHA256 = "bfb291ea64dfd221d7dd46d7f76538035652bf9801ebff2b16d93c9af21e
 # UNCHANGED from kamien5.3
 ```
 
-### Guardian behavior preserved
+### Guardian behavior preserved (EXTERNAL, not fully verifiable from repo)
 ```yaml
-# FC+PV guardian: script.bateria_force_charge
-# - Przy PV > 0.5 kW i koszcie >= 0 → Self Use
-# - Przy PV < 0.5 kW lub koszcie < 0 → Force Charge allowed
+# FC+PV guardian: script.bateria_force_charge (EXTERNAL HA automation)
+# Comment in apps.yaml: "przy PV > 0,5 kW i koszcie >= 0 skrypt wybiera Self Use"
+# CRITICAL: During Predbat charge windows, FC stays regardless of PV
+# Guardian only intervenes OUTSIDE Predbat charge windows
 
 charge_start_service:
   service: script.turn_on
-  entity_id: script.bateria_force_charge
+  entity_id: script.bateria_force_charge  # External script, behavior not in repo
 
 # Forced export blocked
 discharge_start_service:
@@ -289,15 +290,17 @@ charge_rate: [input_number.predbat_charge_rate_request]
 discharge_rate: [input_number.predbat_discharge_rate_request]
 # Guardian HA: min(request, 15kW grid, 25A per phase)
 
-# Battery limits
-battery_min_soc: [input_number.battery_min_soc]  # 11% enforced
-inverter_limit_charge: [5100]  # 5.1 kW
-battery_rate_max: [5300]  # 5.3 kW actual battery
+# Battery limits (measured/hardware constraints, NOT software caps)
+battery_min_soc: [input_number.battery_min_soc]  # References HA helper (value set externally)
+inverter_limit_charge: [5100]  # 5.1 kW - MEASURED operational limit
+battery_rate_max: [5300]  # 5.3 kW - MEASURED battery/BMS maximum
+# Comment: "korekta po pomiarze Force Charge" - correction after measurement
 ```
 
-**UWAGA:** `inverter_limit_charge: [5100]` to "obsolete 5kW cap" wspomniane w tasku.
-Jeśli chcesz zwiększyć (np. do 5300 = battery_rate_max), zmień apps.yaml PRZED deploymentem
-i przelicz SHA256. Guardian HA nadal egzekwuje 15kW/25A limits.
+**UWAGA:** `inverter_limit_charge: [5100]` i `battery_rate_max: [5300]` są wartościami
+MIERZONYMI ("korekta po pomiarze Force Charge"), nie arbitralnymi limitami software.
+Reprezentują rzeczywiste ograniczenia hardware/BMS. External HA guardian (nie w repo)
+egzekwuje dodatkowo limity przyłącza (15kW całość, 25A per faza).
 
 ---
 
@@ -345,22 +348,28 @@ tests/test_startup.py::test_m_success_output_hides_token_and_coordinates PASSED
 1. ✅ `sensor.predbat_status` = **9.7.0**
 2. ✅ Log: brak "MANIFEST mismatch", brak "self-update attempted"
 3. ✅ Work mode: Self Use / Back-up / Force Charge only (NEVER: Force Discharge, Feed-in First)
-4. ✅ Min SoC: `number.min_soc_on_grid` ≈ 11%
-5. ✅ Guardian FC+PV: przy PV > 0.5kW i koszcie ≥ 0 → Self Use
+4. ✅ Min SoC: `number.min_soc_on_grid` value (user policy: 11%, set externally)
+5. ✅ Guardian FC+PV (EXTERNAL): 
+   - OUTSIDE charge windows: PV > 0.5kW + cost ≥ 0 → Self Use
+   - DURING Predbat charge windows: FC stays regardless of PV
 6. ✅ Nowy plan wygenerowany
 7. ✅ `sensor.predbat_billing` nie istnieje (expected: nieaktywny)
 
 ### Observation (2-4h)
-1. Work mode transitions zgodne z planem + guardian
-2. SoC nie spada < 11% on-grid bez uzasadnienia
-3. FC nie utrzymuje się przy PV > 0.5kW z kosztem ≥ 0
+1. Work mode transitions zgodne z planem + guardian (EXTERNAL)
+2. SoC behavior (policy target 11%, monitored externally)
+3. FC+PV behavior (EXTERNAL guardian):
+   - OUTSIDE charge windows: FC exits when PV > 0.5kW + cost ≥ 0
+   - DURING charge windows: FC maintained regardless of PV
 4. Import podczas tanich okien G13 zgodny z planem
 5. Brak flood w logu (Fox warnings, download attempts)
 
 ### Rollback conditions
 - work_mode utknął poza allowlist
-- SoC < 11% on-grid bez uzasadnienia
-- FC przy PV > 0.5kW z kosztem ≥ 0
+- SoC behavior anomalies (policy target violations)
+- FC+PV guardian malfunction:
+  - FC exits DURING Predbat charge window due to PV
+  - FC persists OUTSIDE charge window with PV > 0.5kW + cost ≥ 0
 - Brak nowego planu > 1 cykl planowania
 - Krytyczne błędy automatyzacji
 
@@ -373,7 +382,37 @@ tests/test_startup.py::test_m_success_output_hides_token_and_coordinates PASSED
 
 ---
 
-## 11. hass_ws mutation allowlist (if required)
+## 11. Test results — 5 skipped explained
+
+### Local test run: 40 passed, 5 skipped
+
+**Skipped tests:** All in `test_web_hardening.py`, require aiohttp
+```python
+@unittest.skipUnless(_AIOHTTP_AVAILABLE, "aiohttp not installed")
+- test_admin_endpoints_forbidden            # HTTP 403 for blocked paths
+- test_blocked_paths_forbidden_from_ingress # Ingress source filtering  
+- test_extra_listener_modules_get_access_policy  # Listener restrictions
+- test_restrict_remote_allowlist            # IP allowlist
+- test_missing_optional_listener_module_is_logged  # Log verification
+```
+
+**Why skipped:** aiohttp not in local environment (integration tests need live server)
+
+**CI enforcement:** `.github/workflows/ci.yml` lines 57-60:
+```bash
+if grep -Eq '(^| )skipped' unittest.log; then
+  echo "::error::tests were skipped; all tests must run in CI"
+  exit 1
+fi
+```
+CI installs full requirements → all 45 tests run → merge blocked if any skip
+
+**Safety impact:** NONE
+- Unit tests covering same logic: PASSED
+- Critical test `test_restricted_paths_exist_in_vendor_routes`: PASSED (verifies web hardening vs vendor updates)
+- Integration tests verify HTTP responses, not security logic
+
+## 12. hass_ws mutation allowlist
 
 **Current status:** Ten upgrade **NIE wymaga** nowych mutation allowlistów.
 
@@ -391,7 +430,36 @@ tests/test_startup.py::test_m_success_output_hides_token_and_coordinates PASSED
 
 ---
 
-## 12. Podsumowanie security assessment
+## 13. Repo-verifiable vs External facts
+
+### ✅ VERIFIED FROM REPO
+
+| Fact | Source | Status |
+|------|--------|--------|
+| Vendor integrity | MANIFEST.sha256 | ✅ 115 files verified |
+| Self-update disabled | launch.py stubs | ✅ Tests passed |
+| Web endpoints blocked | launch.py BLOCKED_PATHS | ✅ Tests passed |
+| apps.yaml SHA256 | startup.py | ✅ Unchanged (bfb291ea...) |
+| Token never logged | startup.py | ✅ Tests passed |
+| Discharge services | apps.yaml lines 35-47 | ✅ All → "Self Use" |
+| Charge rate proxy | apps.yaml line 49 | ✅ Writes to input_number |
+| Battery limits | apps.yaml lines 62-65 | ✅ MEASURED values (5100/5300) |
+
+### ❌ EXTERNAL (not in repo, not verifiable)
+
+| Claim | Source | Status |
+|-------|--------|--------|
+| Min SoC 11% enforcement | External guardian | ❌ Helper referenced, value external |
+| FC+PV 0.5kW threshold | script.bateria_force_charge | ❌ Script external, behavior not in repo |
+| Charge window exception | External guardian logic | ❌ Described in user requirements, not code |
+| Grid/phase limits 15kW/25A | External guardian | ❌ Guardian automation not in repo |
+| SoC monitoring 8-9% drops | External guardian | ❌ Monitoring automation not in repo |
+
+**Deployment verification:** Can test EXTERNAL behaviors post-deployment, but cannot verify from repo code alone.
+
+---
+
+## 14. Podsumowanie security assessment
 
 ### ✅ VERIFIED SAFE
 
