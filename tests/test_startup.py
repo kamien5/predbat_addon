@@ -37,7 +37,7 @@ LAUNCH_SRC = os.path.join(
     REPO_ROOT, "predbat", "rootfs", "opt", "predbat", "launch.py"
 )
 
-EXPECTED_FILE_COUNT = 114
+EXPECTED_FILE_COUNT = 115
 APPS_YAML_SHA256 = (
     "bfb291ea64dfd221d7dd46d7f76538035652bf9801ebff2b16d93c9af21e4d6e"
 )
