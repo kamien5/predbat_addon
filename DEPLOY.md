@@ -59,8 +59,9 @@ After add-on restart, verify within 15–30 minutes:
    - During planned Freeze: work_mode **Back-up** as configured
    - After Freeze window: returns to Self Use and allows discharge
 5. **Force Charge + PV guardian**:
-   - When PV > 0.5 kW and cost ≥ 0: guardian switches to **Self Use** (not leaving Force Charge during solar)
-   - Guardian allows FC with PV only when cost is **negative** (intentional)
+   - **OUTSIDE Predbat charge windows**: When PV > 0.5 kW and cost ≥ 0, guardian switches to **Self Use**
+   - **DURING Predbat charge windows**: Force Charge stays regardless of PV level
+   - Guardian allows FC with PV when cost is **negative** (intentional)
 6. **No forced export**: Predbat must not set discharge/export modes (services discharge_* = Self Use)
 7. **Log health**:
    - No MANIFEST hash mismatch errors (kamien5)
@@ -87,7 +88,8 @@ Monitor:
 Escalate to rollback if:
 - `work_mode` persistently outside allowlist (e.g., stuck in Force Discharge)
 - SoC drops < 11% while on-grid without plan justification
-- Force Charge persists during PV > 0.5 kW with cost ≥ 0
+- Force Charge persists OUTSIDE charge windows during PV > 0.5 kW with cost ≥ 0
+- Force Charge exits DURING Predbat charge window due to PV (incorrect - should stay)
 - No new plan generated for > 1 planning cycle
 - Critical automation failures tied to changed sensor behavior
 
@@ -132,7 +134,7 @@ If issues arise outside Predbat control (inverter, network, etc.):
 
 - **Minimum SoC on grid**: 11% (policy, enforced by guardian fail-safe)
 - **Self-update**: Disabled (vendored Predbat version pinned in add-on image)
-- **Force Charge guardian**: At PV > 0.5 kW and cost ≥ 0, switches to Self Use
+- **Force Charge guardian**: OUTSIDE charge windows, at PV > 0.5 kW and cost ≥ 0, switches to Self Use; DURING Predbat charge windows, FC stays regardless of PV
 - **Export blocking**: All discharge services set to Self Use (no forced export from battery)
 
 ## Tag Management

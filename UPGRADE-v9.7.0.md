@@ -114,7 +114,9 @@ przez throttling charge_rate_request. Nie weryfikowalne z repo.
 3. **Web endpoints**: UI dostępny przez ingress, admin endpoints blocked
 4. **Work mode**: dozwolone tylko Self Use, Back-up, Force Charge
 5. **Min SoC**: `number.min_soc_on_grid` ≈ 11%
-6. **Guardian FC+PV**: przy PV > 0.5 kW i koszcie ≥ 0 → Self Use
+6. **Guardian FC+PV** (EXTERNAL):
+   - POZA oknami ładowania: przy PV > 0.5 kW i koszcie ≥ 0 → Self Use
+   - W TRAKCIE okien ładowania Predbat: FC utrzymywany niezależnie od PV
 7. **Eksport**: Predbat NIE wywołuje Force Discharge / Feed-in First
 8. **Plan**: nowy plan wygenerowany w ciągu 30 min
 
