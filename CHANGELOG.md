@@ -1,5 +1,15 @@
 # Predbat_addon CHANGELOG
 
+## 1.7.1-kamien5.4 (kamien5 fork)
+
+- Vendor Predbat v9.7.0 (4cbf633355525ea62ddf8e47e647ee215b38f1ca, 25 commits from v9.6.5)
+- Upstream MCP OAuth security hardening (#5847, #5992) — not applicable (MCP disabled, endpoints blocked)
+- New billing.py module (Octopus/Kraken billing API) — inactive in this installation
+- Upstream improvements: plan export gate (#5977), Solcast P10/P90 calibration (#5974), execute Control SOC (#6001), Sunsynk BMS battery size (#6007), GE Cloud optimization (#6005)
+- All security tests passing; kamien5 hardening preserved
+- apps.yaml configuration unchanged (guardian FC+PV 0.5kW, min SoC 11%, no forced export)
+- See UPGRADE-v9.7.0.md for detailed review and deployment plan
+
 ## 1.7.1-kamien5.3 (kamien5 fork)
 
 - Vendor Predbat v9.6.5 (86b01646e09bdc1594a9ffd361e5880c05fd3089)
