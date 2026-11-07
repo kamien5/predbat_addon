@@ -139,9 +139,9 @@ If issues arise outside Predbat control (inverter, network, etc.):
 
 ## Tag Management
 
-- Production tag (e.g., `kamien5-v2`) remains on last stable release until new version is validated
-- Do NOT delete or move production tags (e.g., `kamien5-v2` stays; `kamien5-v3` created later by human on merge commit after validation)
-- Development versions (e.g., `1.7.1-kamien5.3`) are released for testing but tag movement occurs only after human approval
+- Production tags mark validated releases (current: `kamien5-v3` on commit 0e1d3f02)
+- Do NOT delete or move production tags (e.g., `kamien5-v3` stays; next `kamien5-v4` will be created after v9.7.0 validation)
+- Development versions (e.g., `1.7.1-kamien5.4`) are prepared in PRs; tags created only after human approval and merge
 
 ## Security Notes
 

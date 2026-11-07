@@ -137,7 +137,8 @@ przez throttling charge_rate_request. Nie weryfikowalne z repo.
 
 - `work_mode` utknął poza allowlist
 - SoC < 11% on-grid bez uzasadnienia
-- FC utrzymuje się podczas PV > 0.5 kW z kosztem ≥ 0
+- FC utrzymuje się POZA oknami ładowania Predbat podczas PV > 0.5 kW z kosztem ≥ 0
+- FC wyłącza się W TRAKCIE okna ładowania Predbat z powodu PV (błąd - powinien zostać)
 - Brak nowego planu > 1 cykl planowania
 - Krytyczne błędy automatyzacji
 

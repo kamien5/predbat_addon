@@ -426,7 +426,7 @@ CI installs full requirements → all 45 tests run → merge blocked if any skip
 - **Brak nowych service calls** — używa existing entities
 - **Brak nowych write operations** — tylko read/compute
 
-**Wnioski:** Existing allowlisty są sufficient. Deployment nie wymaga rozszerzenia hass_ws permissions.
+**Wnioski:** Service calls i entities niezmienione. Coordinator must verify allowlist status and approve fresh one-shot mutations (W32/W33 consumed, reuse impossible even for identical payloads).
 
 ---
 
@@ -495,24 +495,27 @@ CI installs full requirements → all 45 tests run → merge blocked if any skip
 
 ## Wnioski
 
-**RECOMMENDATION: ✅ APPROVE FOR DEPLOYMENT**
+**RECOMMENDATION: HOLD — Requires Evidence Before Deployment**
 
-1. Vendor upgrade **safe** — wszystkie security protections preserved
+1. Vendor upgrade **code-verified** — wszystkie security protections preserved in repo
 2. Upstream fixes **not applicable** lub **inactive** w tej instalacji
-3. Tests **passing** — 40/40 security tests OK
-4. Guardian behavior **unchanged** — FC+PV 0.5kW, min SoC 11%, no forced export
-5. Rollback plan **ready** — HA backup + procedura
+3. Tests **passing** — 40/45 in local environment (5 skipped), CI must run all 45
+4. Guardian behavior **not repo-verifiable** — external HA automations, requires live evidence
+5. **CRITICAL FINDINGS** (from live trace 2026-11-07 08:05 CET):
+   - 5kW cap EXISTS in external HA (`force_charge_power 5.0kW`, `min(..., 5.0)`)
+   - FC+PV charge window exception CONFIRMED in automation traces
+   - Existing backup: protected (encrypted), 2026-11-05, addon size 0.0 (metadata only)
 
-**Next steps:**
-1. Code review tego PR
-2. Merge do main
-3. Wait for GitHub Actions build
-4. Deployment zgodnie z UPGRADE-v9.7.0.md
-5. Obserwacja 2-4h post-deployment
+**Required before deployment:**
+1. Fresh UNENCRYPTED backup (user standing instruction: no encryption key)
+2. NEW one-shot mutation approval (W32/W33 consumed, identical hashes cannot reactivate)
+3. External HA guardian evidence documented (provided, confirms policy)
+4. 5kW external cap remediation scoped separately (NOT in vendor upgrade)
+5. CI completion: all 45 tests pass, both arches build
+6. Tree equivalence verification: reviewed HEAD → merge commit
 
 ---
 
 **Prepared by:** Cursor Agent  
 **Date:** 2026-11-07  
-**Reviewer:** (pending)  
-**Approved for deployment:** (pending)
+**Status:** HOLD — awaiting evidence and coordinator approvals
