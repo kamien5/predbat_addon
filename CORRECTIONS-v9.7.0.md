@@ -16,11 +16,11 @@
 - **External HA config**: Guardian automations enforce limits (external to this repository)
 - **Status**: HA 5kW cap removal patch under separate development (not part of this PR)
 
-**Hardware Limits** (5.1kW charge, 5.3kW max observed):
-- **Source**: Live telemetry measurements, **NOT** addon configuration
-- **Distinction**: Measured vs. configured vs. software-capped
-- **Addon scope**: Predbat engine does not enforce these limits directly
-- **Guardian scope**: HA-side enforcement (external config, unverifiable from repo alone)
+**Observed Hardware Behavior**:
+- Live measurements show ~5.1-5.5kW charging observed (hardware/BMS dependent)
+- **NOT** proven from repository configuration or addon code
+- Addon repository contains Predbat engine only
+- Actual hardware limits enforced by inverter/BMS at runtime
 
 ### ✅ FC PV Threshold Exception
 

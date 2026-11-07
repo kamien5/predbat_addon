@@ -1,9 +1,9 @@
 # Predbat v9.7.0 Deployment and Upgrade
 
-**Current HEAD**: `e0b12aa41f8a3060fa07823031a653144c43e6fd`  
 **Branch**: `cursor/vendor-predbat-v9.7.0-2ba3`  
 **PR**: [#5](https://github.com/kamien5/predbat_addon/pull/5)  
-**Status**: BLOCKED - awaiting reviews and source pin solution
+**Status**: BLOCKED - awaiting reviews and source pin solution  
+**CI**: Unit tests 45/45 pass, amd64 build green, aarch64 pending
 
 ---
 
