@@ -30,6 +30,11 @@ to tell "a source is configured but has not answered yet" - transient, retry nex
 apart from "no source is configured at all", which is a setup gap that will never resolve.
 Before the tag existed that question was asked as "givtcp_rest or ge_cloud_direct", which
 was simply the two sources that happened to have been wired up when the check was written.
+
+Set "align_minute": True on an entry whose run() acts on minute-resolution schedule edges, so its
+loop runs just after each wall-clock minute boundary instead of every 60 seconds from process start
+(see ComponentBase.start()). Leave it off otherwise: the free-running loops spread components across
+the minute, where aligning them all would put every API call and its processing in the same second.
 """
 
 import importlib
@@ -39,6 +44,7 @@ import asyncio
 import os
 
 from coordinator import Coordinator
+from const import MCP_DEFAULT_SECRET
 
 
 def serves_inverter(component):
@@ -104,7 +110,7 @@ COMPONENT_LIST = {
         "name": "MCP Server",
         "args": {
             "mcp_enable": {"required": True, "config": "mcp_enable", "default": False},
-            "mcp_secret": {"required": False, "secret": True, "config": "mcp_secret", "default": "predbat_mcp_secret"},
+            "mcp_secret": {"required": False, "secret": True, "config": "mcp_secret", "default": MCP_DEFAULT_SECRET},
             "mcp_port": {"required": False, "config": "mcp_port", "default": 8199},
         },
         "phase": 1,
@@ -189,6 +195,11 @@ COMPONENT_LIST = {
                 "required": False,
                 "default": True,
                 "config": "ge_cloud_inverter_control",
+            },
+            "poll_settings": {
+                "required": False,
+                "default": False,
+                "config": "ge_cloud_poll_settings",
             },
         },
         # ge_cloud_direct monitors the inverter (and EV charger), ge_cloud_evc_direct the EV charger alone
@@ -534,6 +545,10 @@ COMPONENT_LIST = {
             "inverter_limit": {"required": False, "config": "hanchu_inverter_limit"},
             "api_delay": {"required": False, "default": 1.0, "config": "hanchu_api_delay"},
             "min_write_interval": {"required": False, "default": 60, "config": "hanchu_min_write_interval"},
+            # Seconds a press of the write button waits for Predbat to finish committing a change
+            # before the schedule is sent, so a half-applied schedule never reaches the inverter
+            # (batpred#6074). 0 writes on every press, as before.
+            "write_debounce": {"required": False, "default": 10.0, "config": "hanchu_write_debounce"},
             # Logs every API request and response. Off by default: on, it writes thousands of long
             # lines a day per device. For a tester proving what hanchu_const.py marks INFERRED.
             "api_debug": {"required": False, "default": True, "config": "hanchu_api_debug"},
@@ -541,6 +556,35 @@ COMPONENT_LIST = {
         # Gate activation on having an account. Without this the component would start for every
         # instance, since all individual args are optional.
         "required_or": ["account"],
+        "phase": 1,
+        "can_restart": True,
+    },
+    "growatt": {
+        "class": "growatt.GrowattAPI",
+        "name": "Growatt OpenAPI",
+        "inverter": True,
+        "event_filter": "predbat_growatt_",
+        "args": {
+            # Predbat.com injects the OAuth access token into growatt_key. The refresh token
+            # remains server-side and OAuthMixin asks the oauth-refresh edge function for a
+            # replacement when this token is close to expiry.
+            "key": {"required": False, "secret": True, "config": "growatt_key"},
+            "auth_method": {"required": False, "default": "oauth", "config": "growatt_auth_method"},
+            "token_expires_at": {"required": False, "config": "growatt_token_expires_at"},
+            "token_hash": {"required": False, "secret": True, "config": "growatt_token_hash"},
+            "inverter_sn": {"required": False, "config": "growatt_inverter_sn"},
+            "automatic": {"required": False, "default": False, "config": "growatt_automatic"},
+            "automatic_ignore_pv": {"required": False, "default": False, "config": "growatt_automatic_ignore_pv"},
+            "control_enable": {"required": False, "default": True, "config": "growatt_control_enable"},
+            "base_url": {"required": False, "default": "https://opencloud.growatt.com/prod-api", "config": "growatt_base_url"},
+            "battery_rate_max": {"required": False, "config": "growatt_battery_rate_max"},
+            "api_delay": {"required": False, "default": 0.2, "config": "growatt_api_delay"},
+            # Growatt documents one deviceDispatch call per five seconds per device.
+            "min_write_interval": {"required": False, "default": 5, "config": "growatt_min_write_interval"},
+        },
+        # token_hash alone is enough for OAuthMixin to obtain the current token from the
+        # SaaS refresh endpoint after a restart whose embedded access token has expired.
+        "required_or": ["key", "token_hash"],
         "phase": 1,
         "can_restart": True,
     },
@@ -712,6 +756,23 @@ COMPONENT_LIST = {
         },
         "phase": 1,
         "can_restart": True,
+        # Each export/charge command starts on the first run inside the window, and carries a
+        # duration to the window's end, so an unaligned loop starts every window up to a minute late.
+        "align_minute": True,
+    },
+    "dummy_inverter": {
+        "class": "dummy_inverter.DummyInverter",
+        "name": "Dummy Inverter",
+        "inverter": True,
+        "event_filter": "predbat_dummy_",
+        # A simulated inverter and battery for demos and log replay, enabled by a dummy_inverter apps.yaml block.
+        # Defaults for every setting in the block live in dummy_inverter.py beside the model that uses them.
+        "args": {
+            "config": {"required": True, "config": "dummy_inverter"},
+            "automatic": {"required": False, "config": "dummy_inverter_automatic", "default": True},
+        },
+        "phase": 1,
+        "can_restart": True,
     },
     "teslemetry": {
         "class": "teslemetry.TeslemetryAPI",
@@ -734,6 +795,9 @@ COMPONENT_LIST = {
         },
         "phase": 1,
         "can_restart": True,
+        # The signal tariff's export band is pushed on the first run inside its window (GH#5960), so
+        # an unaligned loop starts every export up to a minute late, more as run() durations drift it.
+        "align_minute": True,
     },
     "solax": {
         "class": "solax.SolaxAPI",
@@ -754,6 +818,9 @@ COMPONENT_LIST = {
         },
         "phase": 1,
         "can_restart": True,
+        # Remote-control commands carry no duration: a window starts on the first run inside it and
+        # ends on the first run after it, so an unaligned loop is late on both edges.
+        "align_minute": True,
     },
     "solis": {
         "class": "solis.SolisAPI",
@@ -773,6 +840,8 @@ COMPONENT_LIST = {
             "base_url": {"required": False, "config": "solis_base_url", "default": "https://www.soliscloud.com:13333"},
             "control_enable": {"required": False, "config": "solis_control_enable", "default": True},
             "nominal_voltage": {"required": False, "config": "solis_nominal_voltage"},
+            "parallel_slaves": {"required": False, "config": "solis_parallel_slaves"},
+            "parallel_slot_current_max": {"required": False, "config": "solis_parallel_slot_current_max"},
         },
         # Gate activation on having at least one auth path — HMAC (api_key) OR OAuth
         # (access_token). Without this the component would start for every instance
@@ -930,6 +999,7 @@ class Components:
                     # Overrides the class-name fallback ComponentBase.__init__ set, with the
                     # registry key report_discovery() should file this component's reports under.
                     self.components[component_name].component_name = component_name
+                    self.components[component_name].align_minute = component_info.get("align_minute", False)
                 except Exception as e:
                     # A component that will not import (a missing package, a syntax error) or
                     # construct must not take Predbat down with it: record why, leave it inactive

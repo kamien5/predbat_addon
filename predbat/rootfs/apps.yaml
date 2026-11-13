@@ -1,4 +1,4 @@
-# apps.yaml dla Predbat v9.5.0 (tag commit 0cfceaaa719b9ce3de1d10185578feffb008908b), na bazie templates/fox.yaml.
+# apps.yaml dla Predbat v9.7.10 (tag commit 54a8cbb2b8bf66fd1005053cd89d6c80725c2801), na bazie templates/fox.yaml.
 # Instalacja docelowa: falownik FoxESS przez foxess_modbus 1.15.0 (RS485), encje BEZ prefiksu "foxess_".
 # Zmiany względem szablonu oznaczone [ZMIANA]. Eksport z baterii zablokowany (usługi -> Self Use).
 pred_bat:

@@ -35,7 +35,7 @@ CONFIG_DIR = os.environ.get("PREDBAT_CONFIG_DIR", "/config")
 IMAGE_DIR = os.environ.get("PREDBAT_IMAGE_DIR", "/opt/predbat")
 APPS_YAML_SRC = os.environ.get("PREDBAT_APPS_YAML_SRC", "/apps.yaml")
 APPS_YAML_SHA256 = (
-    "bfb291ea64dfd221d7dd46d7f76538035652bf9801ebff2b16d93c9af21e4d6e"
+    "24d30970ac4699c12ae2206e106d7fd7eafac763c714a38fd569393a6fe2e8d8"
 )
 HA_API_URL = os.environ.get("PREDBAT_HA_API_URL", "http://supervisor/core/api")
 OPTIONS_JSON = os.environ.get("PREDBAT_OPTIONS_JSON", "/data/options.json")

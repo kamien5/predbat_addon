@@ -1,10 +1,10 @@
 # kamien5 hardened fork
 
-This is a hardened fork of springfall2008/predbat_addon (base 587e1a7a, add-on 1.7.1):
-Predbat v9.5.0 is vendored and verified against `predbat/MANIFEST.sha256` on every start,
+This is a hardened fork of springfall2008/predbat_addon (add-on `1.7.1-kamien5.5`):
+Predbat v9.7.10 is vendored and verified against `predbat/MANIFEST.sha256` on every start,
 self-update is disabled, the Supervisor token is never logged or passed in argv, permissions
 are minimal (no Supervisor API, no ports, only `addon_config`), and dependencies are pinned
-with hashes. See `SECURITY-REVIEW.md` and `tests/README.md`.
+with hashes. See `DEPLOY-UPGRADE.md`, `SECURITY-REVIEW-v9.7.0.md`, and `tests/README.md`.
 
 #  Predbat Home Assistant App
 Predbat Home Assistant App

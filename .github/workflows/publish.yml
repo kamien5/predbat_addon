@@ -1,0 +1,150 @@
+---
+name: Publish GHCR images
+
+# Builds and pushes the Supervisor-facing images from a reviewed git SHA on main.
+# PR CI (ci.yml) stays cache-only and never publishes.
+# Never retag an existing addon version.
+# workflow_dispatch requires expected_sha == github.sha so an unverified ref
+# cannot be published by picking a different branch in the Actions UI.
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: "Reviewed 40-char hex commit SHA; must equal github.sha"
+        required: true
+        type: string
+  push:
+    tags:
+      - "kamien5-v*"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    name: Publish (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: aarch64
+            platform: linux/arm64
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Assert workflow_dispatch SHA
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::expected_sha must be a 40-character lowercase hex commit SHA"
+            exit 1
+          fi
+          if [[ "$GITHUB_SHA" != "$EXPECTED_SHA" ]]; then
+            echo "::error::github.sha ${GITHUB_SHA} != expected_sha ${EXPECTED_SHA}"
+            exit 1
+          fi
+
+      - name: Read addon version
+        id: meta
+        run: |
+          VERSION="$(sed -n 's/^version: //p' predbat/config.yaml | tr -d '[:space:]')"
+          IMAGE="ghcr.io/kamien5/predbat-addon/${{ matrix.arch }}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "tag=${IMAGE}:${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Addon version ${VERSION} git ${GITHUB_SHA}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse to overwrite an existing version tag
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: bash tools/ghcr_tag_guard.sh inspect "$TAG"
+
+      - name: Set up QEMU
+        if: matrix.arch == 'aarch64'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          image: docker.io/tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.38.1
+          driver-opts: image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
+
+      - name: Build and push
+        env:
+          ARCH: ${{ matrix.arch }}
+          PLATFORM: ${{ matrix.platform }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          SHA_TAG: ${{ steps.meta.outputs.image }}:sha-${{ github.sha }}
+        run: |
+          BUILD_FROM="$(sed -n "s/^  ${ARCH}: \"\(.*\)\"$/\1/p" predbat/build.yaml)"
+          case "$BUILD_FROM" in
+            *@sha256:*) ;;
+            *) echo "::error::build_from for ${ARCH} is not pinned by digest"; exit 1 ;;
+          esac
+          docker buildx build \
+            --platform "$PLATFORM" \
+            --build-arg "BUILD_FROM=$BUILD_FROM" \
+            --build-arg "BUILD_ARCH=$ARCH" \
+            --build-arg "BUILD_VERSION=$VERSION" \
+            --build-arg "BUILD_NAME=Predbat (kamien5 fork)" \
+            --build-arg "BUILD_DESCRIPTION=Predbat v9.7.10 pinned" \
+            --build-arg "BUILD_REF=${GITHUB_SHA}" \
+            --build-arg "BUILD_REPOSITORY=kamien5/predbat_addon" \
+            --build-arg "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=${VERSION}" \
+            --label "org.opencontainers.image.source=https://github.com/kamien5/predbat_addon" \
+            --provenance=true \
+            --sbom=true \
+            --push \
+            --tag "$TAG" \
+            --tag "$SHA_TAG" \
+            predbat
+
+      - name: Record digest
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          DIGEST="$(docker buildx imagetools inspect "$TAG" | awk '/^Digest:/ {print $2; exit}')"
+          if [[ "$DIGEST" != sha256:* ]]; then
+            echo "::error::could not read digest for ${TAG}"
+            exit 1
+          fi
+          {
+            echo "## ${ARCH}"
+            echo "- image: \`${TAG}\`"
+            echo "- digest: \`${DIGEST}\`"
+            echo "- git: \`${GITHUB_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "${ARCH} ${TAG} ${DIGEST} ${GITHUB_SHA}"

@@ -14,6 +14,8 @@ import unittest
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CONFIG_YAML = os.path.join(REPO_ROOT, "predbat", "config.yaml")
 BUILD_YAML = os.path.join(REPO_ROOT, "predbat", "build.yaml")
+CI_YML = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
+PUBLISH_YML = os.path.join(REPO_ROOT, ".github", "workflows", "publish.yml")
 
 
 class ConfigYamlTestCase(unittest.TestCase):
@@ -88,6 +90,41 @@ class ConfigYamlTestCase(unittest.TestCase):
         self.assertGreaterEqual(len(entries), 2)
         for entry in entries:
             self.assertIn("@sha256:", entry)
+
+    def test_supervisor_image_is_arch_templated_ghcr(self) -> None:
+        match = re.search(r"(?m)^image:\s*(\S+)\s*$", self.config_text)
+        self.assertIsNotNone(match)
+        image = match.group(1)
+        self.assertEqual(image, "ghcr.io/kamien5/predbat-addon/{arch}")
+        self.assertNotIn("latest", image)
+        self.assertNotIn("@sha256:", image)
+
+    def test_addon_version_is_immutable_tag_shape(self) -> None:
+        match = re.search(r"(?m)^version:\s*(\S+)\s*$", self.config_text)
+        self.assertIsNotNone(match)
+        version = match.group(1)
+        self.assertRegex(version, r"^1\.7\.1-kamien5\.\d+$")
+        self.assertEqual(version, "1.7.1-kamien5.5")
+
+    def test_no_local_supervisor_build_flag(self) -> None:
+        self.assertNotRegex(self.config_text, r"(?m)^build:\s*true\s*$")
+
+    def test_publish_workflow_pins_same_checkout_as_ci(self) -> None:
+        with open(CI_YML, "r", encoding="utf-8") as handle:
+            ci = handle.read()
+        with open(PUBLISH_YML, "r", encoding="utf-8") as handle:
+            pub = handle.read()
+        pin = re.search(
+            r"uses:\s+(actions/checkout@[0-9a-f]{40})",
+            ci,
+        )
+        self.assertIsNotNone(pin)
+        self.assertIn(pin.group(1), pub)
+        self.assertIn("ghcr.io/kamien5/predbat-addon/${{ matrix.arch }}", pub)
+        self.assertIn("bash tools/ghcr_tag_guard.sh inspect", pub)
+        self.assertNotIn("type=cacheonly", pub)
+        self.assertNotIn("id-token:", pub)
+        self.assertNotIn("attestations:", pub)
 
 
 if __name__ == "__main__":

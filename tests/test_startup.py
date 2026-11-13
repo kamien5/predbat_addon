@@ -37,9 +37,9 @@ LAUNCH_SRC = os.path.join(
     REPO_ROOT, "predbat", "rootfs", "opt", "predbat", "launch.py"
 )
 
-EXPECTED_FILE_COUNT = 114
+EXPECTED_FILE_COUNT = 118
 APPS_YAML_SHA256 = (
-    "bfb291ea64dfd221d7dd46d7f76538035652bf9801ebff2b16d93c9af21e4d6e"
+    "24d30970ac4699c12ae2206e106d7fd7eafac763c714a38fd569393a6fe2e8d8"
 )
 HA_TEST_LAT = 0.123456
 HA_TEST_LON = 0.654321
@@ -259,6 +259,26 @@ class StartupTestCase(unittest.TestCase):
         self.assertEqual(expected.count("longitude: 0.654321"), 2)
         self.assertIn("notify_devices: " + devices, expected)
         return expected
+
+    def test_vendor_pin_is_v9_7_10(self) -> None:
+        vendor_txt = os.path.join(REPO_ROOT, "predbat", "VENDOR.txt")
+        with open(vendor_txt, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("tag: v9.7.10", text)
+        self.assertIn("commit: 54a8cbb2b8bf66fd1005053cd89d6c80725c2801", text)
+        self.assertIn("file_count: 118", text)
+        with open(APPS_YAML_SRC, "r", encoding="utf-8") as handle:
+            apps = handle.read()
+        self.assertNotRegex(apps, r"(?m)^\s*mcp_enable:\s*(true|True|yes|on|1)\s*$")
+        self.assertNotRegex(apps, r"(?m)^\s*auto_update:\s*(true|True|yes|on|1)\s*$")
+        with open(
+            os.path.join(VENDOR_SRC, "config.py"), "r", encoding="utf-8"
+        ) as handle:
+            config_py = handle.read()
+        self.assertRegex(
+            config_py,
+            r'"name": "auto_update",\s*\n(?:.*\n){0,6}\s*"default": False,',
+        )
 
     def test_a_clean_start_installs_all_pinned_files(self) -> None:
         image_dir = self._make_image_dir()
