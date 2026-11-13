@@ -1,12 +1,19 @@
 ---
 name: Publish GHCR images
 
-# Builds and pushes the Supervisor-facing images from a reviewed git SHA.
+# Builds and pushes the Supervisor-facing images from a reviewed git SHA on main.
 # PR CI (ci.yml) stays cache-only and never publishes.
 # Never retag an existing addon version.
+# workflow_dispatch requires expected_sha == github.sha so an unverified ref
+# cannot be published by picking a different branch in the Actions UI.
 
 on:
   workflow_dispatch:
+    inputs:
+      expected_sha:
+        description: "Reviewed 40-char hex commit SHA; must equal github.sha"
+        required: true
+        type: string
   push:
     tags:
       - "kamien5-v*"
@@ -14,8 +21,6 @@ on:
 permissions:
   contents: read
   packages: write
-  id-token: write
-  attestations: write
 
 concurrency:
   group: publish-${{ github.workflow }}-${{ github.ref }}
@@ -44,6 +49,20 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Assert workflow_dispatch SHA
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+        run: |
+          if [[ ! "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::expected_sha must be a 40-character lowercase hex commit SHA"
+            exit 1
+          fi
+          if [[ "$GITHUB_SHA" != "$EXPECTED_SHA" ]]; then
+            echo "::error::github.sha ${GITHUB_SHA} != expected_sha ${EXPECTED_SHA}"
+            exit 1
+          fi
+
       - name: Read addon version
         id: meta
         run: |
@@ -54,14 +73,17 @@ jobs:
           echo "tag=${IMAGE}:${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Addon version ${VERSION} git ${GITHUB_SHA}"
 
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Refuse to overwrite an existing version tag
         env:
           TAG: ${{ steps.meta.outputs.tag }}
-        run: |
-          if docker manifest inspect "$TAG" >/dev/null 2>&1; then
-            echo "::error::${TAG} already exists; version tags are immutable"
-            exit 1
-          fi
+        run: bash tools/ghcr_tag_guard.sh inspect "$TAG"
 
       - name: Set up QEMU
         if: matrix.arch == 'aarch64'
@@ -75,12 +97,6 @@ jobs:
         with:
           version: v0.38.1
           driver-opts: image=moby/buildkit:v0.34.1@sha256:99368f3e46177c6405b9740e4461d91cee004128daeecca78d4ceac50ec1da5c
-
-      - name: Log in to GHCR
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
       - name: Build and push
         env:

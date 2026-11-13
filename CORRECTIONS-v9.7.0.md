@@ -1,8 +1,7 @@
 # Corrections and Clarifications — v9.7.0 Upgrade
 
-**Document status**: HISTORICAL clarifications for the v9.7.0 pass.  
-**Deployment procedure (current)**: See [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md) (v9.7.10 / addon `1.7.1-kamien5.5`, GHCR image pin, fresh W40/W41).  
-**CI at `6e88899bc8258336feea12aa1109c4df1c4e25b9`**: Unit tests, Docker build (amd64), Docker build (aarch64) all **success** (not PENDING).  
+**Document status**: HISTORICAL clarifications for the v9.7.0 pass (2026-11-07).  
+**Current deployment specification**: [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md) (Predbat **v9.7.10**, addon `1.7.1-kamien5.5`, public GHCR images, grants W40 / W41). Statements below in the present tense that mention `build: true`, “No published image”, 45 tests, or W32/W33 as the live grants are **superseded**.  
 **Created**: 2026-11-07
 
 ---
@@ -30,7 +29,7 @@
 - **Inside** Predbat `Charging*` windows: FC stays regardless of PV
 - **Implementation**: Verified in automation `bateria_fc_przy_pv` condition check
 
-**All documentation** updated to include "outside charge window" qualifier.
+**Complete rule** is the inside/outside pair above (Force Charge **stays** inside `Charging*`; high PV **blocks** it outside). Do not read this as “exception only outside windows”.
 
 ---
 
@@ -38,8 +37,8 @@
 
 ### In This Repository (Verifiable)
 
-✅ **Predbat engine**: v9.7.0 from upstream commit `4cbf6333...`  
-✅ **Vendor file integrity**: 115 files checksummed and verified  
+✅ **Predbat engine (then)**: v9.7.0 from upstream commit `4cbf6333...` — **now v9.7.10 / 118 files**; see [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md)  
+✅ **Vendor file integrity (then)**: 115 files checksummed and verified  
 ✅ **Self-update**: Disabled in `apps.yaml`  
 ✅ **Min SoC config**: Shows 11% in config (engine enforcement)  
 ✅ **FC Charging exception**: Logic present in code
@@ -58,23 +57,18 @@
 
 ## Build and Deployment Method
 
-### ✅ Actual Method
+### Historical (v9.7.0 pass, 2026-11-07)
 
-**Supervisor local build**:
-- `build: true` in repository configuration
-- Supervisor clones and builds locally on deployment
-- **No published image** to registry
-- **No manual docker build/push** by coordinator
+At that time the addon still used Supervisor local build (`build: true`, no `image:` field, no published registry image). Source pin before that local build was an open blocker.
 
-### ⚠️ Source Pin Issue (Blocker)
+### Current (supersedes the above)
 
-**Problem**: Supervisor build source resolution **undocumented**
-- Tag alone may not pin checkout SHA
-- No proven prebuild verification mechanism
-- Cannot confirm built image = reviewed tree
+See [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md):
 
-**Status**: **BLOCKS DEPLOYMENT** until resolved  
-See [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md) Critical Blockers section.
+- `config.yaml` has `image: ghcr.io/kamien5/predbat-addon/{arch}` and **no** `build: true`
+- Images are published by `.github/workflows/publish.yml` to public GHCR after merge to `main`
+- Piotr accepted this GHCR path on 2026-11-13 17:00 CET (`t429s1509`, B4)
+- Label `org.opencontainers.image.revision` is the merge commit SHA on `main`
 
 ---
 
@@ -103,27 +97,16 @@ See [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md) Critical Blockers section.
 
 ## CI and Architecture
 
-### ✅ Build Configuration
+### Historical (v9.7.0 pass)
 
-**Method**: `build: true` (Supervisor local build)  
-**CI**: `cache-only` (no publication to registry)  
-**config.yaml**: No `image:` field (local build)
+Then: Supervisor local `build: true`, no `image:` in `config.yaml`, unit tests 45/45 in CI (aiohttp-dependent tests skipped without a pinned venv). Deployment was a Supervisor clone + local build; source verification before that build was unproven.
 
-**CI status**:
-- Unit tests: 45/45 pass (no aiohttp locally, all pass in CI)
-- amd64 build: ✅ Green
-- aarch64 build: ✅ Green (both arches required)
+### Current (supersedes the above)
 
-### ✅ Deployment Mechanics
-
-**Real deployment path**:
-1. Supervisor receives addon update command (new W-label required)
-2. Supervisor clones repository at selected ref
-3. Supervisor builds image locally (`build: true`)
-4. Supervisor installs built image
-5. **Source verification**: Currently **unproven** (blocker)
-
-**NOT**: Pre-built image, NOT manual docker push, NOT registry pull
+- PR CI (`ci.yml`): unit tests with **zero skipped**, cache-only Docker builds for amd64 and aarch64
+- Publish (`publish.yml`): GHCR push from `main` only, `expected_sha` gate, fail-closed tag probe
+- `config.yaml`: `image: ghcr.io/kamien5/predbat-addon/{arch}`
+- Test count is no longer 45 — see `tests/` and [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md)
 
 ---
 
@@ -145,7 +128,7 @@ See [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md) Critical Blockers section.
 
 ### ✅ What Was Tested
 
-**Unit tests** (45 total):
+**Unit tests** (45 total at the 2026-11-07 pass; current count is in `tests/` / CI on PR #5):
 - Predbat engine logic
 - Config parsing
 - Entity state handling
@@ -206,11 +189,11 @@ See [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md) Critical Blockers section.
 - UPGRADE-v9.7.0.md
 - DEPLOYMENT-BLOCKERS.md
 
-**Remaining active docs**:
-- **DEPLOY-UPGRADE.md**: Single deployment procedure (blockers, steps, rollback)
-- **CORRECTIONS-v9.7.0.md**: This file (clarifications and corrections)
-- **SECURITY-REVIEW-v9.7.0.md**: Security assessment
-- **TASK-5KW-CAP-REMOVAL.md**: Separate HA config task (not part of addon deployment)
+**Remaining docs**:
+- **DEPLOY-UPGRADE.md**: Single current deployment procedure (authoritative)
+- **CORRECTIONS-v9.7.0.md**: This file (historical clarifications for the v9.7.0 pass)
+- **SECURITY-REVIEW-v9.7.0.md**: Historical MCP/security assessment; procedure is in DEPLOY-UPGRADE.md
+- 5 kW cap removal is **out of this repository** (external HA package). The former `TASK-5KW-CAP-REMOVAL.md` was removed and is not a live spec.
 
 ---
 
@@ -222,24 +205,26 @@ See [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md) Critical Blockers section.
 - Separate approval/testing/deployment process
 - **NOT included** in addon v9.7.0 upgrade
 
-**Status**: Stage 1 read-only helper patch + HA v2 automation patch in development as separate artifacts. See [TASK-5KW-CAP-REMOVAL.md](./TASK-5KW-CAP-REMOVAL.md).
+**Status**: Stage 1 read-only helper patch + HA v2 automation patch remain **outside this repository**. There is no in-tree `TASK-5KW-CAP-REMOVAL.md`.
 
 ---
 
 ## Summary of Corrections
 
-1. ✅ **5kW cap**: Policy vs. addon vs. HA config distinction clarified
-2. ✅ **FC PV exception**: Complete rule with charge window qualifier
-3. ✅ **Build method**: Supervisor local build (not manual/published image)
-4. ✅ **Source pin**: Identified as unresolved blocker
-5. ✅ **W32/W33 consumed**: Fresh hashes required for deployment
-6. ✅ **MCP protection**: Corrected to source-IP + default-off (not unconditional blacklist)
-7. ✅ **External HA config**: Clearly marked as unverifiable from repo
-8. ✅ **Documentation consolidated**: Single procedure in DEPLOY-UPGRADE.md
+Historical (2026-11-07) items 1–8 still describe the v9.7.0 pass. They are **not** the live procedure:
 
-**All active documentation** reviewed for consistency. No contradictions remain.
+1. **5kW cap**: Policy vs. addon vs. HA config distinction — still valid as a boundary
+2. **FC PV exception**: **Inside** `Charging*` Force Charge stays on despite high PV; **outside** `Charging*` high PV blocks Force Charge (inverter → `Self Use`)
+3. **Build method**: then Supervisor local build — **now** public GHCR image (see DEPLOY-UPGRADE.md)
+4. **Source pin**: then an open blocker — **now** resolved by GHCR labels + merge-to-`main` before publish
+5. **W32/W33 consumed**: still true; live grants are W40/W41 in DEPLOY-UPGRADE.md (`20d0c320…` is invalid)
+6. **MCP protection**: source-IP + default-off (not an unconditional path blacklist)
+7. **External HA config**: still unverifiable from this repo
+8. **Documentation**: single live procedure in DEPLOY-UPGRADE.md; this file is historical
+
+Do not treat this file as internally contradiction-free relative to the current tree. If anything here disagrees with [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md), DEPLOY-UPGRADE.md wins.
 
 ---
 
-**Last updated**: 2026-11-07  
-**Next review**: After Security/QA final approval
+**Last updated**: 2026-11-13  
+**Next review**: After Security/QA final approval of the current PR #5 head

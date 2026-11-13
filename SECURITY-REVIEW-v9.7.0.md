@@ -1,6 +1,6 @@
-# Przegląd bezpieczeństwa: upgrade Predbat v9.6.5 → v9.7.0 (kamien5-v4)
+# Przegląd bezpieczeństwa: upgrade Predbat v9.6.5 → v9.7.0 (warstwa MCP)
 
-**Aktualizacja 2026-11-13:** silnik podniesiony do **v9.7.10** (`54a8cbb2…`), addon **1.7.1-kamien5.5**. MCP nadal OFF + source-IP. Procedura i pin obrazu: [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md). CI na `6e88899…`: 3/3 **success**.
+**Aktualizacja 2026-11-13:** silnik podniesiony do **v9.7.10** (`54a8cbb2…`), addon **1.7.1-kamien5.5**. MCP nadal OFF + source-IP. Obowiązująca procedura i pin obrazu: [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md). CI: bieżący head PR #5 (nie historyczne `6e88899…` / `2499317…`). Tag po merge: `kamien5-v5`, nie `kamien5-v4`.
 
 **Data przeglądu v9.7.0:** 2026-11-07  
 **Addon version (wówczas):** 1.7.1-kamien5.4  
@@ -250,7 +250,7 @@ git show v9.7.0:apps/predbat/<file> | sha256sum
 # Matches MANIFEST.sha256 dla każdego pliku
 ```
 
-### Test coverage
+### Test coverage (historical, 2026-11-07 local run)
 ```
 pytest tests/ -v
 ======================== 40 passed, 5 skipped in 10.36s ========================
@@ -263,13 +263,15 @@ tests/test_web_hardening.py::test_mask_secret_like_and_location_fields PASSED
 
 ---
 
-## 8. apps.yaml configuration — NIEZMIENIONY
+## 8. apps.yaml configuration — ustawienia strażnika bez zmian
+
+Nagłówek komentarza zaktualizowany z v9.5.0 na v9.7.10 (sam pin SHA256). Klucze YAML (usługi FC/PV, min SoC, brak `mcp_enable` / `auto_update`) **bez zmian**.
 
 ### Pinned SHA256
 ```python
 # predbat/rootfs/startup.py
-APPS_YAML_SHA256 = "bfb291ea64dfd221d7dd46d7f76538035652bf9801ebff2b16d93c9af21e4d6e"
-# UNCHANGED from kamien5.3
+APPS_YAML_SHA256 = "24d30970ac4699c12ae2206e106d7fd7eafac763c714a38fd569393a6fe2e8d8"
+# Header comment only vs kamien5.3; guardian keys unchanged
 ```
 
 ### Guardian behavior preserved (EXTERNAL, not fully verifiable from repo)
@@ -386,9 +388,11 @@ tests/test_startup.py::test_m_success_output_hides_token_and_coordinates PASSED
 
 ---
 
-## 11. Test results — 5 skipped explained
+## 11. Test results — 5 skipped explained (historical, 2026-11-07)
 
-### Local test run: 40 passed, 5 skipped
+Current CI bar: every test in `tests/` must run with **zero skipped** (see [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md)). The 40/5 split below is the then-local environment without aiohttp.
+
+### Local test run (2026-11-07): 40 passed, 5 skipped
 
 **Skipped tests:** All in `test_web_hardening.py`, require aiohttp
 ```python
@@ -409,7 +413,7 @@ if grep -Eq '(^| )skipped' unittest.log; then
   exit 1
 fi
 ```
-CI installs full requirements → all 45 tests run → merge blocked if any skip
+CI installs full requirements → every test in `tests/` runs (historically 45; count has grown) → merge blocked if any skip
 
 **Safety impact:** NONE
 - Unit tests covering same logic: PASSED
@@ -480,7 +484,7 @@ CI installs full requirements → all 45 tests run → merge blocked if any skip
 | Web hardening | ✅ Preserved | All blocked paths confirmed |
 | Token handling | ✅ Verified | Never logged |
 | apps.yaml config | ✅ Unchanged | Guardian behavior preserved |
-| Test coverage | ✅ Passing | 40 passed, 5 skipped |
+| Test coverage | ✅ Passing (2026-11-07, historical) | Then 40 passed / 5 skipped locally; **current** suite and CI bar: [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md) |
 
 ### 🟡 OBSERVATION REQUIRED
 
@@ -503,7 +507,7 @@ CI installs full requirements → all 45 tests run → merge blocked if any skip
 
 1. Vendor upgrade **code-verified** — wszystkie security protections preserved in repo
 2. Upstream fixes **not applicable** lub **inactive** w tej instalacji
-3. Tests **passing** — 40/45 in local environment (5 skipped), CI must run all 45
+3. Tests **passing** — historically 40/45 locally on 2026-11-07 (5 skipped without pinned venv). **Current** suite is in `tests/` (CI must run every test with zero skipped; count is no longer 45). See [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md).
 4. Guardian behavior **not repo-verifiable** — external HA automations, requires live evidence
 5. **CRITICAL FINDINGS** (from live trace 2026-11-07 08:05 CET):
    - 5kW cap EXISTS in external HA (`force_charge_power 5.0kW`, `min(..., 5.0)`)
@@ -512,11 +516,11 @@ CI installs full requirements → all 45 tests run → merge blocked if any skip
 
 **Required before deployment:**
 1. Fresh UNENCRYPTED backup (user standing instruction: no encryption key)
-2. NEW one-shot mutation approval (W32/W33 consumed, identical hashes cannot reactivate)
+2. NEW one-shot mutation approval (W32/W33 consumed; live hashes are W40/W41 in [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md))
 3. External HA guardian evidence documented (provided, confirms policy)
 4. 5kW external cap remediation scoped separately (NOT in vendor upgrade)
-5. CI completion: all 45 tests pass, both arches build
-6. Tree equivalence verification: reviewed HEAD → merge commit
+5. CI completion: all current tests pass with zero skipped, both arches build (see PR #5 / DEPLOY-UPGRADE.md; the 45-test count is historical)
+6. Tree equivalence verification: reviewed PR head → merge commit on `main` **before** `publish.yml`
 
 ---
 

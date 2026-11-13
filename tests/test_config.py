@@ -121,8 +121,10 @@ class ConfigYamlTestCase(unittest.TestCase):
         self.assertIsNotNone(pin)
         self.assertIn(pin.group(1), pub)
         self.assertIn("ghcr.io/kamien5/predbat-addon/${{ matrix.arch }}", pub)
-        self.assertIn("already exists; version tags are immutable", pub)
+        self.assertIn("bash tools/ghcr_tag_guard.sh inspect", pub)
         self.assertNotIn("type=cacheonly", pub)
+        self.assertNotIn("id-token:", pub)
+        self.assertNotIn("attestations:", pub)
 
 
 if __name__ == "__main__":
