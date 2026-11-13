@@ -1,8 +1,9 @@
 # Corrections and Clarifications — v9.7.0 Upgrade
 
-**Document status**: ACTIVE corrections record  
-**Created**: 2026-11-07  
-**Deployment procedure**: See [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md)
+**Document status**: HISTORICAL clarifications for the v9.7.0 pass.  
+**Deployment procedure (current)**: See [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md) (v9.7.10 / addon `1.7.1-kamien5.5`, GHCR image pin, fresh W40/W41).  
+**CI at `6e88899bc8258336feea12aa1109c4df1c4e25b9`**: Unit tests, Docker build (amd64), Docker build (aarch64) all **success** (not PENDING).  
+**Created**: 2026-11-07
 
 ---
 

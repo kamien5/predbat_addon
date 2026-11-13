@@ -85,6 +85,8 @@ from utils import (
     format_time_ago,
     get_override_time_from_string,
     history_attribute,
+    is_entity_id,
+    minute_data,
     prune_today,
     mask_secret_args,
     mask_secret_yaml_text,
@@ -876,9 +878,7 @@ class WebInterface(ComponentBase):
                     <!-- House to Grid path -->
                     <path id="house-grid-path" d="M342,228 L391,261" stroke="transparent" fill="none" />
                 </defs>
-        """.format(
-            battery_icon, dp0(house_power)
-        )
+        """.format(battery_icon, dp0(house_power))
 
         # Car charging arm - drawn top right, the corner left free by PV/battery/grid. It runs from
         # whichever node is actually feeding the charger: the House when the charger is behind the
@@ -910,9 +910,7 @@ class WebInterface(ComponentBase):
                     <polygon points="0 0, 10 3.5, 0 7" fill="#E53935"/>
                     </marker>
                 </defs>
-            """.format(
-                source=car_source, source_id=car_source.lower(), path=car_path
-            )
+            """.format(source=car_source, source_id=car_source.lower(), path=car_path)
             if car_charging:
                 # Calculate animation speed based on power flow - faster for higher power
                 car_speed = max(0.5, min(3.0, 2.0 - (abs(car_power) / 3000)))
@@ -932,18 +930,14 @@ class WebInterface(ComponentBase):
                 <circle r="2" fill="#E53935" opacity="0.4">
                     <animateMotion dur="{speed}s" repeatCount="indefinite" begin="1.0s" path="{path}" />
                 </circle>
-                """.format(
-                    source=car_source, line=car_line, label=car_label, power=dp0(car_power), speed=car_speed, path=car_path
-                )
+                """.format(source=car_source, line=car_line, label=car_label, power=dp0(car_power), speed=car_speed, path=car_path)
             else:
                 html += """
                 <!-- {source} to Car Arrow (dashed) -->
                 <line {line} stroke="#E53935" stroke-width="2" stroke-dasharray="5,5" marker-end="url(#car-arrow)" />
                 <text {label} text-anchor="middle" fill="#E53935">{power} W</text>
                 <!-- No moving dot when the car is not charging -->
-                """.format(
-                    source=car_source, line=car_line, label=car_label, power=dp0(car_power)
-                )
+                """.format(source=car_source, line=car_line, label=car_label, power=dp0(car_power))
 
         # Draw arrows and labels
         if pv_generating:
@@ -965,9 +959,7 @@ class WebInterface(ComponentBase):
                 <circle r="2" fill="#F9A825" opacity="0.4">
                     <animateMotion dur="{}s" repeatCount="indefinite" begin="1.0s" path="M192,128 L241,161" />
                 </circle>
-            """.format(
-                dp0(pv_power), pv_speed, pv_speed, pv_speed
-            )
+            """.format(dp0(pv_power), pv_speed, pv_speed, pv_speed)
         else:
             # Make the PV to House line dashed if not generating
             html += """
@@ -975,9 +967,7 @@ class WebInterface(ComponentBase):
                 <line x1="192" y1="128" x2="241" y2="161" stroke="#F9A825" stroke-width="2" stroke-dasharray="5,5" marker-end="url(#pv-arrow)" />
                 <text x="244" y="122" text-anchor="middle" fill="#F9A825">{} W</text>
                 <!-- No moving dot when PV is not generating -->
-            """.format(
-                dp0(pv_power)
-            )
+            """.format(dp0(pv_power))
         if battery_to_house:
             # Calculate animation speed based on power flow - faster for higher power
             battery_speed = max(0.5, min(3.0, 2.0 - (abs(battery_power) / 3000)))
@@ -997,9 +987,7 @@ class WebInterface(ComponentBase):
                 <circle r="2" fill="#43A047" opacity="0.4">
                     <animateMotion dur="{}s" repeatCount="indefinite" begin="1.0s" path="M192,272 L241,239" />
                 </circle>
-            """.format(
-                dp0(battery_power), battery_speed, battery_speed, battery_speed
-            )
+            """.format(dp0(battery_power), battery_speed, battery_speed, battery_speed)
         else:
             # Calculate animation speed based on power flow - faster for higher power
             battery_speed = max(0.5, min(3.0, 2.0 - (abs(battery_power) / 3000)))
@@ -1019,9 +1007,7 @@ class WebInterface(ComponentBase):
                 <circle r="2" fill="#43A047" opacity="0.4">
                     <animateMotion dur="{}s" repeatCount="indefinite" begin="1.0s" path="M258,228 L209,261" />
                 </circle>
-            """.format(
-                dp0(battery_power), battery_speed, battery_speed, battery_speed
-            )
+            """.format(dp0(battery_power), battery_speed, battery_speed, battery_speed)
 
         if grid_importing:
             # Calculate animation speed based on power flow - faster for higher power
@@ -1042,9 +1028,7 @@ class WebInterface(ComponentBase):
                 <circle r="2" fill="#757575" opacity="0.4">
                     <animateMotion dur="{}s" repeatCount="indefinite" begin="1.0s" path="M408,272 L359,239" />
                 </circle>
-            """.format(
-                dp0(grid_power), grid_speed, grid_speed, grid_speed
-            )
+            """.format(dp0(grid_power), grid_speed, grid_speed, grid_speed)
         else:
             # Calculate animation speed based on power flow - faster for higher power
             grid_speed = max(0.5, min(3.0, 2.0 - (abs(grid_power) / 3000)))
@@ -1064,9 +1048,7 @@ class WebInterface(ComponentBase):
                 <circle r="2" fill="#757575" opacity="0.4">
                     <animateMotion dur="{}s" repeatCount="indefinite" begin="1.0s" path="M342,228 L391,261" />
                 </circle>
-            """.format(
-                dp0(grid_power), grid_speed, grid_speed, grid_speed
-            )
+            """.format(dp0(grid_power), grid_speed, grid_speed, grid_speed)
         html += """
                 <!-- Arrowhead Marker -->
                 <defs>
@@ -1491,9 +1473,7 @@ class WebInterface(ComponentBase):
             <button onclick="location.reload()" style="display: inline-block; margin-left: 10px; padding: 8px 15px; background-color: #2196F3; color: white; border: none; text-decoration: none; border-radius: 4px; font-weight: bold; cursor: pointer;">
                 <span class="mdi mdi-refresh" style="margin-right: 5px;"></span>Reload
             </button>
-        </div>""".format(
-            self.default_page
-        )
+        </div>""".format(self.default_page)
 
         # Collect available attributes for all selected entities
         entity_attributes_map = {}
@@ -1542,9 +1522,7 @@ class WebInterface(ComponentBase):
                 <input type="hidden" name="days" value="{}" />
                 <button type="submit" style="margin-top: 10px; padding: 8px 16px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">Update Chart</button>
             </form>
-        </div>""".format(
-            days
-        )
+        </div>""".format(days)
 
         # Add days selector
         text += """<div style="margin-bottom: 20px;">
@@ -1875,9 +1853,11 @@ class WebInterface(ComponentBase):
         self.update_success_timestamp()
         return get_header_html(title, calculating, self.default_page, self.arg_errors, THIS_VERSION_DISPLAY, self.get_battery_status_icon(), refresh, codemirror=codemirror, chat_enabled=self.chat_enabled())
 
-    def get_chart_series(self, name, results, chart_type, color):
+    def get_chart_series(self, name, results, chart_type, color, hidden=False):
         """
         Return HTML for a chart series
+
+        hidden: start the series switched off; clicking its legend entry shows it.
         """
         text = ""
         text += "   {\n"
@@ -1885,6 +1865,8 @@ class WebInterface(ComponentBase):
         text += "    type: '{}',\n".format(chart_type)
         if color:
             text += "    color: '{}',\n".format(color)
+        if hidden:
+            text += "    hidden: true,\n"
         text += "    data: [\n"
         first = True
         for key in results:
@@ -1983,12 +1965,13 @@ var options = {
             chart_type = series.get("chart_type", "line")
             color = series.get("color", "")
             unit_name = series.get("unit", yaxis_name) or ""
+            hidden = series.get("hidden", False)
 
             if results:
                 if not first:
                     text += ","
                 first = False
-                text += self.get_chart_series(name, results, chart_type, color)
+                text += self.get_chart_series(name, results, chart_type, color, hidden=hidden)
                 opacity.append(opacity_value)
                 stroke_width.append(stroke_width_value)
                 stroke_curve.append("'{}'".format(stroke_curve_value))
@@ -2059,6 +2042,10 @@ var options = {
                 axis_parts.append("      decimalsInFloat: {}".format(decimals))
                 if opposite:
                     axis_parts.append("      opposite: true")
+                if "min" in axis:
+                    axis_parts.append("      min: {}".format(axis["min"]))
+                if "max" in axis:
+                    axis_parts.append("      max: {}".format(axis["max"]))
                 if labels_formatter:
                     axis_parts.append("      labels: {{ formatter: function(val) {{ {} }} }}".format(labels_formatter))
 
@@ -2075,7 +2062,11 @@ var options = {
         text += "    formatter: function(seriesName, opts) {\n"
         text += "        var units = [{}];\n".format(units_array)
         text += "        var unit = units[opts.seriesIndex] !== undefined ? units[opts.seriesIndex] : '{}';\n".format(yaxis_name)
-        text += "        return [opts.w.globals.series[opts.seriesIndex].at(-1), ' ', unit, ' <br> ', seriesName]\n"
+        text += "        var last = opts.w.globals.series[opts.seriesIndex].at(-1);\n"
+        text += "        if (last === null || typeof last === 'undefined') {\n"
+        text += "            return seriesName;\n"
+        text += "        }\n"
+        text += "        return [last, ' ', unit, ' <br> ', seriesName]\n"
         text += "    }\n"
         text += "  },\n"
         text += "  annotations: {\n"
@@ -2098,7 +2089,10 @@ var options = {
         text += "    }\n"
         text += "   ]\n"
         text += "  }\n"
-        text += "}\n"
+        # The semicolon is required: the title script below starts with '(', and without it the browser parses
+        # 'var options = {...}(function() {...})()' as one statement calling the options object, which throws
+        # 'TypeError: ... is not a function' and leaves every chart blank (#6015).
+        text += "};\n"
         # The title is an HTML heading above the chart, not an ApexCharts title: ApexCharts binds drag-to-zoom to the
         # whole chart SVG, so a drag (or a touch-scroll on mobile) anywhere in a title band inside it - including the
         # gap between the title text and the toolbar - zoomed the chart (#5979). Outside the SVG it cannot start a zoom,
@@ -3351,6 +3345,60 @@ chart.render();
         # Redirect back to dashboard
         raise web.HTTPFound("./dash")
 
+    def get_inverter_soc_history(self):
+        """
+        Today's actual SoC of each inverter as a percentage of its own capacity, for the Battery chart,
+        as a list of (inverter id, {stamp: %}).
+
+        Each battery is on its own scale, so one can reach 100% while the fleet total is still short of full.
+        Empty for a single-inverter install, whose one line is already the chart's Actual.
+        Read from each inverter's own soc_percent sensor, or its soc_kw sensor converted to kWh and scaled
+        the way Inverter.update_status() scales it, and sampled on the same grid as the chart's Actual line.
+        There is no predicted SoC per inverter: the plan treats the batteries as one.
+        """
+        inverters = self.base.inverters
+        if len(inverters) <= 1:
+            return []
+        use_percent = "soc_percent" in self.base.args
+        now_str = self.now_utc.strftime(TIME_FORMAT)
+        results = []
+        for inverter in inverters:
+            sensor = self.base.get_arg("soc_percent" if use_percent else "soc_kw", indirect=False, index=inverter.id)
+            if not is_entity_id(sensor):
+                continue
+            if use_percent:
+                scale = 1.0
+            else:
+                if not inverter.soc_max:
+                    continue
+                scale = (inverter.battery_scaling or 1.0) * 100.0 / inverter.soc_max
+            history = self.get_history_wrapper(sensor, 1, required=False, tracked=False)
+            data = {}
+            if history:
+                # Keyed by minutes ago, like soc_kwh_history; required_unit converts a Wh sensor the way update_status() does
+                soc_history, _ = minute_data(
+                    history[0],
+                    1,
+                    self.now_utc,
+                    "state",
+                    "last_updated",
+                    backwards=True,
+                    clean_increment=False,
+                    smoothing=False,
+                    divide_by=1.0,
+                    scale=1.0,
+                    required_unit=None if use_percent else "kWh",
+                )
+                for minute in range(0, self.minutes_now, self.plan_interval_minutes):
+                    minutes_ago = self.minutes_now - minute
+                    if minutes_ago in soc_history:
+                        stamp = (self.midnight_utc + timedelta(minutes=minute)).strftime(TIME_FORMAT)
+                        data[stamp] = dp2(soc_history[minutes_ago] * scale)
+            if inverter.soc_percent is not None:
+                data[now_str] = inverter.soc_percent
+            results.append((inverter.id, data))
+        return results
+
     def get_chart(self, chart):
         """
         Return the HTML for a chart
@@ -3421,7 +3469,31 @@ chart.render();
                 {"name": "Best Export Limit", "data": best_export_limit_kw, "opacity": "1.0", "stroke_width": "3", "stroke_curve": "stepline", "color": "#15eb1c"},
                 {"name": "Record", "data": record, "opacity": "0.5", "stroke_width": "4", "stroke_curve": "stepline", "color": "#000000", "chart_type": "area"},
             ]
-            text += self.render_chart(series_data, "kWh", "Battery SoC Prediction", now_str)
+            # Multi-inverter installs: each battery's actual SoC in % of its own capacity, on a 0-100% axis
+            # of their own, off until picked in the legend
+            inverter_colors = ["#2ca02c", "#ff7f0e", "#17becf", "#8c564b", "#e377c2", "#bcbd22", "#7f7f7f", "#393b79"]
+            inverter_series_names = []
+            for inv_id, inv_soc in self.get_inverter_soc_history():
+                if not inv_soc:
+                    continue
+                name = "Actual Inverter {}".format(inv_id)
+                inverter_series_names.append(name)
+                series_data.append(
+                    {
+                        "name": name,
+                        "data": inv_soc,
+                        "opacity": "1.0",
+                        "stroke_width": "2",
+                        "stroke_curve": "smooth",
+                        "color": inverter_colors[inv_id % len(inverter_colors)],
+                        "unit": "%",
+                        "hidden": True,
+                    }
+                )
+            extra_yaxis = None
+            if inverter_series_names:
+                extra_yaxis = {"title": "Inverter SoC (%)", "series_names": inverter_series_names, "decimals": 0, "opposite": True, "min": 0, "max": 100}
+            text += self.render_chart(series_data, "kWh", "Battery SoC Prediction", now_str, extra_yaxis=extra_yaxis)
         elif chart == "Power":
             series_data = [
                 {"name": "battery", "data": battery_power_best, "opacity": "1.0", "stroke_width": "2", "stroke_curve": "smooth"},
@@ -6357,9 +6429,9 @@ document.addEventListener('DOMContentLoaded', function() {
 
         action = data.get("action")
         if action == "check":
-            result = await kraken_key.check_kraken_key(base_url, token)
+            result = await kraken_key.check_kraken_key(base_url, token, session_factory=self.http_session)
         elif action == "generate":
-            result = await kraken_key.generate_kraken_key(base_url, token)
+            result = await kraken_key.generate_kraken_key(base_url, token, session_factory=self.http_session)
         else:
             return web.json_response({"status": "error", "error": "Unknown action"}, status=400, headers=headers)
 

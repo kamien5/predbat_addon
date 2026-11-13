@@ -31,4 +31,4 @@ After installing/rebuilding the add-on:
 3. In the add-on log, confirm a line `restored: predbat.py`.
 4. Confirm the restored file matches the image pin, e.g. its sha256 equals the corresponding line in the image `MANIFEST.sha256` (also under `/opt/predbat/MANIFEST.sha256` inside the container).
 5. After a restart, confirm `/addon_configs/<slug>/apps.yaml` is the pinned image copy with latitude/longitude taken from Home Assistant config and `notify_device` from add-on options (no unsubstituted placeholders).
-6. In Home Assistant, change `select.predbat_update` (or otherwise trigger a Predbat version update). The log should show that self-update is disabled in the kamien5 fork (pinned v9.5.0), and the files under the config share must stay on the pinned hashes.
+6. In Home Assistant, change `select.predbat_update` (or otherwise trigger a Predbat version update). The log should show that self-update is disabled in the kamien5 fork (pinned v9.7.10), and the files under the config share must stay on the pinned hashes.

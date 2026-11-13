@@ -36,7 +36,7 @@ import hass as hass
 import pytz
 import asyncio
 
-THIS_VERSION = "v9.7.0"
+THIS_VERSION = "v9.7.10"
 THIS_VERSION_DISPLAY = THIS_VERSION
 
 from download import predbat_update_move, predbat_update_download, check_install, read_deploy_git_version, is_valid_predbat_branch, parse_predbat_branch_option, DEFAULT_PREDBAT_REPOSITORY
@@ -107,7 +107,7 @@ from components import Components, COMPONENT_LIST
 from execute import Execute
 from marginal import Marginal
 from plan import Plan
-from fetch import Fetch
+from fetch import Fetch, LoadSourceMissing
 from output import Output
 from userinterface import UserInterface
 from compare import Compare
@@ -368,7 +368,6 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
         self.manual_freeze_charge_times = []
         self.manual_freeze_export_times = []
         self.manual_demand_times = []
-        self.manual_all_times = []
         self.manual_api = []
         self.manual_import_rates = {}
         self.manual_export_rates = {}
@@ -425,6 +424,11 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
         self.predict_carbon_best = {}
         self.predict_car_hold_best = {}
         self.predict_metric_best = {}
+        # The final plan's SoC and metric under PV10 and PV90, shown beside the expected ones in the plan table (#5871)
+        self.predict_soc_best10 = {}
+        self.predict_metric_best10 = {}
+        self.predict_soc_best90 = {}
+        self.predict_metric_best90 = {}
         self.metric_min_improvement = 0.0
         self.metric_min_improvement_export = 0.1
         self.metric_min_improvement_export_freeze = 0.1
@@ -625,10 +629,15 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
         self.dynamic_load_car_sensors = {}
         self.dynamic_load_car_effective = {}
         self.dynamic_load_car_stripped = 0
+        self.octopus_feed_covered = set()
+        self.octopus_feed_stripped = set()
+        self.octopus_feed_covered_saved = []  # the half hours last written to storage, so a write only happens on a change
         self.predbat_branch_warned = set()
         self.octopus_surplus = set()
         self.octopus_slots_planned = {}
         self.octopus_slots_held = {}
+        self.octopus_slots_held_until = {}
+        self.octopus_slots_held_charged = {}
         self.octopus_slots_held_saved = {}
         self.dispatch_billing_warned = None
         self.battery_capacity_nominal = False
@@ -1388,8 +1397,8 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
         """
         Refresh input data and recompute the plan if required, without executing it.
 
-        Returns None when a pre-condition fails (template configuration, inverter data
-        unavailable or import rates all zero) - the error will already have been recorded.
+        Returns None when a pre-condition fails (template configuration, no load source configured
+        yet, inverter data unavailable or import rates all zero) - the error will already have been recorded.
         Otherwise returns a plan artifact summary dict with keys recomputed, plan_valid,
         plan_version and plan_last_updated. Passing scheduled=False forces a recompute.
 
@@ -1424,7 +1433,11 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
 
         self.expose_config("active", True)
         self.fetch_config_options()
-        sensor_force_replan = self.fetch_sensor_data()
+        try:
+            sensor_force_replan = self.fetch_sensor_data()
+        except LoadSourceMissing:
+            # Already logged and recorded; often a component that has not set load_today yet, so try again next cycle (#5092)
+            return None
 
         # Check if any sensor changes require a replan
         if sensor_force_replan:
@@ -1576,6 +1589,7 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
                 discharge_rate_w=int(self.battery_rate_max_discharge * MINUTE_WATT),
                 soc_max=self.soc_max,
                 reserve=self.reserve,
+                best_soc_min=self.best_soc_min,
                 timezone=str(self.local_tz),
             )
 
@@ -2501,6 +2515,8 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
             self.dynamic_load_car_load()
             # And the half hours Octopus Intelligent dispatches ran in, so they keep the dispatch rate
             self.octopus_held_load()
+            # And the half hours a dispatch was seen covering, so a stale rate feed is still checked after a restart
+            self.octopus_feed_load()
 
         except Exception as e:
             self.log("Error: Exception raised {}".format(e))

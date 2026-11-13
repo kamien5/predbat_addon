@@ -26,7 +26,7 @@ WORKDIR /app_data
 COPY rootfs /
 # COPY ingress.conf /etc/nginx/http.d/
 
-# Pinned Predbat v9.5.0 code (vendored from springfall2008/batpred @ 0cfceaaa, see VENDOR.txt).
+# Pinned Predbat v9.7.10 code (vendored from springfall2008/batpred @ 54a8cbb2, see VENDOR.txt).
 # The build fails if any vendored file does not match MANIFEST.sha256.
 COPY vendor /opt/predbat/vendor
 COPY MANIFEST.sha256 VENDOR.txt /opt/predbat/

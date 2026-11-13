@@ -2,8 +2,8 @@
 # Vendors Predbat apps/predbat runtime sources into predbat/vendor reproducibly.
 set -euo pipefail
 
-TAG="v9.7.0"
-EXPECTED_COMMIT="4cbf633355525ea62ddf8e47e647ee215b38f1ca"
+TAG="v9.7.10"
+EXPECTED_COMMIT="54a8cbb2b8bf66fd1005053cd89d6c80725c2801"
 SOURCE_REPO="https://github.com/springfall2008/batpred"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

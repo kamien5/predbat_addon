@@ -1,204 +1,159 @@
-# Predbat v9.7.0 Deployment and Upgrade
+# Predbat v9.7.10 Deployment and Upgrade
 
 **Branch**: `cursor/vendor-predbat-v9.7.0-2ba3`  
 **PR**: [#5](https://github.com/kamien5/predbat_addon/pull/5)  
-**Status**: BLOCKED - awaiting reviews and source pin solution  
-**CI**: Unit tests 45/45 pass, amd64 build green, aarch64 pending
+**Addon**: `1.7.1-kamien5.5`  
+**Engine**: Predbat **v9.7.10** (`54a8cbb2b8bf66fd1005053cd89d6c80725c2801`)  
+**Status**: Ready for parallel Security + QA review of the **same final commit SHA**. Do not merge until both approve. No live HA/Mac mutation from this document.
 
 ---
 
-## Critical Blockers
+## Live HA audit (2026-11-13 15:42 CET)
 
-###  1. **NO PROVEN SOURCE PIN** ⛔
+Recorded on the production host **before** this upgrade (read-only):
 
-Home Assistant Supervisor local build (`build: true`) does **NOT** pin source SHA before build.
+| Item | Live value |
+|------|------------|
+| Installed addon | `1.7.1-kamien5.3` |
+| Predbat Core | `v9.6.5` |
+| `switch.predbat_auto_update` | `off` |
+| `min_soc_on_grid` | `11%` |
+| `update.predbat_version` | sees upstream **`v9.7.10`** |
 
-- **Tag alone is insufficient** — Supervisor may fetch from branch/main
-- **No documented prebuild checkout verification** for installed version
-- **Cannot prove** built image corresponds to reviewed tree
-- **STOP deployment until**:
-  - Confirmed Supervisor prebuild checkout mechanism documented OR
-  - Alternative proven source-pin method implemented OR
-  - Image published to registry with immutable digest
-
-**DO NOT** proceed with "deploy immediately from main" or tag dropdown without proven source pin.
-
-### 2. **Backup Required BEFORE Any Mutation** 
-
- - **Current backup** (5 Nov 19:29): Metadata present, content/restore **NOT verified**
-- **Fresh unencrypted full backup** required before first mutation
-- **Test restore** to confirm backup integrity
-- **User policy**: NO encryption, NO encryption key (standing decision 31 Oct)
-
-### 3. **One-Shot Approval Hashes Consumed**
-
-- **W32** (store reload): **CONSUMED**
-- **W33** (addon update): **CONSUMED**
-- **Identical payloads CANNOT be reactivated** (flock + fsync ledger)
-- **NEW approval hashes required** for any deployment attempt
-- Fresh scoped approvals must be reviewed and authorized separately
-
-### 4. **Security and QA Review Required**
-
-- **Both reviews** must approve **SAME final SHA**
-- **Green CI** on both amd64 and aarch64 required
-- **No active contradictions** in documentation
-- **Current status**: Documentation audit in progress
-
-### 5. **External HA Configuration** (Separate Scope)
-
-- **5kW cap removal**: HA v2 patch under development (separate from this PR)
-- **NOT verified** from addon repository alone
-- **Live config hash/CAS precondition** required before HA writes
-- **Atomic rollback mechanism** must be designed and tested
+This PR vendors that same upstream tag into the hardened fork. It does **not** change live HA.
 
 ---
 
-## Upgrade Procedure (After Blockers Resolved)
+## CI (head SHA `6e88899bc8258336feea12aa1109c4df1c4e25b9` and later)
 
-### Phase 1: Pre-Deployment Verification
+| Check | Result |
+|-------|--------|
+| Unit tests | **success** (not PENDING) |
+| Docker build (amd64) | **success** |
+| Docker build (aarch64) | **success** |
 
-1. **Resolve source pin blocker**
-   - Document Supervisor checkout mechanism OR
-   - Publish image to registry with immutable digest OR
-   - Implement alternative proven source tracking
+Re-run CI on the final commit of this PR before sign-off. All three must stay green.
 
-2. **Fresh backup**
-   ```
-   Backup type: Full (addon + HA config)
-   Protected: false (NO encryption)
-   Verify: Download and inspect archive
-   ```
+---
 
-3. **New approval hashes**
-   - Generate fresh W-labels for store reload and addon update
-   - Review exact payloads
-   - Coordinate Security/QA approval
+## Why v9.7.10 (not stay on v9.7.0)
 
-4. **Final SHA verification**
-   - Both Security and QA approve SAME commit SHA
-   - CI green (45/45 tests, both arches)
-   - Documentation consolidated and contradiction-free
+Upstream `springfall2008/batpred` latest release is **v9.7.10** (2026-11-11), commit `54a8cbb2b8bf66fd1005053cd89d6c80725c2801`. Live HA already sees that tag.
 
-### Phase 2: Deployment
+v9.7.0→v9.7.10 is a straight patch series (v9.7.1 … v9.7.10): Hanchu/Sunsynk/Octopus/GE Cloud fixes, kernel speed-ups, History billing, Growatt **experimental** (not used — this install is FoxESS), and MCP metadata/proxy-URL hardening on top of the v9.7.0 OAuth fixes. `github.py` / `download.py` are unchanged vs v9.7.0.
 
-**Order** (T = trigger time):
+Vendored set: **118 files** (was 115; added `growatt.py`, `growatt_const.py`, `dummy_inverter.py`). MANIFEST verified.
+
+**Unchanged fork controls** (not taken from upstream defaults):
+
+- Self-update **OFF** (`launch.py` stubs + vendor `auto_update` default `False`)
+- Min SoC **11%** is the live HA entity `number.min_soc_on_grid` (not rewritten here)
+- FC PV exception (outside charge window only) is **external HA** automation — out of this repo
+- MCP off + source-IP middleware (`FORBIDDEN_ENABLED_OPTIONS = ("mcp_enable",)`, ingress `172.30.32.2`)
+
+---
+
+## Blocker #1 — source pin (resolved: abandon local `build: true`)
+
+Home Assistant Supervisor **cannot** prove a git SHA before a local `build: true`. The image field is `{image}:{addon version}` with `{arch}` substitution; a single `@sha256:` in `config.yaml` cannot cover both amd64 and aarch64.
+
+**Chosen path** (works with Supervisor, no extra HA credentials, `hassio_api: false`):
+
+1. CI `ci.yml` keeps **cache-only** multi-arch builds on every PR (prove Dockerfile).
+2. `config.yaml` sets `image: ghcr.io/kamien5/predbat-addon/{arch}` — Supervisor **pulls**, it does not rebuild from git.
+3. `.github/workflows/publish.yml` pushes **immutable** version tags from the reviewed SHA (`workflow_dispatch` or tag `kamien5-v*`). It **refuses** to overwrite an existing version tag.
+4. Each image is labelled `org.opencontainers.image.revision=<git SHA>`.
+5. After publish, record per-arch registry digests in [`predbat/IMAGE-DIGESTS.md`](./predbat/IMAGE-DIGESTS.md).
+6. After HA install, inspect the running container: label SHA and `RepoDigests` must match.
+
+The GHCR package must be **public** (Supervisor has no registry login). Do not deploy until both digests are recorded.
+
+Local `build: true` is **not** used for this upgrade.
+
+---
+
+## Backup policy (Piotr, 31.10 — standing)
+
+Before **any** mutation on live HA:
+
+- **Only** a **full, unencrypted** Supervisor backup (`protected: false`).
+- **No** password, **no** encryption key.
+- Verify: backup info (`type=full`, `protected=false`, size > 0, `content.homeassistant=true`) before the addon update.
+- Do not reuse an old backup as the pre-mutation copy.
+
+---
+
+## Fresh one-shot grants (do not reuse W32/W33)
+
+Ledger is fail-closed. **W32** and **W33** are **consumed**. Identical payloads hash to the same digest and **must not** be sent again.
+
+Canonicalisation: `sha256(json.dumps(msg, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode("ascii"))`.
+
+| Label | Purpose | canon_sha256 | Exact message |
+|-------|---------|--------------|----------------|
+| **W40** | Store reload (timeout 120 so the hash ≠ consumed W32) | `32e0b905acda79ce0561a3c30334eacf3466aa02b605ab0cd93f4e509b256df4` | `{"endpoint":"/store/reload","method":"post","timeout":120,"type":"supervisor/api"}` |
+| **W41** | Addon update to **1.7.1-kamien5.5** (explicit version so the hash ≠ consumed W33) | `20d0c320501867a3c844be5e3cbd567fa1b9f743e84840e50d4b103726978412` | `{"data":{"version":"1.7.1-kamien5.5"},"endpoint":"/addons/fc83ef65_predbat/update","method":"post","timeout":1800,"type":"supervisor/api"}` |
+
+W40/W41 require **new FAL entries** on the Mac helper (native approval). Do not reset ledgers. Do not send W32 (`cfd9c644…` `/store/reload` without timeout) or W33 (`a411a7ed…` update without `data`).
+
+---
+
+## Security + QA checklist (same final commit SHA)
+
+Both reviewers sign the **same** git SHA of this PR head (not `6e88899` once further commits land).
+
+### Security
+
+- [ ] `predbat/VENDOR.txt` is `v9.7.10` / `54a8cbb2b8bf66fd1005053cd89d6c80725c2801` / 118 files
+- [ ] `cd predbat/vendor && sha256sum --strict -c --quiet ../MANIFEST.sha256`
+- [ ] `apps.yaml` has no `mcp_enable: true` and no `auto_update: true`
+- [ ] `launch.py` still stubs download helpers; MCP fail-closed; ingress IP allowlist
+- [ ] `config.yaml`: `image: ghcr.io/kamien5/predbat-addon/{arch}`, `hassio_api: false`, no `build: true`
+- [ ] `build.yaml` base images still digest-pinned
+- [ ] W40/W41 hashes above match the helper FAL entries (new, unused)
+- [ ] GHCR package public; version tag not overwritten
+- [ ] No merge, no live HA, no Mac helper install from this PR alone
+
+### QA
+
+- [ ] GitHub Actions on **this** SHA: Unit tests, Docker build (amd64), Docker build (aarch64) all **success**
+- [ ] Local: `.venv/bin/python -m unittest discover -s tests -v` — no skipped tests in CI
+- [ ] Addon version string `1.7.1-kamien5.5`
+- [ ] After a future install (not now): Core reports v9.7.10; `switch.predbat_auto_update=off`; `min_soc_on_grid=11%`; FC PV exception still only outside `Charging*` windows (external HA)
+- [ ] Backup taken immediately before any mutation is full + unencrypted
+
+---
+
+## Upgrade procedure (after both reviews + GHCR publish + digest fill-in)
 
 ```
-T+0:   BACKUP FIRST (fresh unencrypted full backup)
-T+5:   Verify backup integrity (download, inspect)
-T+10:  Execute store reload (new W-label)
-T+15:  Execute addon update (new W-label, build: true, timeout 1800)
-T+20:  Wait for build completion
-T+25:  Verify addon version sensor
-T+30:  Check Predbat startup (sensor.predbat_status)
-T+35:  Collect evidence (version, logs, image ID if accessible)
-T+40:  Begin 2-4h observation window
+T+0:   Full unencrypted backup; verify info (protected=false)
+T+1:   Confirm IMAGE-DIGESTS.md has both arch sha256 values
+T+2:   W40 store reload
+T+3:   W41 addon update 1.7.1-kamien5.5 (Supervisor pulls GHCR; timeout 1800)
+T+4:   Inspect container label revision + RepoDigests
+T+5:   Confirm Core v9.7.10, auto_update off, min_soc 11%
+T+6:   2–4h observation
 ```
 
-**Critical**: If any step fails, restore from backup immediately.
-
-### Phase 3: Post-Deployment Verification
-
-1. **Version confirmation**
-   - Addon UI shows correct version
-   - `sensor.predbat_status` shows engine v9.7.0
-   - VENDOR.txt contains upstream commit `4cbf6333...`
-
-2. **Behavior validation**
-   - Min SoC stays >= 11%
-   - Self-update OFF (confirmed disabled)
-   - Guardian/fail-safe behavior preserved
-   - Force Charge respects Charging window exception
-
-3. **Observation window**
-   - 2-4 hours minimum
-   - Monitor for unexpected mode changes
-   - Check SoC does not drop below 11%
-   - Verify no unintended export
+Rollback: restore the **same** full unencrypted backup taken at T+0.
 
 ---
 
-## Rollback Procedure
+## Out of scope
 
-### Immediate Rollback (Within 1 Hour)
-
-If critical failure detected:
-
-1. **STOP Predbat** (via button.predbat_stop or UI)
-2. **Restore from backup** (fresh backup taken T+0)
-3. **Verify restoration**:
-   - Addon version matches pre-upgrade
-   - Engine version confirms rollback
-   - Guardian configuration intact
-4. **Document failure** (logs, symptoms, timeline)
-
-### Delayed Rollback (After Observation)
-
-If issues found during observation window:
-
-1. **Capture evidence** (logs, sensor states, timeline)
-2. **Fresh backup of current state** (for forensics)
-3. **Restore original backup** (pre-upgrade)
-4. **Root cause analysis** before retry
-
----
-
-## Current Limitations and Constraints
-
-### Proven Behaviors (From Repository)
-
-✅ **Min SoC**: Config shows 11% floor  
-✅ **Self-update**: Disabled in config  
-✅ **Vendor files**: 115 files verified against upstream  
-✅ **CI tests**: 45/45 pass locally, both arches build  
-✅ **Force Charge PV exception**: Charging window logic present
-
-### Unverified (External HA Configuration)
-
-⚠️ **5kW cap**: HA automation not visible from addon repo  
-⚠️ **14kW/23A limits**: Guardian config external to addon  
-⚠️ **11% SoC enforcement**: HA-side guardian unverified from repo  
-⚠️ **No forced export**: Cannot prove from addon config alone  
-⚠️ **Hardware ceiling**: BMS behavior not repository-testable
-
-**Note**: HA configuration verification requires separate read-only helper access (Stage 1 patch under development).
-
----
-
-## Open Questions
-
-1. **Supervisor build source resolution**
-   - How does Supervisor determine git ref for `build: true`?
-   - Is checkout SHA logged/accessible post-build?
-   - Can we verify built tree matches reviewed tree?
-
-2. **Image publication alternative**
-   - Should we publish to registry instead of local build?
-   - What is approval process for image publication?
-   - Digest-based pull eliminates ambiguity
-
-3. **One-shot approval refresh**
-   - Fresh W-labels required for deployment
-   - Review/approval workflow for new hashes?
-   - Ledger cannot be reset (consumed state permanent)
+- 5 kW cap removal (external HA package)
+- 14 kW / 23 A guardian (external HA)
+- Merge of PR #5
+- Live HA or Mac helper changes
 
 ---
 
 ## References
 
-- **Upstream**: [batpred v9.7.0](https://github.com/springfall2008/batpred/releases/tag/v9.7.0) (commit `4cbf6333`)
-- **Vendor PR**: [kamien5/predbat_addon#5](https://github.com/kamien5/predbat_addon/pull/5)
-- **Previous tag**: `kamien5-v3` (v9.6.5 addon 1.7.1-kamien5.3)
-- **Proposed tag**: `kamien5-v4` (after blockers resolved)
+- Upstream: [batpred v9.7.10](https://github.com/springfall2008/batpred/releases/tag/v9.7.10)
+- Previous live: `kamien5-v3` (addon `1.7.1-kamien5.3`, engine v9.6.5)
+- Proposed tag after merge: `kamien5-v4` (triggers publish.yml)
 
----
-
-## Document Status
-
-**Created**: 2026-11-07  
-**Replaces**: DEPLOYMENT-PROVENANCE.md, DEPLOY.md, UPGRADE-v9.7.0.md  
-**Supersedes**: DEPLOYMENT-BLOCKERS.md (blockers consolidated above)  
-**Status**: ACTIVE — single source of truth for deployment procedure
-
-**DO NOT** create additional deployment docs. Update this file only.
+**Document status**: ACTIVE — single source of truth for this upgrade.  
+**Updated**: 2026-11-13

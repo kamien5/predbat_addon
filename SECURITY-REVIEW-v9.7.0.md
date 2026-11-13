@@ -1,9 +1,11 @@
 # Przegląd bezpieczeństwa: upgrade Predbat v9.6.5 → v9.7.0 (kamien5-v4)
 
-**Data przeglądu:** 2026-11-07  
-**Addon version:** 1.7.1-kamien5.4  
-**Vendor commit:** springfall2008/batpred v9.7.0 = 4cbf633355525ea62ddf8e47e647ee215b38f1ca  
-**Status:** ✅ Verified — gotowe do deployment po review
+**Aktualizacja 2026-11-13:** silnik podniesiony do **v9.7.10** (`54a8cbb2…`), addon **1.7.1-kamien5.5**. MCP nadal OFF + source-IP. Procedura i pin obrazu: [DEPLOY-UPGRADE.md](./DEPLOY-UPGRADE.md). CI na `6e88899…`: 3/3 **success**.
+
+**Data przeglądu v9.7.0:** 2026-11-07  
+**Addon version (wówczas):** 1.7.1-kamien5.4  
+**Vendor commit (wówczas):** springfall2008/batpred v9.7.0 = 4cbf633355525ea62ddf8e47e647ee215b38f1ca  
+**Status:** warstwa MCP/OAuth z v9.7.0 nadal obowiązuje; wdrożenie wg DEPLOY-UPGRADE.md (GHCR, W40/W41)
 
 ---
 
